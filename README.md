@@ -6,6 +6,12 @@
 而是记得**这段关系里发生过什么**。
 
 ---
+<img width="986" height="754" alt="image" src="https://github.com/user-attachments/assets/7ece94ae-e3a4-47e9-b323-8ba3803f8ad6" />
+<img width="969" height="782" alt="image" src="https://github.com/user-attachments/assets/41dea5c1-852f-440e-a95d-39b943df7c97" />
+<img width="999" height="411" alt="image" src="https://github.com/user-attachments/assets/50ae4c28-f9f5-4ef6-a8d6-877a340b7d12" />
+<img width="984" height="664" alt="image" src="https://github.com/user-attachments/assets/ff4c166f-6a65-4472-a5b0-f2a81cdf49a6" />
+
+---
 
 ## 它解决什么问题
 

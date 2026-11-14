@@ -258,7 +258,7 @@ $env:DSH_BASE = $env:DSH_WEB_URL     # 端口每次启动都变，不要写死
 
 | 项 | 值 |
 |---|---|
-| 包版本 | `1.0.0`（MIT，已发布到 npm） |
+| 包版本 | `1.0.1`（MIT，已发布到 npm） |
 | schema | **v5** |
 | 代码规模 | `index.js` 4223 行 / `client.js` 1563 行 / `db-store.mjs` 1081 行 / `db-schema.mjs` 422 行 |
 | HTTP 路由 | **17 条** |

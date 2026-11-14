@@ -9,8 +9,7 @@
 会话事件、自己入库；结论每轮以纯文本注入。所以它不会把会话搞崩，也不需要
 文件读写权限。
 
-> **状态**：`1.0.0`，MIT 许可。当前从 GitHub 安装；npm 发布后可直接
-> `add dsh-fatfishdream-memory`。
+> **状态**：`1.0.0`，MIT 许可，已发布到 npm。
 
 ---
 
@@ -61,7 +60,10 @@ DSH 的会话是隔离的。关掉窗口再打开，AI 不知道昨天你们改�
 ## 装它
 
 ```bash
-# 从 GitHub 直接装（插件在仓库的子目录里，用 #path: 指定）
+# 从 npm 装（推荐）
+dsh plugin --profile <你的profile> add dsh-fatfishdream-memory
+
+# 或从 GitHub 装（插件在仓库的子目录里，用 #path: 指定）
 dsh plugin --profile <你的profile> add "git+https://github.com/FatFishNet/dsh-fatfishdream-memory.git#path:/dsh-fatfishdream-memory"
 
 # 已经 clone 到本地的话，直接指向包目录
@@ -71,8 +73,6 @@ dsh plugin --profile <你的profile> add <clone 路径>/dsh-fatfishdream-memory
 装完**完整重启 DSH**（不是禁用→启用，是重启客户端 —— 客户端代码是浏览器模块，
 禁用启用不会重新加载它）。
 
-> **尚未发布到 npm。** 发布后才会多一条 `add dsh-fatfishdream-memory`，
-> 那时上面两种装法仍然可用。
 **确认装对了**：看 DSH 日志里的
 
 ```

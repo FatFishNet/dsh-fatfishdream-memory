@@ -44,7 +44,10 @@ DSH 的会话是隔离的。关掉窗口再打开，AI 不知道昨天你们改�
 ## 装它
 
 ```bash
-# 从 GitHub 直接装（插件在仓库的子目录里，用 #path: 指定）
+# 从 npm 装（推荐）
+dsh plugin --profile <你的profile> add dsh-fatfishdream-memory
+
+# 或从 GitHub 装（插件在仓库的子目录里，用 #path: 指定）
 dsh plugin --profile <你的profile> add "git+https://github.com/FatFishNet/dsh-fatfishdream-memory.git#path:/dsh-fatfishdream-memory"
 ```
 
@@ -255,7 +258,7 @@ $env:DSH_BASE = $env:DSH_WEB_URL     # 端口每次启动都变，不要写死
 
 | 项 | 值 |
 |---|---|
-| 包版本 | `1.0.0`（MIT，已解除 `private`，待发 npm） |
+| 包版本 | `1.0.0`（MIT，已发布到 npm） |
 | schema | **v5** |
 | 代码规模 | `index.js` 4223 行 / `client.js` 1563 行 / `db-store.mjs` 1081 行 / `db-schema.mjs` 422 行 |
 | HTTP 路由 | **17 条** |

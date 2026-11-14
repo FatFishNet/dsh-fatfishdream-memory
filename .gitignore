@@ -23,6 +23,13 @@ _debug.log
 *.orig
 *.rej
 
+# ---- npm / pnpm 凭据（★ 绝不能提交）----
+# `npm login` 默认写 ~/.npmrc（用户目录，安全），
+# 但 `--location=project` 或某些 CI 配置会在仓库里生成一份，
+# 里面是明文 _authToken。2026-11-14 发版前检查发现这里没排除。
+.npmrc
+.pnpmrc
+
 # ---- 操作系统杂项 ----
 .DS_Store
 Thumbs.db

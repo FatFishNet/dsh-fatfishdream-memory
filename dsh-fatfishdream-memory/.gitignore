@@ -10,6 +10,10 @@ node_modules/
 *.log
 *.tgz
 
+# npm / pnpm 凭据 —— 绝不能跟着包提交（里面是明文 _authToken）
+.npmrc
+.pnpmrc
+
 # 调试期的整目录备份（`_backup-*`、`_dbbackup/` 等）。
 # 2026-11-14 开源：根 .gitignore 的 `_*/` 管不到这里（包内是独立目录），
 # 实测两个 `_backup-*` 会跟着提交（约 700 KB 旧版源码副本）。

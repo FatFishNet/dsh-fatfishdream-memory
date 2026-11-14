@@ -211,6 +211,15 @@ kind 组丢失会导致所有带标记回复**静默丢弃**且 `node --check` �
   **所以给用户的命令必须写成 `& $git ...` / `& $node $pnpm ...`**，
   先定义变量再调用 —— 直接写裸露的 `git` / `npm` 一定会失败。
   发 npm 包用 `& $node $pnpm publish --access public --no-git-checks`。
+- **验证「发布成功」只用一种方法：装一次。**（2026-11-14 实踩）
+  我自己写脚本去 GET tarball 判断「有没有传上去」，脚本路径不对就得出
+  「半发布」的结论，差点让用户去退 dist-tag —— 而包其实一直是好的。
+  ```
+  mkdir <临时目录>; cd <临时目录>
+  & $node $pnpm add dsh-fatfishdream-memory@<版本>
+  ```
+  看到 `downloaded 1, added 1` 就是好的。**别用探测脚本绕圈子**，
+  更不要基于探测结果让用户改 dist-tag / 重发版本。
 
 其余坑（中文检索 / contentless FTS / junction 细节 / 依赖面 / 日志路径）见
 [`docs/维护手册.md`](docs/维护手册.md) §3。

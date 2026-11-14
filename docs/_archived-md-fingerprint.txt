@@ -1,0 +1,16 @@
+# _archive-md 指纹清单（正文已并入 memory.db，本文件仅作日后对照）
+# 生成于 2026-11-12T21:34:03.449Z
+
+FatFishDream\PROJECT.md  3768B  sha256:50ec82fe8951d01d
+FatFishDream\PROJECT.md.bak-精简前  3716B  sha256:9f50cabce60586dc
+FatFishDream\log\2026-11.md  87728B  sha256:07e551311ef6892d
+ForzaOverlay\PROJECT.md  4823B  sha256:6afe5e871cd16f9a
+ForzaOverlay\PROJECT.md.bak-精简前-20261112-183029  5036B  sha256:58beab0f21070fe9
+ForzaOverlay\log\2026-11.md  39505B  sha256:f4ad2a4a54482854
+design\PROJECT.md  2265B  sha256:13f130092e0293ba
+design\log\2026-11.md  9589B  sha256:e4f415e296186ab7
+dsh-skill-switch-main\PROJECT.md  2193B  sha256:035d2d47187c00bf
+dsh-skill-switch-main\log\2026-11.md  94605B  sha256:9c5bf14f6ac8226b
+facts.md  2651B  sha256:aedf396d66d6e2e7
+干杂活\PROJECT.md  3229B  sha256:47f51f65800cf7c6
+干杂活\log\2026-11.md  7555B  sha256:803e294c4d929151

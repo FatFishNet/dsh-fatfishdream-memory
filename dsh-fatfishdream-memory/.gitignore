@@ -1,0 +1,21 @@
+# 开发期备份（.pre-<改动名> 形式）
+*.pre-*
+*.bak/
+*.backup
+
+# 依赖与临时产物
+node_modules/
+.pnpm-store/
+*.tmp
+*.log
+*.tgz
+
+# 调试期的整目录备份（`_backup-*`、`_dbbackup/` 等）。
+# 2026-11-14 开源：根 .gitignore 的 `_*/` 管不到这里（包内是独立目录），
+# 实测两个 `_backup-*` 会跟着提交（约 700 KB 旧版源码副本）。
+# 用户决定：**保留在本地，不上传**。所以只忽略、不删除。
+_*/
+
+# 本目录只放随包分发的内容（见 package.json 的 files 字段）。
+# STORAGE.md 是要给使用者看的文档，所以留在本目录而不是 docs/ 下，
+# 否则会被 git 和 npm 双重排除，README 里就成了断链。

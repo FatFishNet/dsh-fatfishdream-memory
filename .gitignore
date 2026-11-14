@@ -1,0 +1,67 @@
+# ---- 依赖 ----
+node_modules/
+.pnpm-store/
+pnpm-lock.yaml
+
+# ---- DSH 运行时与编辑器 ----
+.dsh-scope.json
+.dsh/
+.vscode/
+# ⚠️ Visual Studio 是 `.vs/`，不是 `.vscode/` —— 两者是不同的 IDE。
+# 2026-11-14 开源检查发现 `.vs/` 未被排除：里面是 slnx.sqlite 缓存、
+# v18/.wsuo（用户状态二进制）与 DocumentLayout.json，会随提交上去。
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 临时文件 ----
+*.tmp
+*.log
+_debug.log
+*.orig
+*.rej
+
+# ---- 操作系统杂项 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 开发期备份（.pre-<改动名> 形式）----
+*.pre-*
+*.bak/
+*.ok/
+*.backup
+
+# ---- 测试与验证的临时目录（以 _ 开头，跑完即删）----
+# 注意：这条同时会挡住 _review/（他人文件）和 _upgrade-backup/
+# （含本机绝对路径与 profile 依赖清单，绝不能提交），都是想要的效果。
+# 也同样挡住 _dbbackup/（memory.db 备份 = 用户真实记忆数据）。
+_*/
+
+# ---- 但测试脚本要跟着仓库走 ----
+# _dbpreview/ 下是 31 个脚本（其中 27 个进全量回归）/ 约 520 项回归断言，属于可复用资产，
+# 不是临时产物 —— docs/项目地图.md 与 docs/TESTING.md 都在引用它们，
+# 不放行就是永久断链（见 AGENTS.md 硬约束 16）。
+# 2026-11-13 清理过一次（62 个一次性脚本，4.33 MB）；
+# 2026-11-14 又把 60 个一次性脚本移到 _archive/dbpreview-oneoff-20261114/，
+# 只留回归资产。**新写的一次性排查脚本用完即删，不要留在 _dbpreview/。**
+!_dbpreview/
+
+# ---- 归档文档也要跟着走 ----
+# _archive/USAGE-FOR-OTHER-PROJECTS.md 被 README.md、docs/项目地图.md、
+# dsh-memory/README.md 三处引用，不放行同样是断链。
+# 已核对：该文件不含本机绝对路径，可安全公开。
+# （区别于 _dbbackup/ 与 _upgrade-backup/ —— 那两个绝不能放行。）
+!_archive/
+
+# ---- 本地开发约定（写给本机 AI 助手看）----
+# 2026-11-14 开源：**放行**。README 与 docs/ 共 14 处引用它，
+# 挡住就是克隆后永久断链。内容本身没有本机私密信息（只有工程约束与事故记录），
+# 反而是「为什么这么设计」的最好说明。
+# （历史：这里曾被忽略，理由是「不属于开源内容」；文档引用起来之后这个理由不成立了。）
+# AGENTS.md
+
+# ---- 打包产物（如果发布到 npm）----
+*.tgz

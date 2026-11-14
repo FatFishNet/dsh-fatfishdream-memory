@@ -1,0 +1,60 @@
+{
+  "name": "dsh-fatfishdream-memory",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness 记忆插件（大肥鱼的梦）：零工具长期记忆，结论注入 + 标记写入 + 情绪自动捕获。",
+  "engines": {
+    "dsh": ">=0.2.2-rc.3"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "db-schema.mjs",
+    "db-store.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "STORAGE.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "author": "FatFishNet",
+  "license": "MIT",
+  "contributors": [
+    {
+      "name": "chidaic",
+      "url": "https://github.com/chidaic/dsh-light-memory"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FatFishNet/dsh-fatfishdream-memory"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "sqlite",
+    "long-term-memory"
+  ]
+}

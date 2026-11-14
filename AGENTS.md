@@ -197,6 +197,20 @@ kind 组丢失会导致所有带标记回复**静默丢弃**且 `node --check` �
 - **热重载后 `session/event` 可能失效**（日志没有 `[user-message]`）：完整重启 DSH。
 - **DSH 更新后插件消失**：先查 node_modules 里的 junction 指向，指向旧路径就 `rmdir` + `mklink /J` 再启用。
 - **流水可为空**：用户清空 logs 后「记忆索引」只剩 rules 的 topic 计数，是正常状态。
+- **本机 `git` / `npm` 都不在 PATH**（2026-11-14 实测，给用户写命令时踩过）：
+  用户终端里 `git add` 会报「术语 'git' 不会被识别」。
+
+  ```
+  git ：D:\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\
+        Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe   ← VS 自带的
+  npm ：**没有**。DSH 只带 node 与 pnpm，发布用 pnpm publish。
+  pnpm：D:\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.cjs
+  node：（同上目录）\node\bin\node.exe
+  ```
+
+  **所以给用户的命令必须写成 `& $git ...` / `& $node $pnpm ...`**，
+  先定义变量再调用 —— 直接写裸露的 `git` / `npm` 一定会失败。
+  发 npm 包用 `& $node $pnpm publish --access public --no-git-checks`。
 
 其余坑（中文检索 / contentless FTS / junction 细节 / 依赖面 / 日志路径）见
 [`docs/维护手册.md`](docs/维护手册.md) §3。

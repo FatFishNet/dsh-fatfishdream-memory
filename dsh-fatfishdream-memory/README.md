@@ -9,8 +9,8 @@
 会话事件、自己入库；结论每轮以纯文本注入。所以它不会把会话搞崩，也不需要
 文件读写权限。
 
-> **状态**：`1.0.0`。`package.json` 里仍是 `private: true` ——
-> **尚未发布到 npm**，目前按本地目录安装。
+> **状态**：`1.0.0`，MIT 许可。当前从 GitHub 安装；npm 发布后可直接
+> `add dsh-fatfishdream-memory`。
 
 ---
 
@@ -73,7 +73,6 @@ dsh plugin --profile <你的profile> add <clone 路径>/dsh-fatfishdream-memory
 
 > **尚未发布到 npm。** 发布后才会多一条 `add dsh-fatfishdream-memory`，
 > 那时上面两种装法仍然可用。
-
 **确认装对了**：看 DSH 日志里的
 
 ```

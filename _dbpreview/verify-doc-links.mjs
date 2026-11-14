@@ -13,6 +13,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DOCS = [
   'README.md',
   'AGENTS.md',
+  'CONTRIBUTING.md',
+  'CHANGELOG.md',
   'docs/项目地图.md',
   'docs/维护手册.md',
   'docs/TESTING.md',

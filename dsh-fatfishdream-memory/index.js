@@ -42,6 +42,34 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createDbStore } from './db-store.mjs'
 import { PERSONA_FORBIDDEN } from './db-store.mjs'
 
+/**
+ * 插件自身的版本号（显示在 GUI 标题旁）。
+ *
+ * ⚠️ **单一真相来源是 `package.json`，不要在这里硬编码。**
+ * 硬编码的版本号必然会在某次发版时忘记改 —— 界面上就会一直显示旧版本，
+ * 而且没有任何报错。所以这里用 `import.meta.url` 反查包目录，
+ * 读不到就返回空串（界面自然不显示，不会显示错的）。
+ *
+ * 为什么同步读：它只在模块加载时跑一次，且是几十字节的文件。
+ */
+const PACKAGE_VERSION = (() => {
+  try {
+    // 包目录 = 本文件所在目录。不用 createRequire('./package.json')，
+    // 因为 exports 里虽然导出了 ./package.json，但走相对路径更直接、更少依赖。
+    const here = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+    const raw = readFileSync(join(here, 'package.json'), 'utf8')
+    // ⚠️ 这里刻意**不调用 parseJson()**：它定义在文件后半段（L431 附近），
+    // 虽然函数声明会提升、实际能跑，但让模块顶部的常量依赖后面才出现的工具
+    // 太脆弱了 —— 将来有人把它改成 const 箭头函数就会在加载期炸掉。
+    // 只用 Node 内置的 JSON.parse 就够，这份文件是包作者自己写的，不会有 BOM。
+    const pkg = JSON.parse(raw)
+    return typeof pkg?.version === 'string' ? pkg.version : ''
+  } catch {
+    // 打包/校验环境下读不到是正常情况，静默降级为空串
+    return ''
+  }
+})()
+
 export const name = 'dsh-fatfishdream-memory'
 
 /** 只硬依赖 systemPrompt。其余服务可选，缺失即退化。 */
@@ -3514,6 +3542,11 @@ export function apply(ctx, rawConfig = {}) {
               ok: true,
               ...info,
               db,
+              // 插件自身版本（GUI 标题旁显示）。来自 package.json，不硬编码。
+              versions: {
+                plugin: PACKAGE_VERSION || null,
+                schema: dbStoreExists() ? (db?.schemaVersion ?? null) : null,
+              },
               // 口径声明：告诉调用方「info.projects 里那组统计数字该怎么读」。
               //
               // 2026-11-13 加。为什么必须显式声明：overview() 无论跑在哪种模式

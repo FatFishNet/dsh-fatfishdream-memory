@@ -44,10 +44,15 @@ DSH 的会话是隔离的。关掉窗口再打开，AI 不知道昨天你们改�
 ## 装它
 
 ```bash
-dsh plugin --profile <你的profile> add dsh-fatfishdream-memory
+# 从 GitHub 直接装（插件在仓库的子目录里，用 #path: 指定）
+dsh plugin --profile <你的profile> add "git+https://github.com/FatFishNet/dsh-fatfishdream-memory.git#path:/dsh-fatfishdream-memory"
 ```
 
 装完**完整重启 DSH**（不是禁用→启用，是重启客户端 —— `client.js` 是浏览器模块）。
+
+> **还没发布到 npm。** 以后发了的话，这里会多一条
+> `dsh plugin --profile <你的profile> add dsh-fatfishdream-memory`，
+> 那时上面那条 GitHub 装法仍然可用。
 
 装好后侧边栏出现「大肥鱼的梦」图标，点开是六个页签：
 

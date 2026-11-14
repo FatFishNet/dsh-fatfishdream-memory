@@ -60,6 +60,14 @@ window.__ModuleLoader__.load({
       },
       header: { display: 'flex', alignItems: 'baseline', gap: '12px', flexWrap: 'wrap' },
       h1: { fontSize: '18px', fontWeight: 600, margin: 0 },
+    // 标题旁的版本号：小一号、弱化色，不抢标题。
+    // 用 --dsw-alias-label-secondary 与 sub 同一个 token（AGENTS 15：不假设 token 存在，
+    // 这个 token 在 S.sub 里已经用着，属于已验证可用的）。
+    ver: {
+      fontSize: '12px',
+      color: 'var(--dsw-alias-label-secondary)',
+      fontVariantNumeric: 'tabular-nums',
+    },
       wrap: { display: 'flex', flexDirection: 'column', gap: '12px' },
       card: {
         border: '1px solid var(--dsw-alias-border-l1)',
@@ -836,6 +844,11 @@ window.__ModuleLoader__.load({
           'div',
           { style: S.header },
           h('h1', { style: S.h1 }, '大肥鱼的梦'),
+          // 版本号来自 /state 的 versions.plugin（宿主从 package.json 读），
+          // **不要在这里写死** —— 发版时必忘改，界面上就会一直显示旧版本。
+          info?.versions?.plugin
+            ? h('span', { style: S.ver }, `v${info.versions.plugin}`)
+            : null,
           h(
             'span',
             { style: S.sub },

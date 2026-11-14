@@ -1,6 +1,7 @@
 # FatFishDream · 大肥鱼的梦
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）用的**长期记忆插件**。
+本插件仅依赖 DSH 客户端内置的 Node.js (>=22.5.0) 原生 SQLite 模块。
 
 它让 AI 跨会话记得「我们之前一起做过什么」——不是记得更多技术细节，
 而是记得**这段关系里发生过什么**。

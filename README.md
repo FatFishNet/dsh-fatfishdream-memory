@@ -8,6 +8,8 @@
 而是记得**这段关系里发生过什么**。
 
 ---
+<img width="986" height="754" alt="image" src="https://github.com/user-attachments/assets/7ece94ae-e3a4-47e9-b323-8ba3803f8ad6" />
+---
 
 ## 它解决什么问题
 

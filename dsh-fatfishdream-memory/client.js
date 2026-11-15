@@ -41,6 +41,11 @@ window.__ModuleLoader__.load({
     }
     const API_SEARCH = '/api/dsh-memory/search'
     const API_ROOT_MOVE = '/api/dsh-memory/root/move'
+    // 工作区改名（2026-11-15）。POST 一次，dryRun:true 只报数不写库。
+    const API_SCOPE_RENAME = '/api/dsh-memory/scope/rename'
+    // 有数据的工作区列表。**不能用 /state 的 byScope** —— 那个只数 active 的
+    // rules+logs，会漏掉「全是停用条目」的工作区（2026-11-15 实测 design 就是）。
+    const API_SCOPE_LIST = '/api/dsh-memory/scope/list'
     // v5：库体积分层。**不在 /state 里** —— 它要扫全库页，100MB 库约 160ms，
     // 放在每次切页签都拉的 /state 里会卡主线程。存储设置页按需拉一次。
     const API_STATS_BREAKDOWN = '/api/dsh-memory/stats-breakdown'
@@ -279,6 +284,29 @@ window.__ModuleLoader__.load({
       rules: 'rules',        // 规则与偏好
       emotion: 'emotion',    // 情绪记录
       log: 'logs',           // 记忆流水
+    }
+
+    /**
+     * 工作区改名的前端校验（不请求后端，输入时即时反馈）。
+     *
+     * 为什么放前端也放后端：前端为了「边打字边提示」，后端为了「不信任客户端」。
+     * 但**两边规则必须一致**，否则会出现「界面说可以、点了报错」。
+     * 后端真正的判据在 `renameScope`（含目标占用检查，那个必须查库才能知道）。
+     *
+     * @returns {string} 空串 = 通过；否则是给人看的原因
+     */
+    function validateScopeName(next, current) {
+      const v = String(next ?? '').trim()
+      if (v === '') return '新名字不能为空'
+      if (v === current) return '新名字与当前工作区相同'
+      // __global__ 是保留值：改了会破坏「全局规则跨项目」的语义
+      if (v === '__global__') return '__global__ 是保留值，不能作为工作区名'
+      // 字符集：只允许字母/数字/中文/-/_，避免各种奇怪字符导致 slug 行为不可预期
+      if (!/^[A-Za-z0-9\u4e00-\u9fa5_-]+$/.test(v)) {
+        return '只能用字母、数字、中文、下划线或连字符'
+      }
+      if (v.length > 60) return '名字太长了（上限 60 字符）'
+      return ''
     }
 
     async function post(url, body) {
@@ -658,6 +686,23 @@ window.__ModuleLoader__.load({
       const [personaIssues, setPersonaIssues] = React.useState(null)
       const [checkingPersona, setCheckingPersona] = React.useState(false)
 
+      // ---- 工作区改名（第七页签，2026-11-15）----
+      //
+      // 流程刻意做成「预览 → 确认 → 执行」三步，不能一键到底：
+      // 改名**没有撤销按钮**，备份是唯一退路。所以强制先看一眼要动多少条。
+      const [wsFrom, setWsFrom] = React.useState('')
+      const [wsTo, setWsTo] = React.useState('')
+      // dryRun 的结果：{before, conflicts, canRename}
+      const [wsPreview, setWsPreview] = React.useState(null)
+      // 真迁移的结果：{ok, tables, total, verify, before, after}
+      const [wsResult, setWsResult] = React.useState(null)
+      const [wsBusy, setWsBusy] = React.useState(false)
+      // 二次确认弹窗：存下预览数据，等用户点「确认迁移」
+      const [wsConfirming, setWsConfirming] = React.useState(false)
+      // 有数据的工作区列表（下拉数据源）。用专用接口，不用 /state 的 byScope ——
+      // 后者只数 active 的 rules+logs，会漏掉「全部停用」或「只有 archive」的工作区。
+      const [wsScopes, setWsScopes] = React.useState([])
+
       const load = React.useCallback(async () => {
         setBusy(true)
         try {
@@ -759,6 +804,22 @@ window.__ModuleLoader__.load({
         return () => { alive = false }
       }, [tab])
 
+      // 工作区列表：**只在切到「工作区」页签时拉**，与体积分层同一个思路。
+      React.useEffect(() => {
+        if (tab !== 'workspace') return undefined
+        let alive = true
+        void (async () => {
+          try {
+            const r = await fetch(API_SCOPE_LIST)
+            const p = await r.json()
+            if (alive && p.ok) setWsScopes(p.scopes ?? [])
+          } catch {
+            /* 拉不到就空列表，不弹错 */
+          }
+        })()
+        return () => { alive = false }
+      }, [tab])
+
       const moveRoot = async () => {
         const target = rootDraft.trim()
         if (!target) {
@@ -837,6 +898,437 @@ window.__ModuleLoader__.load({
           label,
         )
 
+      // ---- 工作区改名：预览（dryRun）----
+      //
+      // 只报数不写库。用户在这里看清「要动多少条、有没有冲突」，
+      // 再决定要不要点「开始迁移」。这一步不能省 —— 改名没有撤销。
+      const previewRename = async () => {
+        const err = validateScopeName(wsTo, wsFrom)
+        if (err) {
+          setMessage({ kind: 'err', text: err })
+          return
+        }
+        if (!wsFrom) {
+          setMessage({ kind: 'err', text: '请先选择要改名的工作区' })
+          return
+        }
+        setWsBusy(true)
+        setWsResult(null)
+        try {
+          const r = await post(API_SCOPE_RENAME, { from: wsFrom, to: wsTo.trim(), dryRun: true })
+          if (r.ok) {
+            setWsPreview(r)
+            if (!r.canRename) {
+              setMessage({ kind: 'err', text: '该工作区没有数据，无需迁移。' })
+            } else if (r.willMerge) {
+              // 目标已有数据 = 合并，不是错误。
+              // 2026-11-15 用户明确：「新建工作区然后再去迁移记忆的情况是很常见的」。
+              setMessage({
+                kind: 'ok',
+                text:
+                  `「${wsTo.trim()}」已有 ${r.targetBefore?.total?.all ?? 0} 行数据，` +
+                  `确认后会合并成 ${r.expectAfter?.total ?? 0} 行。确认无误后点「开始合并」。`,
+              })
+            } else {
+              setMessage({ kind: 'ok', text: '预览完成。确认无误后点「开始迁移」。' })
+            }
+          } else {
+            setWsPreview(null)
+            setMessage({ kind: 'err', text: r.error ?? '预览失败' })
+          }
+        } catch (e) {
+          setMessage({ kind: 'err', text: String(e?.message ?? e) })
+        } finally {
+          setWsBusy(false)
+        }
+      }
+
+      // ---- 工作区改名：真迁移 ----
+      //
+      // 后端在同一个事务里改三张表，改完自己采两次快照比对
+      // （条数守恒 / 旧区归零 / 行集合未变），任何一项不过就报错。
+      // 所以前端拿到 verify.ok === true 才能说「成功」。
+      const doRename = async () => {
+        setWsBusy(true)
+        setWsConfirming(false)
+        try {
+          // allowMerge 由预览阶段的结果决定：目标非空 = 用户已经看到「合并」预览，
+          // 点确认即表示同意合并。后端仍会再判一次（不信任客户端）。
+          const allowMerge = wsPreview?.willMerge === true
+          const r = await post(API_SCOPE_RENAME, { from: wsFrom, to: wsTo.trim(), allowMerge })
+          if (r.ok) {
+            setWsResult(r)
+            setMessage({
+              kind: 'ok',
+              text: r.merged
+                ? `已合并：${r.from} → ${r.to}。迁后校验 ${r.verify?.checks?.length ?? 0} 项全部通过。`
+                : `已改名：${r.from} → ${r.to}。迁后校验 ${r.verify?.checks?.length ?? 0} 项全部通过。`,
+            })
+            // 名字变了，列表与下拉都要重新拉
+            void load()
+            void loadInfo()
+            // 重新拉工作区列表（改名后列表顺序会变）
+            try {
+              const lr = await fetch(API_SCOPE_LIST)
+              const lp = await lr.json()
+              if (lp.ok) setWsScopes(lp.scopes ?? [])
+            } catch {}
+            // 改名后当前选中的旧名字已经不存在，重置表单免得误导
+            setWsFrom('')
+            setWsTo('')
+            setWsPreview(null)
+          } else {
+            setMessage({ kind: 'err', text: r.error ?? '迁移失败' })
+          }
+        } catch (e) {
+          setMessage({ kind: 'err', text: String(e?.message ?? e) })
+        } finally {
+          setWsBusy(false)
+        }
+      }
+
+      /**
+       * 工作区页签（第七个，2026-11-15）。
+       *
+       * 这个页面解决一个具体事故：用户把工作区 `干杂活` 改名成 `SoftTest`，
+       * 但库里 129 条数据仍挂在旧 scope 上 —— 查新名字一条都查不到。
+       * 而「改名」在这套系统里要同时处理三层：数据库 scope、state.json 的键映射、
+       * 以及工作区目录名。这一页只做第一层（改数据库 scope），
+       * 映射关系由后端自动写进 state.json 的 `.scope` 字段。
+       *
+       * 设计上刻意保守：
+       *   - 下拉只列**有数据**的工作区（空的不该出现在这里）
+       *   - 强制「先预览、再确认」两步，因为改名没有撤销按钮
+       *   - 预览里把三张表的数字**分开列**（rules/logs/archive），
+       *     并注明 archive 是原文层 —— 只给一个总数会被读成「记忆条目」
+       */
+      function renderWorkspace() {
+        // 有数据的工作区列表来自专用接口 `/scope/list`（按 snapshotScope 同口径数三表全部行）。
+        // ⚠️ 不要改用 `info.db.byScope` —— 那个只数 active 的 rules+logs，
+        // 2026-11-15 实测会漏掉「rules 全是停用条目」的 design（18 行）。
+        const wsList = wsScopes
+
+        const rows = [
+          h('div', { key: 'head', style: S.title }, '工作区改名'),
+          h(
+            'div',
+            { key: 'desc', style: S.sub },
+            '把某个工作区的全部记忆改挂到新名字下。只改数据库里的归属（scope），' +
+              '不动磁盘目录。用户画像与情绪记录不分工作区，不受影响。',
+          ),
+          h(
+            'div',
+            { key: 'warn', style: { ...S.sub, color: 'var(--dsw-alias-state-warning-primary, inherit)' } },
+            '⚠️ 改名没有撤销按钮。迁移前请确认已备份（_dbbackup/），迁移后可用备份回退。',
+          ),
+
+          // ---- 当前工作区（下拉）----
+          h(
+            'div',
+            { key: 'row1', style: S.row },
+            h(
+              'select',
+              {
+                style: { ...S.select, flex: '1 1 280px', minWidth: '180px' },
+                value: wsFrom,
+                onChange: (e) => {
+                  setWsFrom(e.target.value)
+                  // 换了源工作区，旧的预览结果就失效了 —— 留着会误导
+                  setWsPreview(null)
+                  setWsResult(null)
+                },
+              },
+              h('option', { value: '' }, '选择要改名的工作区…'),
+              ...wsList.map((s) =>
+                h('option', { key: s.scope, value: s.scope }, `${s.scope}（${s.total} 行）`),
+              ),
+            ),
+          ),
+
+          // ---- 新名字 ----
+          h(
+            'div',
+            { key: 'row2', style: S.row },
+            h('input', {
+              style: { ...S.input, flex: '1 1 280px' },
+              value: wsTo,
+              spellCheck: false,
+              placeholder: '新名字（不是路径）',
+              onChange: (e) => {
+                setWsTo(e.target.value)
+                setWsPreview(null)
+                setWsResult(null)
+              },
+            }),
+            h(
+              'button',
+              {
+                style: { ...S.btn, ...S.primary, ...(wsBusy || !wsFrom || !wsTo.trim() ? S.btnDisabled : {}) },
+                onClick: previewRename,
+                disabled: wsBusy || !wsFrom || !wsTo.trim(),
+              },
+              wsBusy ? '处理中…' : '预览影响',
+            ),
+          ),
+
+          // ---- 实时校验提示（不请求后端）----
+          (() => {
+            const err = wsFrom && wsTo.trim() ? validateScopeName(wsTo, wsFrom) : ''
+            return err ? h('div', { key: 'vld', style: S.err }, err) : null
+          })(),
+        ]
+
+        // ---- 预览结果 ----
+        if (wsPreview) {
+          const b = wsPreview.before
+          const tb = wsPreview.targetBefore
+          const total = b?.total ?? { all: 0, active: 0 }
+          const willMerge = wsPreview.willMerge === true
+          const expect = wsPreview.expectAfter
+          rows.push(
+            h(
+              'div',
+              { key: 'preview', style: S.card },
+              h('div', { style: S.title }, willMerge ? '合并预览' : '待迁移区域的数据量'),
+              h(
+                'div',
+                { style: S.sub },
+                willMerge
+                  ? `把「${wsPreview.from}」合并进已有工作区「${wsPreview.to}」。` +
+                      `目标区现有的数据会**原样保留**，源工作区的数据会并入，最终合成一个工作区。`
+                  : `工作区「${wsPreview.from}」→「${wsPreview.to}」。` +
+                      `以下数字是**迁移前的基线**，迁移后会逐项比对。`,
+              ),
+              // 三张表分开列：只给总数会被读成「记忆条目」
+              h(
+                'div',
+                { style: { display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '6px' } },
+                ...['rules', 'logs', 'archive'].map((t) => {
+                  const v = b?.tables?.[t]
+                  if (!v) return null
+                  const label =
+                    t === 'rules' ? '规则与偏好' : t === 'logs' ? '记忆流水' : '原文归档'
+                  const note = t === 'archive' ? '（原文层，无启用/停用概念）' : ''
+                  return h(
+                    'div',
+                    { key: t, style: { ...S.sub, fontVariantNumeric: 'tabular-nums' } },
+                    `${label} ${t}：${v.all} 行` +
+                      (t === 'archive' ? '' : `（其中启用 ${v.active}）`) +
+                      ` · id ${v.minId ?? '—'}–${v.maxId ?? '—'}${note}`,
+                  )
+                }),
+              ),
+              h(
+                'div',
+                { style: { ...S.sub, marginTop: '6px', fontWeight: 600 } },
+                `源工作区合计 ${total.all} 行`,
+              ),
+
+              // ---- 合并时额外展开目标区现状 + 合并后总量 ----
+              willMerge
+                ? h(
+                    'div',
+                    {
+                      key: 'mergeInfo',
+                      style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l1)' },
+                    },
+                    h('div', { style: S.title }, '目标工作区现状'),
+                    h(
+                      'div',
+                      { style: { display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '4px' } },
+                      ...['rules', 'logs', 'archive'].map((t) => {
+                        const v = tb?.tables?.[t]
+                        if (!v) return null
+                        const label = t === 'rules' ? '规则与偏好' : t === 'logs' ? '记忆流水' : '原文归档'
+                        return h(
+                          'div',
+                          { key: `tb-${t}`, style: { ...S.sub, fontVariantNumeric: 'tabular-nums' } },
+                          `${label} ${t}：${v.all} 行 · id ${v.minId ?? '—'}–${v.maxId ?? '—'}`,
+                        )
+                      }),
+                    ),
+                    h(
+                      'div',
+                      { style: { ...S.sub, marginTop: '6px', fontWeight: 600 } },
+                      `目标区现有 ${tb?.total?.all ?? 0} 行`,
+                    ),
+                    // 合并后的预计总量：迁移前就能算，给用户一个明确预期
+                    h(
+                      'div',
+                      { style: { ...S.ok, marginTop: '8px', fontWeight: 600 } },
+                      `合并后合计：${expect?.total ?? 0} 行` +
+                        `（${total.all} 迁入 + ${tb?.total?.all ?? 0} 原有）`,
+                    ),
+                    h(
+                      'div',
+                      { style: { ...S.sub, marginTop: '4px' } },
+                      '⚠️ 合并后两批数据无法再拆开。如果还要分开，请先用备份回退。',
+                    ),
+                  )
+                : null,
+              h(
+                'div',
+                { key: 'confirmRow', style: { ...S.row, marginTop: '10px' } },
+                h(
+                  'button',
+                  {
+                    style: {
+                      ...S.btn,
+                      ...S.primary,
+                      ...(wsBusy || !wsPreview.canRename ? S.btnDisabled : {}),
+                    },
+                    onClick: () => setWsConfirming(true),
+                    disabled: wsBusy || !wsPreview.canRename,
+                  },
+                  willMerge ? '开始合并' : '开始迁移',
+                ),
+                h(
+                  'button',
+                  { style: S.btn, onClick: () => setWsPreview(null) },
+                  '取消',
+                ),
+              ),
+            ),
+          )
+        }
+
+        // ---- 二次确认（弹在页面里，不用 window.confirm）----
+        //
+        // 为什么不用 window.confirm：DSH 桌面端是 Electron，
+        // 原生弹窗会阻塞渲染进程，而且样式与主题不一致。
+        if (wsConfirming) {
+          const willMerge = wsPreview?.willMerge === true
+          const expectTotal = wsPreview?.expectAfter?.total ?? wsPreview?.before?.total?.all ?? 0
+          rows.push(
+            h(
+              'div',
+              { key: 'confirm', style: { ...S.card, borderColor: 'var(--dsw-alias-state-error-primary)' } },
+              h('div', { style: S.title }, willMerge ? '确认合并？' : '确认迁移？'),
+              h(
+                'div',
+                { style: S.sub },
+                willMerge
+                  ? `将把「${wsFrom}」的 ${wsPreview?.before?.total?.all ?? 0} 行数据合并进「${wsTo.trim()}」` +
+                      `（目标现有 ${wsPreview?.targetBefore?.total?.all ?? 0} 行），合并后共 ${expectTotal} 行。` +
+                      '此操作不可撤销。'
+                  : `将把「${wsFrom}」的全部数据改名为「${wsTo.trim()}」，共 ` +
+                      `${wsPreview?.before?.total?.all ?? 0} 行。此操作不可撤销。`,
+              ),
+              h(
+                'div',
+                { style: { ...S.row, marginTop: '8px' } },
+                h(
+                  'button',
+                  { style: { ...S.btn, ...S.primary, ...(wsBusy ? S.btnDisabled : {}) }, onClick: doRename, disabled: wsBusy },
+                  wsBusy ? '处理中…' : willMerge ? '确认合并' : '确认迁移',
+                ),
+                h('button', { style: S.btn, onClick: () => setWsConfirming(false) }, '再想想'),
+              ),
+            ),
+          )
+        }
+
+        // ---- 结果（含迁前/迁后比对）----
+        if (wsResult) {
+          const checks = wsResult.verify?.checks ?? []
+          const before = wsResult.before
+          const targetBefore = wsResult.targetBefore
+          const afterTo = wsResult.after?.to
+          const wasMerged = wsResult.merged === true
+          rows.push(
+            h(
+              'div',
+              { key: 'result', style: S.card },
+              h(
+                'div',
+                { style: S.title },
+                wasMerged
+                  ? `合并完成：${wsResult.from} → ${wsResult.to}`
+                  : `迁移完成：${wsResult.from} → ${wsResult.to}`,
+              ),
+              h(
+                'div',
+                { style: S.sub },
+                wasMerged
+                  ? `迁入 ${wsResult.total} 行，目标原有 ${targetBefore?.total?.all ?? 0} 行，` +
+                      `合并后共 ${afterTo?.total?.all ?? '?'} 行。迁后校验 ${checks.length} 项` +
+                      (wsResult.verify?.ok ? '全部通过。' : '未通过，见下。')
+                  : `共迁移 ${wsResult.total} 行。迁后校验 ${checks.length} 项` +
+                      (wsResult.verify?.ok ? '全部通过。' : '未通过，见下。'),
+              ),
+              // 迁前 vs 迁后并排：这就是用户要的「报告是否一致」
+              // 合并时多一列「目标原有」，因为迁后 = 迁入 + 原有
+              h(
+                'div',
+                {
+                  style: {
+                    display: 'grid',
+                    gridTemplateColumns: wasMerged ? 'auto 1fr 1fr 1fr' : 'auto 1fr 1fr',
+                    gap: '4px 12px',
+                    marginTop: '8px',
+                    fontSize: '12px',
+                    fontVariantNumeric: 'tabular-nums',
+                  },
+                },
+                h('div', { style: { ...S.sub, fontWeight: 600 } }, '表'),
+                h('div', { style: { ...S.sub, fontWeight: 600 } }, '源工作区'),
+                wasMerged ? h('div', { style: { ...S.sub, fontWeight: 600 } }, '目标原有') : null,
+                h('div', { style: { ...S.sub, fontWeight: 600 } }, '迁后合并'),
+                ...['rules', 'logs', 'archive'].flatMap((t) => {
+                  const bv = before?.tables?.[t]
+                  const av = afterTo?.tables?.[t]
+                  if (!bv) return []
+                  const tv = targetBefore?.tables?.[t]
+                  return [
+                    h('div', { key: `${t}-n`, style: S.sub }, t),
+                    h('div', { key: `${t}-b`, style: S.sub }, `${bv.all} 行（id ${bv.minId ?? '—'}–${bv.maxId ?? '—'}）`),
+                    wasMerged
+                      ? h('div', { key: `${t}-t`, style: S.sub }, `${tv?.all ?? 0} 行（id ${tv?.minId ?? '—'}–${tv?.maxId ?? '—'}）`)
+                      : null,
+                    h('div', { key: `${t}-a`, style: S.sub }, `${av?.all ?? '?'} 行（id ${av?.minId ?? '—'}–${av?.maxId ?? '—'}）`),
+                  ]
+                }),
+              ),
+              // 逐项校验结果：失败项要红着标出来
+              h(
+                'div',
+                { style: { display: 'flex', flexDirection: 'column', gap: '2px', marginTop: '8px' } },
+                ...checks.map((c, i) => {
+                  const label =
+                    c.check === 'old-empty'
+                      ? '旧区归零'
+                      : c.check.startsWith('id-range')
+                        ? '行集合'
+                        : '条数'
+                  const detail = c.detail ? `（${c.detail}）` : ''
+                  return h(
+                    'div',
+                    { key: `c${i}`, style: c.ok ? S.ok : S.err },
+                    `${c.ok ? '✓' : '✗'} ${c.table} ${label}${detail}：期望 ${c.want} → 实际 ${c.got}`,
+                  )
+                }),
+              ),
+              wsResult.stateSynced
+                ? h(
+                    'div',
+                    { style: { ...S.sub, marginTop: '8px' } },
+                    `state.json 已记录映射：目录「${wsResult.stateSynced.key}」→ 记忆名「${
+                      wsResult.stateSynced.scope ?? wsResult.stateSynced.key
+                    }」。下次打开该项目会自动读到新名字。`,
+                  )
+                : null,
+              h(
+                'div',
+                { style: { ...S.sub, marginTop: '8px' } },
+                '注入层每轮都重新解析 scope（无会话级缓存），所以这个会话的下一条消息就会读到新名字下的记忆，不需要重开会话。',
+              ),
+            ),
+          )
+        }
+
+        return h('div', { style: S.wrap }, ...rows)
+      }
+
       return h(
         'div',
         { style: S.page },
@@ -869,6 +1361,7 @@ window.__ModuleLoader__.load({
           tabBtn('rules', '规则与偏好'),
           tabBtn('emotion', '情绪记录'),
           tabBtn('log', '记忆流水'),
+          tabBtn('workspace', '工作区改名'),
           tabBtn('heartbeat', '收尾语'),
           tabBtn('settings', '存储设置'),
         ),
@@ -943,6 +1436,8 @@ window.__ModuleLoader__.load({
 
               // ---- 心跳（每轮收尾语）已独立成「收尾语」页签 ----
             )
+          : tab === 'workspace'
+          ? renderWorkspace()
           : tab === 'heartbeat'
           ? h(
               'div',
@@ -1366,6 +1861,28 @@ window.__ModuleLoader__.load({
     const MEM_PARTIAL_RE = /^[ \t]*<!--mem-(?:l(?:og)?|f(?:act|ix)?|n(?:ote)?)?[\s\S]*$/m
 
     /**
+     * 折叠统计：用来说明「守卫到底有没有在起作用」。
+     *
+     * 为什么要记 counters 而不是只记结果：
+     *   2026-11-15 修「滚动条被擦除器打断」之后，光看代码不能确认问题真的解决了。
+     *   两个数字一对比就知道方向对不对：
+     *
+     *     marked  逐渐增长 = 对话区里仍有空段被收掉（正常，视觉上无害）
+     *     blocked 也在增长 = 守卫真的拦下了东西（说明旧逻辑本来会误伤）
+     *     blocked 恒为 0     = **守卫根本没被触发**，问题不在「藏错地方」，
+     *                          得换方向查（比如 CSS 选择器、别的插件、别的注入）
+     *
+     * 这正是「别猜，要有证据」的落地方式 —— 用户报的是现象，
+     * 我们需要的是一组能证伪的数字。
+     */
+    const collapseStats = {
+      marked: 0,
+      blocked: 0,
+      tags: {},        // 被打标记的元素 tag 分布
+      blockedBy: {},   // 被拦下的原因分布
+    }
+
+    /**
      * 擦掉一段 DOM 里所有完整的 mem 标记。
      *
      * @param {Node} root - 起始节点（含其子树）
@@ -1416,20 +1933,143 @@ window.__ModuleLoader__.load({
         //   这个变量已经不存在，留着这句只为记住为什么不用 el.remove。）
         //
         // 现在改成「打标记 + CSS 隐藏」：不删节点、不改结构，React 察觉不到。
+        //
+        // ============================================================
+        // ⚠️ 2026-11-15 收窄（用户报「改功能后全局 skills 滚动条失效」）
+        // ============================================================
+        //
+        // 旧判据只有 `el !== document.body`，等于「除 body 外全都可以隐藏」。
+        // 而这条属性配的是全局 CSS `display: none !important`，一旦打到
+        // 某个滚动容器的子节点上，容器 scrollHeight 塌成 0，滚动条就消失，
+        // 且 !important 无法用别的样式覆盖回来。
+        //
+        // 现在加三道守卫，宁可留下一个空行（视觉上无害），
+        // 也绝不隐藏一个可能承载布局的元素：
+        //
+        //   ① 必须是**行内语义元素**（p / span / div 这类文本容器）。
+        //      排除掉 main / section / ul / li / table / 自定义容器 ——
+        //      它们是布局骨架，隐藏一个就可能塌掉整块可滚动区域。
+        //   ② 不能是「有尺寸的块」。空 div 若被 flex/grid 分配了高度，
+        //      它就是布局占位；隐藏它会改变兄弟节点位置。
+        //   ③ 不能处在任何 overflow:auto/scroll 的祖先里。
+        //      这条最关键：滚动容器的内部结构一律不碰。
         const el = node.parentElement
         if (
           el &&
           el !== document.body &&
+          el !== document.documentElement &&
           after.trim() === '' &&
           el.textContent.trim() === '' &&
           el.children.length === 0 &&
-          !el.hasAttribute('data-dsh-mem-blank')
+          !el.hasAttribute('data-dsh-mem-blank') &&
+          isSafeToCollapse(el)
         ) {
           el.setAttribute('data-dsh-mem-blank', '')
           ensureBlankStyle()
+          collapseStats.marked++
+          collapseStats.tags[el.tagName] = (collapseStats.tags[el.tagName] ?? 0) + 1
+        } else if (el && after.trim() === '' && el.textContent.trim() === '' &&
+                   el.children.length === 0 && !el.hasAttribute('data-dsh-mem-blank')) {
+          // 走到这里 = 本来会打标记，但被守卫拦下了。
+          // 记下来：如果这个数字一直是 0，说明守卫根本没起作用，
+          // 问题不在「藏错了」，得换方向查。
+          collapseStats.blocked++
+          const why = el === document.body ? 'body'
+            : el === document.documentElement ? 'documentElement'
+            : !isSafeToCollapse(el) ? 'unsafe'
+            : 'other'
+          collapseStats.blockedBy[why] = (collapseStats.blockedBy[why] ?? 0) + 1
         }
       }
       return removed
+    }
+
+    /**
+     * 判断一个「已擦空的元素」能不能安全地 `display:none` 掉。
+     *
+     * ## 为什么需要这个函数（2026-11-15）
+     *
+     * 用户报「每次改动功能，全局 skills 的滚动条都失效」。
+     * 根因：擦除器给「擦完只剩空白」的元素打 `data-dsh-mem-blank`，
+     * 而配套 CSS 是 `display: none !important` —— **全局生效、无法覆盖**。
+     *
+     * 旧判据只有 `el !== document.body`，其余一律隐藏。于是：
+     *   滚动容器 A（overflow:auto）
+     *     └─ 某个子元素 B 被擦成空 → 打标记 → display:none
+     *        → A 的 scrollHeight 塌陷 → **滚动条消失**
+     *
+     * ## 判据设计：宁可少隐藏，也不塌布局
+     *
+     * 隐藏一个空行收益很小（视觉上少一条缝），
+     * 而隐藏错一个布局元素代价很大（整块区域滚不动）。
+     * 所以这里全部用「保守拒绝」：
+     *
+     *   ① 只允许行内语义元素。main/section/ul/li/table/nav/aside 这类
+     *      是骨架，绝不是「一段文字的空壳」。
+     *   ② 不能处在任何 overflow:auto/scroll 的祖先里 —— 滚动容器内部一律不碰。
+     *   ③ 不能有实际尺寸。被 flex/grid 分配了高度的空 div 是布局占位。
+     *
+     * @param {Element} el 已确认「擦完为空、无子元素」的候选元素
+     * @returns {boolean} true 才允许打标记
+     */
+    function isSafeToCollapse(el) {
+      try {
+        // ① 白名单：只碰文本容器。用 tag 白名单而不是黑名单 ——
+        //    黑名单永远列不全，白名单列不全时只是「少隐藏一个」，安全方向是对的。
+        const SAFE_TAGS = ['P', 'SPAN', 'DIV', 'BR', 'CODE', 'EM', 'STRONG', 'LI']
+        if (!SAFE_TAGS.includes(el.tagName)) return false
+
+        // 但 LI 只在它不在列表容器里时才安全？不必细究 ——
+        // 下面第 ② 条（滚动祖先）已经覆盖了绝大多数危险场景。
+
+        // ② 祖先里有滚动容器 → 一律不碰。
+        //    这一条是本次问题的直接防线：skills 面板就是一个滚动容器。
+        //
+        //    但**不能只看 overflow**。2026-11-15 实测顾虑：
+        //      - 有些容器靠 `overflow-y: auto` 的类名生效，computed 能读到 → 覆盖到
+        //      - 但另一些用 `max-height` + `overflow: hidden` 做裁剪，
+        //        或者滚动发生在**更外层的父级**（本元素只是个 flex 子项）
+        //    所以除 overflow 外，再加一条「祖先有受限高度」的判断：
+        //    只要某个祖先的高度是受限的（maxHeight / height 不是 auto），
+        //    它内部元素的显隐就可能改变滚动量 —— 一律不碰。
+        let p = el.parentElement
+        let guard = 0
+        while (p && p !== document.body && guard++ < 50) {
+          const cs = getComputedStyle(p)
+          if (cs.overflowY === 'auto' || cs.overflowY === 'scroll' ||
+              cs.overflow === 'auto' || cs.overflow === 'scroll') {
+            return false
+          }
+          // 祖先被限高（max-height / height 有值）且自身允许滚动或裁剪
+          const limitedHeight =
+            (cs.maxHeight && cs.maxHeight !== 'none') ||
+            (cs.height && cs.height !== 'auto' && cs.height !== '0px')
+          if (limitedHeight && (cs.overflowY === 'hidden' || cs.overflow === 'hidden')) {
+            return false
+          }
+          p = p.parentElement
+        }
+
+        // ③ 有实际高度 = 被布局分配了空间，隐藏会改变布局。
+        //
+        //    ⚠️ 高度和宽度不能用同一个阈值（2026-11-15 验证脚本发现）：
+        //    行内元素 `<span>` 只含空白时，高度约等于行高（可能 2px 残留），
+        //    但**宽度仍可能是几十像素**（空白字符的宽度）。
+        //    如果按宽度也卡 4px，就会把正常的空 span 全拒掉 ——
+        //    那等于这个逐行收拢功能完全失效。
+        //
+        //    判据修正：
+        //      - 高度 > 4px  → 拒绝（说明被 flex/grid 撑开，是占位块）
+        //      - 宽度不参与判断（行内元素天然有宽度）
+        //      - 例外：<br> 有行高但无内容，允许
+        const rect = el.getBoundingClientRect()
+        if (rect.height > 4 && el.tagName !== 'BR') return false
+
+        return true
+      } catch {
+        // 任何异常都按「不安全」处理 —— 少隐藏一个不会有问题
+        return false
+      }
     }
 
     /**
@@ -1443,13 +2083,102 @@ window.__ModuleLoader__.load({
     function ensureBlankStyle() {
       if (blankStyleInstalled) return
       blankStyleInstalled = true
+      // 复用已有那条，别重复注入。
+      //
+      // 2026-11-15 修：`blankStyleInstalled` 是模块级布尔，禁用→启用插件会重置它，
+      // 而 <style> 标签还留在 head 里 —— 每重载一次就多一条相同规则。
+      // 虽然重复的 CSS 不影响渲染结果，但会让 DOM 诊断里的 style 计数虚高，
+      // 也给「到底注入了什么」制造噪音。
+      if (document.querySelector('style[data-dsh-memory="blank-collapse"]')) return
       const style = document.createElement('style')
       style.dataset.dshMemory = 'blank-collapse'
+      // ⚠️ 这是一条**全局** CSS（注入 document.head，永不撤除）。
+      // 它的选择器会命中文档里任何带该属性的元素，不限于对话区。
+      //
+      // 所以「能打上这个属性」这件事必须由 isSafeToCollapse 严格把关 ——
+      // 单靠选择器收窄是不够的（CSS 没法表达「这个元素在滚动容器里」）。
       style.textContent = `
         /* 擦除器把标记抹掉后，可能留下只含空白的段落 / 分隔空节点 */
         [data-dsh-mem-blank] { display: none !important; }
       `
       document.head.appendChild(style)
+    }
+
+    /**
+     * 把 DOM 诊断结果回传到服务端日志（排查「滚动条失效」用）。
+     *
+     * 为什么要走这条路：浏览器端看不到服务端日志，DevTools 又要用户手动开。
+     * `/api/dsh-memory/client-report` 路由早就存在但一直空着（TODO 里记着），
+     * 现在给它接上真正的内容。
+     *
+     * 报告什么：**当前所有被打上 data-dsh-mem-blank 的元素**，以及它们
+     * 祖先链上的关键特征（tag / 是否有 overflow / 是否滚动容器）。
+     * 这些正是判断「标记打到了不该打的地方」所需的信息。
+     */
+    function reportDomDiagnostics() {
+      const out = {
+        url: location.pathname,
+        marks: [],
+        scrollHosts: [],
+        styles: 0,
+        // 折叠统计：判断守卫是否真的在起作用（见 collapseStats 的注释）
+        collapse: { ...collapseStats },
+      }
+      try {
+        // 1) 所有被打上标记的元素 —— 这是冲突的直接证据
+        const marked = document.querySelectorAll('[data-dsh-mem-blank]')
+        for (const el of Array.from(marked).slice(0, 30)) {
+          const cs = getComputedStyle(el)
+          out.marks.push({
+            tag: el.tagName.toLowerCase(),
+            cls: (el.className || '').toString().slice(0, 80),
+            display: cs.display,
+            h: el.getBoundingClientRect().height,
+            // 它的父元素是不是滚动容器？如果是，就能解释滚动条消失
+            parentOverflow: el.parentElement ? getComputedStyle(el.parentElement).overflowY : null,
+            parentTag: el.parentElement ? el.parentElement.tagName.toLowerCase() : null,
+          })
+        }
+
+        // 2) 当前页面上「本来能滚动、现在滚不动」的容器
+        //    scrollHeight > clientHeight 说明内容够高，但若子节点被 display:none 撑没了，
+        //    这里会表现为 scrollHeight ≈ clientHeight。
+        const all = document.querySelectorAll('*')
+        let checked = 0
+        for (const el of all) {
+          if (checked >= 40) break
+          const cs = getComputedStyle(el)
+          if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue
+          checked++
+          out.scrollHosts.push({
+            tag: el.tagName.toLowerCase(),
+            cls: (el.className || '').toString().slice(0, 60),
+            id: el.id || null,
+            clientH: el.clientHeight,
+            scrollH: el.scrollHeight,
+            // 关键：这个滚动容器里有没有被我们隐藏的子元素
+            hiddenInside: el.querySelectorAll('[data-dsh-mem-blank]').length,
+          })
+        }
+
+        // 3) head 里我们注入了多少条 style（重载会堆积）
+        out.styles = document.querySelectorAll('style[data-dsh-memory]').length
+      } catch (e) {
+        out.error = String(e?.message ?? e)
+      }
+
+      const qs = new URLSearchParams({
+        dom: '1',
+        state: 'dom-diagnostics',
+        detail: JSON.stringify(out),
+      })
+      fetch(`/api/dsh-memory/client-report?${qs.toString()}`).catch(() => {})
+    }
+
+    // 暴露到 window 供手动触发（用户在 DevTools 里敲一行即可回传当前结构）。
+    // 不自动跑：DOM 诊断会遍历全文档，不该在每次装载时都付这个成本。
+    if (typeof window !== 'undefined') {
+      window.__dshMemoryReportDom = reportDomDiagnostics
     }
 
     /**

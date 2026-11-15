@@ -64,21 +64,6 @@ const DEFAULT_BUDGET = { factsBytes: 8000, policyBytes: 8000, projectBytes: 4096
 
 const byteLen = (s) => Buffer.byteLength(String(s ?? ''), 'utf8')
 
-/** 按字节截断，不切多字节字符 */
-function truncateBytes(text, maxBytes) {
-  const t = String(text ?? '')
-  if (byteLen(t) <= maxBytes) return { text: t, truncated: false }
-  let used = 0
-  let cut = 0
-  for (const ch of t) {
-    const size = byteLen(ch)
-    if (used + size > maxBytes) break
-    used += size
-    cut += ch.length
-  }
-  return { text: t.slice(0, cut).replace(/\uFFFD+$/u, ''), truncated: true }
-}
-
 /**
  * 写入时间统一用**本地时间**（不带 Z），格式 `YYYY-MM-DDTHH:mm:ss.sss`。
  *
@@ -107,6 +92,15 @@ const nowIso = () => {
  *    保留原文是为了记住「为什么排序最终用 id」—— 那仍然有效：
  *    迁移来的老数据内部有逆序（第 3 条），任何按 ts 的排序都救不了。
  *
+ * ## 曾有一个 tsSortKey() 常量，2026-11-15 删除
+ *
+ * 它做的是「截到年-月-日 时:分」的粗粒度比较（`substr(ts,1,16)`）。
+ * 但实际排序用的是下面那个 **TS_ORDER 常量**（id 主排序），这个函数式的
+ * 版本从 1.0.0 起就没被调用过，属于重构遗留。
+ *
+ * 保留它想表达的结论：**只比较到分钟是不够的** ——
+ * 同一分钟内的顺序要靠 id 决定，否则 ts 精度差异（有无毫秒）会干扰排序。
+ *
  * 以下为历史记录（2026-11-13 排查现场）：
  * 库里 355 条流水的时间戳有三种毛病叠在一起：
  *
@@ -124,12 +118,7 @@ const nowIso = () => {
  *
  * 对第 3 条的结论：**老数据的时间本身不可信，不能用它当唯一排序依据**。
  * 而 id 是插入顺序，迁移后新写入的 id 严格递增 —— 它比 ts 可靠得多。
- *
- * 所以排序策略是「ts 优先、id 兜底」，且 ts 只做**粗粒度**比较
- * （截到「年-月-日 时:分」），这样同一分钟内的顺序由 id 决定，
- * 避免 ts 精度差异（有无毫秒）干扰。
  */
-const tsSortKey = (col = 'ts') => `substr(${col}, 1, 16)`
 
 /**
  * 流水页的排序子句。
@@ -535,8 +524,88 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     return { ok: true, id }
   }
 
+  // ============================================================
+  // 工作区（scope）迁移
+  // ============================================================
+
+  /** 有 scope 列的表。profile / emotion 是「用户这个人」，不分项目，迁移不碰。 */
+  const SCOPE_TABLES = ['rules', 'logs', 'archive']
+
   /**
-   * 把一个 scope 的所有数据改名成另一个（项目改名用）。
+   * 采一份 scope 的数据量快照 —— **迁移前与迁移后都用这一个函数**。
+   *
+   * ## 为什么要快照而不是只数条数
+   *
+   * 用户 2026-11-15 的要求：迁移前先整理「待迁移区域的数据量」，
+   * 迁移后报告「与迁移前是否一致」。
+   *
+   * 只数条数是不够的 —— 若 UPDATE 漏掉一批、又误伤另一批，总量可能碰巧不变。
+   * 所以每张表同时记 `minId` / `maxId`：**行集合没变，头尾就没理由变**。
+   *
+   * ## 为什么给两套数字（all / active）
+   *
+   * 同一个 scope 在不同入口能读出三个数（2026-11-15 实测 SoftTest：
+   * `dryRun` 说 162、`/state` 的 byScope 说 42、`listScopes('rules')` 说没有）：
+   *   - `countScope` 原来不按 status 过滤 → 把已删条目也算进去
+   *   - `byScope` 只数 active 的 rules + logs
+   *   - `archive` 压根不进任何统计
+   * 三个数都有各自的道理，但用户点「预览影响」时只看到一个，必然误判。
+   * 所以这里一次给全，让调用方把口径摊开说清楚。
+   *
+   * ⚠️ `archive` 表**没有 status 列**（原文层一条不落，没有「停用」概念），
+   * 所以它的 `all` 与 `active` 恒等。这不是算错，调用方要照实展示。
+   *
+   * @param {string} scope 要采样的工作区名
+   * @returns {{scope:string, tables:Record<string,{all:number,active:number,minId:number|null,maxId:number|null}>, total:{all:number,active:number}}}
+   */
+  function snapshotScope(scope) {
+    const s = String(scope ?? '')
+    const d = open()
+    const tables = {}
+    let allTotal = 0
+    let activeTotal = 0
+
+    for (const t of SCOPE_TABLES) {
+      // archive 没有 status 列，只有它不能被 status='active' 过滤
+      const hasStatus = t !== 'archive'
+      const row = hasStatus
+        ? d
+            .prepare(
+              `SELECT COUNT(*) all_, SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) act, MIN(id) mn, MAX(id) mx
+               FROM ${t} WHERE scope=?`,
+            )
+            .get(s)
+        : d
+            .prepare(`SELECT COUNT(*) all_, COUNT(*) act, MIN(id) mn, MAX(id) mx FROM ${t} WHERE scope=?`)
+            .get(s)
+
+      const all = Number(row?.all_ ?? 0)
+      // 👆 无行时 SQLite 的 SUM 返回 NULL，不能直接转数字
+      const active = hasStatus ? Number(row?.act ?? 0) : all
+      tables[t] = {
+        all,
+        active,
+        minId: all > 0 ? Number(row?.mn) : null,
+        maxId: all > 0 ? Number(row?.mx) : null,
+      }
+      allTotal += all
+      activeTotal += active
+    }
+
+    return { scope: s, tables, total: { all: allTotal, active: activeTotal } }
+  }
+
+  /** 数一个 scope 在某表里有多少行（干跑用，单表版） */
+  function countScope(table, scope, { activeOnly = false } = {}) {
+    const t = String(table ?? '')
+    if (!SCOPE_TABLES.includes(t)) throw new Error(`该表没有 scope 列：${t}`)
+    // archive 没有 status 列，activeOnly 对它无效（原文层不分启用/停用）
+    const where = activeOnly && t !== 'archive' ? `scope=? AND status='active'` : `scope=?`
+    return open().prepare(`SELECT COUNT(*) c FROM ${t} WHERE ${where}`).get(String(scope ?? '')).c
+  }
+
+  /**
+   * 把一个 scope 的全部数据改名成另一个（工作区改名用）。
    *
    * 2026-11-15 加：用户把工作区 `干杂活` 改名成 `SoftTest`，
    * 但库里 129 条数据仍挂在旧 scope 上 —— 查新名字一条都查不到。
@@ -546,11 +615,41 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
    * summary / keywords），所以改 scope 不影响检索，也不存在索引失配。
    * 这点已核对 db-schema.mjs 的 FTS_COLUMNS 与建表语句，不是推测。
    *
+   * ## 迁移内建的「前后一致性」校验（2026-11-15 用户要求）
+   *
+   * 用户原话：「迁移前先整理待迁移区域的数据量，迁移后报告与迁移前是否一致」。
+   * 所以这里不是「改完返回 ok」而是**自己验一遍**：三张表各比对三项，
+   * 任何一项不符就 **ROLLBACK** 并把差异原样报出来。
+   *
+   * ## 合并（allowMerge）—— 2026-11-15 用户追加要求
+   *
+   * 用户原话：「这里允许合并，新建工作区然后再去迁移记忆的情况是很常见的」。
+   *
+   * 场景：用户先建了工作区「大白饭」，在里面聊了几句（产生了原文），
+   * 然后想把旧工作区「SoftTest」的记忆并进来。此时目标区域**必然非空**，
+   * 如果一律拒绝，这条路就走不通。
+   *
+   * 所以：
+   *   - 默认（allowMerge=false）仍然拒绝，保持 API 的保守语义
+   *   - `allowMerge: true` 时合并：`to` 原有的行**原样保留**，`from` 的行改挂过去
+   *   - **校验公式随合并调整**（这是最容易写错的地方）：
+   *       ① 条数：迁后 to = 迁前 from + 迁前 to
+   *       ③ 行集合：迁后 to 的 id 跨度 = 两者并集。
+   *          即 min=min(from.min, to.min)、max=max(from.max, to.max)。
+   *          注意目标原先为空时其 min/max 是 null，要单独处理。
+   *
+   * **合并后两批数据无法再拆开** —— 这是用户已知的取舍（备份是唯一退路），
+   * 所以 GUI 必须在预览里把「会合并多少、合并后一共多少」说清楚。
+   *
    * @param {string} from 旧 scope
    * @param {string} to   新 scope
-   * @returns {{ok:boolean, from:string, to:string, tables:Record<string,number>, total:number}}
+   * @param {{allowMerge?: boolean, force?: boolean}} [options]
+   *   allowMerge=true  目标已有数据时合并而非拒绝
+   *   force=true       跳过占用检查（仅供自检脚本模拟）
+   * @returns {{ok:boolean, from:string, to:string, merged:boolean, tables:Record<string,number>, total:number,
+   *            before:object, targetBefore:object, after:object, verify:object}}
    */
-  function renameScope(from, to) {
+  function renameScope(from, to, options = {}) {
     const a = String(from ?? '').trim()
     const b = String(to ?? '').trim()
     if (a === '' || b === '') throw new Error('需要 from 与 to')
@@ -559,23 +658,129 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     if (a === GLOBAL || b === GLOBAL) throw new Error(`${GLOBAL} 是保留值，不能改名`)
 
     const d = open()
+
+    // ---- 迁前：待迁移区域的数据量 ----
+    const before = snapshotScope(a)
+    if (before.total.all === 0) {
+      throw new Error(`工作区「${a}」没有任何数据，无需迁移（检查名字是否写错）`)
+    }
+
+    // ---- 迁前：目标区域的数据量（合并时要用它算校验基线）----
+    const targetBefore = snapshotScope(b)
+
+    // ---- 目标占用检查：默认拒绝，allowMerge 时合并 ----
+    let merged = false
+    if (options.force !== true) {
+      const hasTarget = targetBefore.total.all > 0
+      if (hasTarget && options.allowMerge !== true) {
+        const detail = SCOPE_TABLES.filter((t) => targetBefore.tables[t].all > 0)
+          .map((t) => `${t} ${targetBefore.tables[t].all} 行`)
+          .join('、')
+        throw new Error(
+          `目标工作区「${b}」已有数据（${detail}）。` +
+            `如需把两者合并，请勾选「合并到目标工作区」后重试。`,
+        )
+      }
+      merged = hasTarget
+    }
+
+    // ---- 事务：三张表一起改，任一失败整体回滚 ----
+    //
+    // 原来没有事务：逐表 UPDATE，第 2 张表失败就只改了一半，
+    // 而界面上还报「迁移完成」。这是 2026-11-15 审出来的最危险的一条。
     const tables = {}
     let total = 0
-    // 只有这两张表有 scope 列（profile / emotion 是「用户这个人」，不分项目）
-    for (const t of ['rules', 'logs', 'archive']) {
-      const before = d.prepare(`SELECT COUNT(*) c FROM ${t} WHERE scope=?`).get(a).c
-      if (before > 0) d.prepare(`UPDATE ${t} SET scope=? WHERE scope=?`).run(b, a)
-      tables[t] = before
-      total += before
+    d.exec('BEGIN')
+    try {
+      for (const t of SCOPE_TABLES) {
+        const n = before.tables[t].all
+        if (n > 0) d.prepare(`UPDATE ${t} SET scope=? WHERE scope=?`).run(b, a)
+        tables[t] = n
+        total += n
+      }
+      d.exec('COMMIT')
+    } catch (error) {
+      d.exec('ROLLBACK')
+      throw new Error(`迁移失败已回滚（数据未变）：${error?.message ?? error}`)
     }
-    return { ok: true, from: a, to: b, tables, total }
-  }
 
-  /** 数一个 scope 在某表里有多少行（干跑用） */
-  function countScope(table, scope) {
-    const t = String(table ?? '')
-    if (!['rules', 'logs', 'archive'].includes(t)) throw new Error(`该表没有 scope 列：${t}`)
-    return open().prepare(`SELECT COUNT(*) c FROM ${t} WHERE scope=?`).get(String(scope ?? '')).c
+    // ---- 迁后：同一函数再采一次，逐项比对 ----
+    const afterNew = snapshotScope(b)
+    const afterOld = snapshotScope(a)
+
+    const checks = []
+    const fail = []
+    for (const t of SCOPE_TABLES) {
+      const wantFrom = before.tables[t]
+      const wantTarget = targetBefore.tables[t]
+      const gotNew = afterNew.tables[t]
+      const gotOld = afterOld.tables[t]
+
+      // ① 条数：非合并 = from 的；合并 = from + 目标原有的
+      const wantCount = merged ? wantFrom.all + wantTarget.all : wantFrom.all
+      const countOk = gotNew.all === wantCount
+      checks.push({
+        table: t,
+        check: merged ? 'count-merged' : 'count',
+        want: wantCount,
+        got: gotNew.all,
+        ok: countOk,
+        detail: merged ? `${wantFrom.all}（迁入）+ ${wantTarget.all}（原有）` : undefined,
+      })
+      if (!countOk) {
+        fail.push(
+          merged
+            ? `${t} 合并后条数不符：期望 ${wantFrom.all}+${wantTarget.all}=${wantCount}，实际 ${gotNew.all}`
+            : `${t} 条数不符：迁前 ${wantCount} → 迁后 ${gotNew.all}`,
+        )
+      }
+
+      // ② 旧区归零
+      const emptyOk = gotOld.all === 0
+      checks.push({ table: t, check: 'old-empty', want: 0, got: gotOld.all, ok: emptyOk })
+      if (!emptyOk) fail.push(`${t} 旧区残留 ${gotOld.all} 条`)
+
+      // ③ 行集合
+      //    非合并：必须与迁前完全一致
+      //    合并：必须是两者的并集（目标原为空时就是迁前 from 的）
+      const spans = [wantFrom, wantTarget].filter((x) => x.all > 0 && x.minId !== null)
+      const wantMin = spans.length > 0 ? Math.min(...spans.map((x) => x.minId)) : null
+      const wantMax = spans.length > 0 ? Math.max(...spans.map((x) => x.maxId)) : null
+      const idsOk = gotNew.minId === wantMin && gotNew.maxId === wantMax
+      checks.push({
+        table: t,
+        check: merged ? 'id-range-merged' : 'id-range',
+        want: `${wantMin}-${wantMax}`,
+        got: `${gotNew.minId}-${gotNew.maxId}`,
+        ok: idsOk,
+      })
+      if (!idsOk) {
+        fail.push(`${t} 行集合变了：期望 ${wantMin}-${wantMax}，实际 ${gotNew.minId}-${gotNew.maxId}`)
+      }
+    }
+
+    // 校验不过说明「事务提交了但内容不对」——这种情况极罕见（逻辑错才会），
+    // 但不能装作成功：把差异原样抛出去，让调用方决定要不要用备份回退。
+    if (fail.length > 0) {
+      throw new Error(`迁移后校验未通过，请用备份回退：${fail.join('；')}`)
+    }
+
+    return {
+      ok: true,
+      from: a,
+      to: b,
+      // merged=true 表示这次是「并进一个已有工作区」，而不是新开一个名字。
+      // GUI 要据此把结果文案写成「已合并」而不是「已改名」。
+      merged,
+      tables,
+      total,
+      // 迁前 / 迁后两份快照原样返回，GUI 要拿来并排展示
+      before,
+      // 合并时目标区域原有的数据量（非合并时全为 0）
+      targetBefore,
+      after: { to: afterNew, from: afterOld },
+      verify: { ok: true, checks },
+    }
   }
 
   /** 项目规则升级为全局（单向，不提供降级） */
@@ -1037,6 +1242,50 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
   }
 
   /**
+   * 列出**所有**存在数据的工作区（工作区改名页的下拉框用）。
+   *
+   * ⚠️ 为什么不能复用 `listScopes` 或 `/state` 的 `byScope`：
+   * 那两个都只统计 `status='active'` 的 rules + logs，而且完全不看 archive。
+   * 2026-11-15 实测踩到 —— 工作区 `design` 有 **18 行 rules 全部是停用状态**，
+   * 于是 `byScope` 里根本没有它，下拉框就漏掉了这个有数据的工作区，
+   * 用户会以为「没有 design 这个工作区」。
+   *
+   * 所以这里按 `snapshotScope` 同一口径数：三张表**全部行**（不过滤 status），
+   * 保证「下拉框里有的 = 改名时确实会动的」。
+   *
+   * @param {{includeGlobal?: boolean}} [options] includeGlobal 默认 false ——
+   *   `__global__` 是保留值，不能改名，列在「选择要改名的工作区」下拉里只会误导
+   *   （点下去必然被后端拒绝）。需要统计全局规则的地方自行传 true。
+   * @returns {Array<{scope:string, total:number, tables:Record<string,number>}>} 按总数降序
+   */
+  function listScopesWithData({ includeGlobal = false } = {}) {
+    const d = open()
+    // 三张表的 scope 并集，再逐个数。用 UNION 一次拿全，避免三次全表扫描。
+    const rows = d
+      .prepare(
+        `SELECT scope, 'rules' t, COUNT(*) n FROM rules GROUP BY scope
+         UNION ALL
+         SELECT scope, 'logs' t, COUNT(*) n FROM logs GROUP BY scope
+         UNION ALL
+         SELECT scope, 'archive' t, COUNT(*) n FROM archive GROUP BY scope`,
+      )
+      .all()
+
+    const agg = new Map()
+    for (const r of rows) {
+      const key = r.scope
+      const cur = agg.get(key) ?? { scope: key, total: 0, tables: { rules: 0, logs: 0, archive: 0 } }
+      cur.tables[r.t] = Number(r.n)
+      cur.total += Number(r.n)
+      agg.set(key, cur)
+    }
+    return [...agg.values()]
+      .filter((x) => x.total > 0)
+      .filter((x) => includeGlobal || x.scope !== GLOBAL)
+      .sort((a, b) => b.total - a.total || a.scope.localeCompare(b.scope))
+  }
+
+  /**
    * 扫描全部条目中的人称问题（GUI 的「检查」按钮用）。
    * 只报告，不改数据。
    */
@@ -1112,8 +1361,8 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     appendLog, appendFact, appendProjectNote, recordEmotion, createEntry, appendArchive,
     // 维护
     setReview, softDelete, setStatus, updateText, upgradeToGlobal, removeGlobalByRegex, setTopic,
-    // 改名（项目 scope 迁移，2026-11-15）
-    renameScope, countScope,
+    // 工作区改名（scope 迁移，2026-11-15）：snapshotScope 是迁前/迁后共用的数据量采样
+    renameScope, countScope, snapshotScope, listScopesWithData, SCOPE_TABLES,
     // 检索
     search, listEntries, listScopes, getById, stats, scanPersona, listArchive, lastLogTs,
     // 体积分层（单独一条路由用，别塞进 stats）

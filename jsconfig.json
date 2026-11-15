@@ -1,0 +1,72 @@
+{
+  // jsconfig.json —— 让 tsserver 对纯 JS 项目做**类型推断**，而不只是语法检查。
+  //
+  // 为什么需要它（2026-11-15 实测）：
+  //   没有这个文件时，tsserver 只报「未使用变量」这类 Hint。
+  //   探针验证过：`undefinedVariable123` + `x.foo()` 这种必然出错的代码
+  //   **一条诊断都不报** —— 因为它不做跨文件/类型推断。
+  //
+  // 为什么是 jsconfig 不是 tsconfig：项目是纯 JS（0 个 .ts）。
+  // jsconfig 就是「allowJs + checkJs 预设」的 tsconfig，语义更贴。
+  //
+  // ⚠️ 刻意不开 strict：
+  //   8400 行历史代码开 strict 会一次刷出几百条，没人会去修，最后等于没开。
+  //   先让检查跑起来、只保留能抓到真问题的项，再逐条收紧。
+  "compilerOptions": {
+    // 对 .js 也做类型推断（这是本文件的核心目的）
+    "checkJs": true,
+    "allowJs": true,
+
+    // 只检查，不产出。项目没有构建步骤，tsc 不应生成任何文件
+    "noEmit": true,
+
+    // 插件用 Node 24 跑，ES2022 足够（顶层 await、class fields 都支持）
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+
+    // ---- 刻意关掉的三项 ----
+    // 1) strict：历史代码量太大，见文件头
+    "strict": false,
+    // 2) noImplicitAny：同上，隐式 any 在这项目里遍地都是
+    "noImplicitAny": false,
+    // 3) types 为空 —— **不引入 @types/node**。
+    //    这个项目零依赖是它的卖点（AGENTS.md），为类型检查加一个 devDep
+    //    会把 node_modules 和 lockfile 带进来。
+    //    代价是 Buffer / process 等 Node 全局认不出来，
+    //    所以下面用 types/node-globals.d.ts 手写最小声明补上。
+    "types": [],
+
+    // 保留 `//` 注释（本文件自己就靠注释解释取舍）
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+
+    // ⚠️ 关掉「隐式 any 参数」提示（TS7044）。
+    //
+    // 2026-11-15 实测：开启 checkJs 后，index.js 一个文件就刷出 100+ 条
+    // 「Parameter 'x' implicitly has an 'any' type」。
+    // 这个项目 8400 行全是 JS，没有一处类型标注 —— 这些提示的信息量约等于零，
+    // 而它们会把真正的问题（对象形状不符、属性不存在）淹没掉。
+    //
+    // 想看的话单独跑一次、加 --noImplicitAny 即可，不要常态开着。
+    "noImplicitAny": false,
+
+    // 别对没有类型定义的 import 报错：插件从 DSH 宿主注入 require，
+    // 第三方模块（react 等）在 client.js 里是运行时才有的，无法解析
+    "skipLibCheck": true
+  },
+  "include": [
+    "dsh-fatfishdream-memory/**/*.js",
+    "dsh-fatfishdream-memory/**/*.mjs",
+    "types/**/*.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    // 回归脚本是一次性/独立性较强的工具，不属于产品代码。
+    // 它们大量用 process.argv / 动态 import，类型化收益低、噪音高。
+    "_dbpreview",
+    // 备份目录里是历史副本，检查它们只会污染结果
+    "dsh-fatfishdream-memory/*.pre-*",
+    "dsh-fatfishdream-memory/_backup-*"
+  ]
+}

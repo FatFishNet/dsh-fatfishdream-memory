@@ -32,7 +32,6 @@ const targets = [
   ['idx', /^\s*let dbStore/, 'let dbStore'],
   ['idx', /^\s*const getDbStore/, 'getDbStore'],
   ['idx', /^\s*const dbStoreExists/, 'dbStoreExists'],
-  ['idx', /^\s*const dbPathOf/, 'dbPathOf'],
   ['idx', /^\s*const checkWritableRoot/, 'checkWritableRoot'],
   ['idx', /^\s*const dispose = ctx\.systemPrompt\.context/, 'systemPrompt.context'],
   ['idx', /^\s*function renderFromDb/, 'renderFromDb'],
@@ -43,8 +42,6 @@ const targets = [
   ['idx', /^\s*function findTableById/, 'findTableById'],
   ['idx', /^\s*function readHeartbeat/, 'readHeartbeat'],
   ['idx', /^\s*async function writeHeartbeat/, 'writeHeartbeat'],
-  ['idx', /^\s*function reportBudget/, 'reportBudget'],
-  ['idx', /^\s*function looksLikeRedline/, 'looksLikeRedline'],
   ['idx', /^\s*const WRITE_TOOLS/, 'WRITE_TOOLS'],
   ['idx', /^\s*const PWSH_WRITE_PATTERNS/, 'PWSH_WRITE_PATTERNS'],
   ['idx', /^\s*const isWriteLikeCall/, 'isWriteLikeCall'],
@@ -54,7 +51,6 @@ const targets = [
   ['idx', /^\s*const runHealthCheck/, 'runHealthCheck'],
   ['idx', /^\s*async function ensureLayout/, 'ensureLayout'],
   ['idx', /^\s*async function overview/, 'overview'],
-  ['idx', /^\s*function measureInjection/, 'measureInjection'],
   ['idx', /^\s*function stripPolicyPhrases/, 'stripPolicyPhrases'],
   ['idx', /^\s*function resolveProjectKey/, 'resolveProjectKey'],
   ['idx', /^\s*const formatX/, 'formatX(占位，不存在则跳过)'],
@@ -173,8 +169,157 @@ const totals = {
   'db-schema.mjs': schema[schema.length - 1] === '' ? schema.length - 1 : schema.length,
   'client.js': client[client.length - 1] === '' ? client.length - 1 : client.length,
 }
+
+// ============================================================
+// C 段：死代码检测 —— 「还定义着，但已经没人调用」
+// ============================================================
+//
+// 为什么需要这一段（2026-11-15 发现）：
+//   上面 A 段的断言只证明「这个符号还在文件里」。
+//   死代码能完美通过 A 段 —— 它当然还在，只是没人调用。
+//
+//   实测代价：`reportBudget` 从 2026-11-13 起就没有任何调用点，
+//   但文档一直写着「写入成功后 reportBudget 检查预算」。
+//   结果是**预算告警静默失效两天**，而全量回归一直是绿的。
+//   日志里最后一条 [mem-预算告警] 停在 11-13T03:57，之后再没出现过。
+//
+//   同类还查出：dbPathOf / looksLikeRedline / measureInjection。
+//
+// 检测方法：在整个文件里数「除定义行外」还出现过几次。
+//   - 0 次 → 死代码
+//   - ≥1 次 → 视为有人用（不区分是函数调用还是值传递）
+//
+// ⚠️ 必须排除注释行，否则注释里提到函数名会被当成「有人用」。
+//    这个项目注释极多（中文注释解释「为什么」），不排除的话几乎查不出任何死代码。
+//
+// ⚠️ 只对**函数与 const/let 声明**做检测。不做全局扫描的原因：
+//    index.js 里有大量「从 config 解构出来的局部变量」，
+//    它们本来就可能只在一处出现，纳入检测会制造大量误报。
+
+/** 判断一行是不是纯注释（行注释或块注释的续行） */
+function isCommentLine(line) {
+  const t = line.trim()
+  return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')
+}
+
+/**
+ * 统计一个名字在源码里的「非定义、非注释」出现次数。
+ * @returns {{defLine:number, refs:number}} 找不到定义时 defLine = -1
+ */
+function usageOf(lines, name) {
+  const defRe = new RegExp(`^\\s*(async\\s+)?(function|const|let)\\s+${name}\\b`)
+  let defLine = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (defRe.test(lines[i])) { defLine = i; break }
+  }
+  if (defLine < 0) return { defLine: -1, refs: -1 }
+
+  // 用单词边界统计，避免 reportBudgetX 之类被算进来
+  const wordRe = new RegExp(`\\b${name}\\b`)
+  let refs = 0
+  for (let i = 0; i < lines.length; i++) {
+    if (i === defLine) continue
+    if (isCommentLine(lines[i])) continue
+    if (wordRe.test(lines[i])) refs++
+  }
+  return { defLine: defLine + 1, refs }
+}
+
+// 参与死代码检测的符号 —— **自动从源码里发现，不维护手工名单**。
+//
+// 为什么不用手工名单（2026-11-15 踩到）：
+//   第一版我列了 35 个名字。然后注入一个故意写的死函数做验证，
+//   结果**检测不出** —— 因为新函数不在名单里。
+//   手工名单的根本问题是：**新代码默认不被检查**，
+//   而死代码恰恰全是「后来才变成死的」或「新写的但忘了接」。
+//
+// ## 作用域判断：为什么缩进只允许 0~2 格
+//
+// index.js 的结构是「apply(ctx) { ... }」把几乎所有东西包在里面，
+// 所以大量函数声明在**缩进 2 格**处（apply 体内），而不是行首：
+//
+//   顶格（0 格）：createStore / analyzeEmotion / readStateSync 等模块级
+//   缩进 2 格  ：reportBudget / looksLikeRedline / dbPathOf —— 都在 apply 里
+//
+// 第一版只认「行首无缩进」，结果把这批**真死代码全部漏掉**，
+// 反而把 4 个模块级的长年死代码报了出来（monthKey / stamp / findSecret / truncateBytes）。
+// 所以作用域判据是「缩进 ≤ 2」，再深就是函数内的嵌套回调，不纳入检测。
+//
+// 刻意排除的两类（在下面过滤掉）：
+//   1) 导出的（export function / export const）：由宿主调用，本文件里没引用是正常的
+//   2) 大写常量（const LEXICON）：不是可调用实体
+function discoverFunctions(lines) {
+  const found = []
+  for (const line of lines) {
+    // 缩进超过 2 格 = 函数体内的嵌套函数，不纳入
+    const indent = line.length - line.trimStart().length
+    if (indent > 2) continue
+    // 导出的由宿主调用，本文件里不出现引用是正常的
+    if (/^\s*export\s+/.test(line)) continue
+
+    const m = line.match(/^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/)
+    if (m) { found.push(m[1]); continue }
+
+    // const 箭头函数：只认小写开头的（大写是常量，不是可调用实体）
+    const a = line.match(/^\s*const\s+([a-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/)
+    if (a) found.push(a[1])
+  }
+  return found
+}
+
+const deadCodeCandidates = []
+for (const f of ['idx', 'store']) {
+  for (const name of discoverFunctions(files[f])) {
+    deadCodeCandidates.push([f, name])
+  }
+}
+
+console.log('\n=== C. 死代码检测（定义还在、但已无人调用）===\n')
+
+// 已知死代码白名单。
+//
+// 为什么需要白名单而不是「发现就报错」：
+//   删不删是人的决定，不是脚本的决定。有些函数是**故意留着**的
+//   （等以后再接回调用点，或作为「曾经存在」的记录）。
+//   与其让回归常年红着，不如显式登记「我知道它是死的」。
+//
+// ⚠️ 白名单的语义是「**已核实**、暂留」，不是「没查过就先塞进来」。
+//    2026-11-15 踩过：truncateBytes 被自动发现报出来后，我没回去核实
+//    就直接加进白名单，而它其实在 index.js L1470 / L1537 有**两处真实调用**。
+//    白名单最危险的用法就是「把没查当成已查」—— 下次加之前先 grep 调用点。
+//
+// 当前状态（2026-11-15）：**已清空**。
+//   原来登记的 10 个已在同日全部删除，删除时保留了各自的教训注释。
+const knownDead = new Set([
+  // 暂无。新增死代码时，先确认它真的没人调用，再决定「删」还是「登记在这里」。
+])
+
+let deadNew = 0
+for (const [f, name] of deadCodeCandidates) {
+  const { defLine, refs } = usageOf(files[f], name)
+  if (defLine < 0) {
+    // A 段已经会因为「找不到」而报错，这里不重复计
+    continue
+  }
+  if (refs === 0) {
+    if (knownDead.has(name)) {
+      console.log(`  ☠️  ${name}（L${defLine}）无人调用 —— 已登记在白名单`)
+    } else {
+      deadNew++
+      console.log(`  ❌ ${name}（L${defLine}）无人调用，且不在白名单里`)
+      console.log(`     要么接回调用点，要么删掉；确认要暂时保留就加进 knownDead`)
+    }
+  }
+}
+
+if (deadNew === 0) {
+  console.log(`  （${deadCodeCandidates.length} 个符号已检查，无新增死代码）`)
+}
+
 console.log('\n源码规模:', Object.entries(totals).map(([k, v]) => `${k}=${v}`).join('  '))
 console.log(
-  `${fail === 0 && missing === 0 ? '✅ 全部对上' : '❌ 有问题'}：${pass} 通过 / ${fail} 失败 / ${missing} 找不到`,
+  `${fail === 0 && missing === 0 && deadNew === 0 ? '✅ 全部对上' : '❌ 有问题'}：` +
+    `${pass} 通过 / ${fail} 失败 / ${missing} 找不到` +
+    `${deadNew > 0 ? ` / ${deadNew} 处新增死代码` : ''}`,
 )
-process.exit(fail === 0 && missing === 0 ? 0 : 1)
+process.exit(fail === 0 && missing === 0 && deadNew === 0 ? 0 : 1)

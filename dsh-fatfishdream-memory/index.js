@@ -389,14 +389,6 @@ function pad(n) {
   return String(n).padStart(2, '0')
 }
 
-function monthKey(date = new Date()) {
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}`
-}
-
-function stamp(date = new Date()) {
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
-
 function localDay(date = new Date()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
 }
@@ -488,6 +480,14 @@ function truncateBytes(text, maxBytes) {
   return { text: result, truncated: true }
 }
 
+// ⚠️ 保留一份敏感信息模式表，但**当前没有任何调用点**（2026-11-15 确认）。
+//
+// 历史：原本配了 findSecret() 想用它扫描待写入的记忆，防止把 API key 存进库里。
+// 但写入路径从没接上（从 1.0.0 首版起就是这样），findSecret 已删除。
+//
+// 为什么常量还留着：它记录的是「哪些形态算密钥」这个**知识**，不是一段逻辑。
+// 将来真要在写入路径加脱敏，这张表可以直接用。
+// 如果确定不再做这件事，连这张表一起删 —— 别让它变成下一个「孤儿常量」。
 const SECRET_PATTERNS = [
   /\bsk-[A-Za-z0-9_-]{16,}\b/,
   /\bAIza[0-9A-Za-z_-]{25,}\b/,
@@ -497,13 +497,6 @@ const SECRET_PATTERNS = [
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
 ]
-
-function findSecret(text) {
-  for (const pattern of SECRET_PATTERNS) {
-    if (pattern.test(text)) return pattern.source
-  }
-  return undefined
-}
 
 async function readIfExists(path) {
   try {
@@ -656,6 +649,8 @@ const POLICY_TEMPLATE = `# 记忆规则
 - **流水必须带 topic 和 summary**（2026-11-13 / 2026-11-14）：
   标记行写成 \`<!--mem-log topic=<分类> summary=<≤35 字> keywords=<词A｜词B>\`，再换行写正文。
   **参数顺序固定** topic → summary → keywords，不能分行、不能换顺序（正则按此顺序解析）。
+  **正文不要写空行**（2026-11-16）：标记在流式输出时会以原文短暂可见，擦除器擦掉文字后，
+  每个空行会留下一个空段落、仍占行高 —— 表现为「回复底部空出一大块」。要分段就用一个换行。
   - topic：13 个分类之一（下方清单）。不带 topic 的流水不会进「记忆索引」，等于对以后的自己隐形。
   - summary：一句话说清这条讲了什么，≤35 字。不写摘要的流水，检索时只能靠正文前 80 字截断兜底，常截在句子中间。
   - keywords：检索用的技术名词，用全角竖线 \`｜\` 分隔（**不要用逗号**，逗号会和正文混淆）；
@@ -698,6 +693,13 @@ const POLICY_TEMPLATE = `# 记忆规则
 
 ## 记什么（模型只记第一条）
 - 流水（logs 表）：做了什么、踩坑、验证结果、提交边界。事实，不含判断。
+- **用户指出的问题、提出的需求、讲的做事偏好，一律记流水。**
+  即便那条消息同时带着情绪 —— **判成情绪不影响记流水，两者是独立的通道**。
+  典型漏记（2026-11-16 用户实报）：
+  「你缺少实用的技能包」「你有可用的能力只是用得少」「走正规流程想想你刚才回复的是什么」。
+  这些句子都命中了情绪词典（宝贝 / 喜欢 / 漂亮），于是只写了 emotion，
+  技术内容一个字没留 —— 下一个会话完全不知道用户提过这些。
+- 判断标准：**这条会让下一个会话的我少走一次弯路吗？** 会 → 记；不会 → 不记。
 - 项目规则（rules 表，scope=项目名）：由**用户**在 GUI 维护，本项目独有的约定、决策、架构、坑。
 - 用户画像（profile 表）：由**用户**在 GUI 维护，跨项目通用的事实与偏好，以及用户的处境。
 
@@ -705,6 +707,9 @@ const POLICY_TEMPLATE = `# 记忆规则
 - 密钥值（记"去哪找"，不记值）。
 - 会腐烂的当前状态：版本号、tip commit、测试数量。
 - 代码和 git 已经记录的内容。
+- **闲聊、寒暄、纯情绪交流**：不记。但注意上一条 ——
+  「带着情绪的实质反馈」要记，只有**纯**寒暄才不记。
+- **同一结论的复述**：用户换个问法再问一遍，不记第二条。
 
 ## 怎么写
 - 一条 = 一个结论，一行。
@@ -875,6 +880,15 @@ const INTENSIFIERS = [
 const DIMINISHERS = [
   { words: ['有点', '稍微', '略微', '些许', '几分'], factor: 0.6 },
   { words: ['还算', '勉强', '凑合'], factor: 0.5 },
+  // 2026-11-15 加：「部分」「一半」「局部」这类**完成度**限定。
+  //
+  // 实测漏判：「部分搞定了，剩下的明天做」被判成 strong 喜悦（0.8）。
+  // 「部分」在命中词**前面**，而原来的 DIMINISHERS 只有「稍微/有点」这类
+  // **程度**词，没有**完成度**词 —— 二者的区别：
+  //   程度轻微（有点开心）→ 情绪本身弱
+  //   完成度部分（部分搞定）→ 事情本身没完成，谈不上喜悦
+  // 后者更该降权，所以因子更低（0.45）。
+  { words: ['部分', '一半', '局部', '大半'], factor: 0.45 },
 ]
 
 const ADVERSATIVES = ['但是', '不过', '可是', '然而']
@@ -1047,6 +1061,50 @@ function modifierBefore(text, pos, window = 3) {
 }
 
 /**
+ * 词条**后面**的限定词：`成功了一半`、`对了三分之一`、`开心了一点点`。
+ *
+ * 为什么单独一个函数、而不是并进 modifierBefore（2026-11-15 实修）：
+ *   `modifierBefore` 只看命中词**前面** 3 个字符。而中文的削弱语
+ *   大量出现在**后面** —— 「成功了一半」的「一半」、「开心一点」的「一点」。
+ *   只看前面 = 这类句子永远按满强度记。
+ *
+ * 实测事故（情绪 #29）：
+ *   用户原话「…能够影响你怎么看待这些代码，就已经**成功了一半**，如何看懂代码是另一回事。」
+ *   词典词是「成功了」（喜悦 0.8）。而「成功了一半」里**含有**「成功了」这个子串
+ *   （成 功 了 一 半），于是 indexOf 命中，按 0.8 记成「高置信喜悦」。
+ *   但那是一句**方法论陈述**，「一半」明确表示未完成，不是喜悦表达。
+ *
+ * 为什么不能靠「换个更长的词」解决：
+ *   「成功了一半」不是固定搭配，「对了一半」「猜对了一半」都会出现。
+ *   要治的是**结构**：命中词后紧跟表示「部分/未完成」的限定成分 → 整体降权。
+ *
+ * 与 modifierBefore 的差异：
+ *   - 只看紧跟其后的字（不跨标点），因为限定词必须直接修饰该词；
+ *   - 因子更狠（0.45），因为「部分达成」离「情绪表达」比「程度轻微」更远；
+ *   - **只降不升**：后面出现「很/太」之类的加强词不让它变强
+ *     （「成功了很激动」里，加强的是后面的「激动」，不是「成功了」）。
+ */
+const POST_LIMITERS = [
+  // 「一半」「三分之一」「几分之一」这类分数表达
+  { re: /^(了)?(一|半|三|四|几)?(半|分|成|部|些)|^之[一二三]/u, factor: 0.45 },
+  // 「一点」「一些」「一下」「有一定」
+  { re: /^(了)?(一)?(点|些|下|部分|局部)/u, factor: 0.5 },
+]
+
+/**
+ * 命中词后紧跟的限定成分带来的降权因子。
+ * @returns {number} 没有限定词时返回 1（不影响原分数）
+ */
+function limiterAfter(text, end) {
+  const tail = text.slice(end, end + 4)
+  if (tail === '') return 1
+  for (const group of POST_LIMITERS) {
+    if (group.re.test(tail)) return group.factor
+  }
+  return 1
+}
+
+/**
  * 词条基础强度 × 程度修饰，并做上限钳制。
  *
  * ⚠️ 为什么需要钳制：弱信号词（基础强度 < STRONG_THRESHOLD）被程度副词放大后，
@@ -1143,16 +1201,20 @@ function analyzeEmotion(raw) {
         }
 
         const modifier = modifierBefore(text, at)
+        // 后置限定词（「成功了一半」的「一半」）与前置程度副词相乘。
+        // 必须在 capScore 之前乘进去：capScore 会用**基础强度**判断它算不算弱信号，
+        // 若在它之后再乘，0.8×0.45=0.36 仍会被当成「基础强度 0.8 的强信号」。
+        const limiter = limiterAfter(text, at + word.length)
         const isFixedNegative = NEGATIONS.some((neg) => word.startsWith(neg))
         if (isFixedNegative) {
-          record(entry.cls, capScore(entry.i, modifier), word)
+          record(entry.cls, capScore(entry.i, modifier * limiter), word)
           continue
         }
         if (negatedBefore(text, at)) {
-          record(entry.cls, Math.min(1, entry.i * modifier * 0.35), `不${word}`)
+          record(entry.cls, Math.min(1, entry.i * modifier * limiter * 0.35), `不${word}`)
           continue
         }
-        record(entry.cls, capScore(entry.i, modifier), word)
+        record(entry.cls, capScore(entry.i, modifier * limiter), word)
       }
     }
   }
@@ -1240,6 +1302,10 @@ function analyzeEmotion(raw) {
  */
 function createStore(config) {
   let root = config.root
+  // resolveRoot 给出的选址理由，原样保存供 /state 与诊断使用。
+  // 它不是运行时可变状态：迁移根目录（migrateRoot）不改变「当初怎么选中的」，
+  // 所以这里用普通变量而非跟随 setRoot 更新。
+  let rootReason = config.rootReason ?? null
 
   /** 所有依赖 root 的路径都从这一处派生，迁移后重新计算即可。 */
   const computePaths = () => ({
@@ -1307,6 +1373,22 @@ function createStore(config) {
     await atomicWrite(paths.state, `${JSON.stringify(state, null, 2)}\n`)
   }
 
+  /**
+   * cwd → 项目标识。
+   *
+   * ## 两个名字，别混
+   *
+   * - **键（key）**：`state.projects` 的键，来自 cwd 的 basename —— 即**目录名**
+   * - **scope**：数据库里 `rules` / `logs` / `archive` 的分类名 —— 即**记忆名**
+   *
+   * 平时两者相同，所以大多数时候看不出区别。但用户在工作区改名功能里
+   * 只改「记忆名」而不动磁盘目录时，两者会分叉 —— 这时必须靠
+   * `state.projects[key].scope` 记住映射，否则下次开会话会按目录名
+   * 建一个**新的空 scope**，而数据全在旧名字下永远见不到。
+   * （2026-11-15 审出，这是改名需求最容易漏的一层。）
+   *
+   * `scope` 字段缺省 = 跟随 key，所以老数据不需要迁移。
+   */
   function resolveProjectKey(cwd, state) {
     const name = projectNameOf(cwd)
     if (name === undefined) return undefined
@@ -1317,7 +1399,10 @@ function createStore(config) {
       claimed !== undefined && claimed.cwd !== undefined && resolve(claimed.cwd) !== resolve(cwd)
         ? `${base}-${shortHash(cwd)}`
         : base
-    return { key, name, dir: projectDir(key, state) }
+    const entry = state?.projects?.[key]
+    // 记录项目时用的是目录名，记忆挂在 scope 名下；两者不同名时以 scope 为准
+    const scope = typeof entry?.scope === 'string' && entry.scope !== '' ? entry.scope : key
+    return { key, name, scope, dir: projectDir(key, state) }
   }
 
   async function registerProject(cwd) {
@@ -1356,6 +1441,18 @@ function createStore(config) {
    *
    * 现在把缩进的行接到上一条结论后面（用空格连接），
    * 并继续应用 `[active]` / `[stale]` / `[superseded]` 的过滤规则。
+   *
+   * ## ⚠️ 文件字节 ≠ 注入字节（2026-11-12 的教训，值得一直记着）
+   *
+   * 本函数会过滤掉 `[stale]` / `[superseded]` 行，所以
+   * **文件 4823 字节的项目，实际注入可能只有 3665 字节**。
+   * 判断「会不会被截断」只能看过滤后的字节数，不能看文件大小 ——
+   * 按文件大小算会得出「已经超预算了」的假警报。
+   *
+   * 当某一段被写到预算之上时，注入会被截断，而**写入者看不到水位**，
+   * 于是会一直往上加，直到新条目永远看不见。
+   * （曾有个 measureInjection() 专门量这个水位，2026-11-15 确认已无调用点并删除；
+   *   现在由 renderFromDb 里各段的 `truncated` 返回值直接在注入文案里提示模型。）
    */
   function activeLines(markdown) {
     if (markdown === undefined) return []
@@ -1406,18 +1503,6 @@ function createStore(config) {
       }
     }
     return lines
-  }
-
-  const EMOTION_LINE_RE = /^- \d{4}-\d{2}-\d{2} 用户表达/u
-
-  function splitMemoryLines(lines) {
-    const facts = []
-    const emotions = []
-    for (const line of lines) {
-      if (EMOTION_LINE_RE.test(line)) emotions.push(line)
-      else facts.push(line)
-    }
-    return { facts, emotions }
   }
 
   /**
@@ -1554,38 +1639,6 @@ function createStore(config) {
 
 
 
-  /**
-   * 量出「这个文件还能注入多少」——写入后立刻回传给模型。
-   *
-   * 为什么需要（2026-11-12 用户发现的问题）：
-   *   另一个项目的规则被写到预算之上，模型毫无察觉 ——
-   *   因为 appendProjectNote 只会回 `{written:true, added:1}`，
-   *   没有任何信号告诉它「你刚把这个文件写到 117%」。
-   *   写入者看不到水位，就会一直往上加，直到注入被截断、新条目永远看不见。
-   *
-   * 关键区分：**文件字节 ≠ 注入字节**。
-   *   activeLines 会过滤掉 [stale] / [superseded] 行，
-   *   所以文件 4823 字节的项目，实际注入可能只有 3665 字节。
-   *   判断「会不会被截断」只能看注入字节，不能看文件大小。
-   */
-  function measureInjection(markdown, maxBytes) {
-    const lines = activeLines(markdown)
-    const text = lines.join('\n')
-    const used = Buffer.byteLength(text, 'utf8')
-    const budget = Number(maxBytes) || 0
-    const fileBytes = Buffer.byteLength(String(markdown ?? ''), 'utf8')
-    const ratio = budget > 0 ? used / budget : 0
-    return {
-      bytes: used, // 实际会注入的字节
-      budget,
-      fileBytes, // 文件本身的大小（含 stale 行），仅供参考
-      percent: Math.round(ratio * 1000) / 10,
-      truncated: budget > 0 && used > budget,
-      // 80% 起就该提醒：留 20% 缓冲，避免下一次写入直接越线
-      nearLimit: ratio >= 0.8,
-    }
-  }
-
   async function overview() {
     // 2026-11-13 剥离后只保留数据库模式需要的字段。
     // 只返回数据库模式需要的字段；真实条数在 /api/dsh-memory/state 的 db.byTable / db.byScope 里。
@@ -1597,6 +1650,9 @@ function createStore(config) {
       projects.push({
         key,
         name: entry.name ?? key,
+        // 记忆挂在哪个 scope 名下。平时 === key；用户只改记忆名后会分叉，
+        // 此时 GUI 与调试脚本必须按 scope 看数据，按 key 看会以为数据没了。
+        scope: typeof entry.scope === 'string' && entry.scope !== '' ? entry.scope : key,
         dir: entry.dir ?? defaultProjectDir(key),
         cwd: entry.cwd ?? null,
       })
@@ -1806,6 +1862,17 @@ function createStore(config) {
     // 若导出成固定值，调用方读到的永远是迁移前的旧路径。
     get root() {
       return root
+    },
+    // resolveRoot 实际走的选址级别（configured / pointer / discovered-on-X /
+    // first-install-X）。/state 会把它暴露给自检脚本与设置页。
+    //
+    // 2026-11-15 加：此前 /state 里写着 `rootReason: store.rootReason`，
+    // 但 createStore 从未保存过这个字段 —— 于是它永远是 undefined，
+    // 接口里恒为空串。自检脚本 selfcheck-dir-name 想验证「指针优先级」
+    // 时拿不到任何证据，只好写了一句恒真断言（永远 pass），
+    // 等于那个盲区从来没被覆盖过。
+    get rootReason() {
+      return rootReason
     },
     get paths() {
       return paths
@@ -2084,7 +2151,6 @@ export function apply(ctx, rawConfig = {}) {
   /** 注入层与写入层共用的取值器（避免重复判空） */
   const getDbStore = () => dbStore
   const dbStoreExists = () => dbStore !== undefined
-  const dbPathOf = () => dbPath
 
   // 根目录确定，日志落点随之确定，并补写之前的缓冲
   logDir = join(config.root, 'logs')
@@ -2157,7 +2223,10 @@ export function apply(ctx, rawConfig = {}) {
           const state = readStateSync(store)
           const resolved = store.resolveProjectKey(cwd, state)
           const parts = []
-          const projectName = resolved?.key
+          // ⚠️ 注入与检索一律用 **scope**（记忆名），不是 key（目录名）。
+          // 工作区改名只改 scope，目录名可能还是旧的 ——
+          // 用 key 会让人以为「改名后项目结论空了」。
+          const projectName = resolved?.scope
 
           // ---- 全局段 ----
           //
@@ -2316,9 +2385,41 @@ export function apply(ctx, rawConfig = {}) {
           //         _dbpreview/selfcheck-injection-wording.mjs 断言了上面这些词。
           '## 写记忆：只能用回复正文里的标记',
           '`<!--mem-log topic=13 类之一 summary=≤35字 keywords=词A｜词B` 换行写正文，`-->` 单独收尾；',
+          // ★ 2026-11-16 加：正文别写空行（用户实报「最下面空出一大块」的成因）。
+          //
+          // 机制：标记在流式输出时以原文短暂可见，擦除器要等「静止 400ms」才擦。
+          // 擦完文字后，标记里的**每个空行都会变成一个空段落**，仍占行高与段间距。
+          // 实测最近 8 条流水：每条 1~5 个空行、合计约 120~320px —— 就是那块留白。
+          //
+          // 正文连写成一段（用句号/分号衔接，不靠空行分隔）后空段落归零，
+          // 留白降到 ~50px。**不需要动 client.js 的隐藏判据**，
+          // 因此完全不会重演 2026-11-15 那次「全局 skills 滚动条失效」。
+          //
+          // 为什么改这里而不是 POLICY_TEMPLATE：模板只在**首次安装**时生成
+          // policy.md，之后那是运行时数据；改模板对已有用户无效。
+          // usageLines 是每轮注入的，改它才对所有人生效。
+          '**正文不要写空行**（空行擦掉后会留下空段落，界面底部会空一块）；要分段就用一个换行。',
           'topic、summary 必带，参数同一行、顺序固定（写反会静默丢摘要）。',
           '只认 mem-log；规则与画像由用户在 GUI 维护，不要写。**绝不能** write / edit / pwsh 碰 memory.db —— 会损坏数据库。',
           'summary 帮以后的你一眼判断；keywords 用 `｜` 分隔，抽不出名词写 `无`；拿不准记什么 → policy.md。',
+          // ★ 2026-11-16 用户实报：情绪记录 #26/#27/#29 都是「带着情绪的实质反馈」，
+          // 全都只进了 emotion 表，技术内容一个字没留。
+          //
+          // 机制上两条通道是**独立**的：analyzeEmotion 只负责写 emotion 表，
+          // 它不拦 mem-log。是我自己误以为「这是情感交流，不算技术结论」而放弃写流水。
+          // 同一个坑 2026-11-14 踩过一次（用户自述性格与做插件的原因，没记），
+          // 所以这次把判据直接写进每轮注入，而不是指望我下次自己想明白。
+          //
+          // 实例（用户原话）：
+          //   「你缺少实用的技能包」            → 命中「宝贝」被判爱意
+          //   「你有可爱的手手，漂亮的眼睛。只是你用的少」 → 命中「漂亮」被判夸赞
+          //   「走正规流程想想你刚才回复的是什么」   → 命中「想你」被判爱意
+          // 这三条的真实内容是技术反馈，下一个会话完全不知道用户提过。
+          '## 什么时候必须记（情绪不豁免）',
+          '用户指出问题、提需求、讲做事偏好 —— **一律记流水**，即使同时被判成情绪。',
+          '情绪表与流水表是两条独立通道：判成情绪不影响写 mem-log。',
+          '判据：**这条会让下一个会话的我少走一次弯路吗？** 会 → 记。',
+          '但纯寒暄、纯情绪交流不记；同一结论换个问法再问一遍也不记第二条。',
           '## 查记忆：用 pwsh 请求本机接口（注入里没有正文）',
           `\`$env:DSH_WEB_URL/api/dsh-memory/search?q=<关键词>&scope=${scopeHint}\`；` +
             'scope 必带（否则 400），端口每次启动都变，必须读环境变量。',
@@ -2331,6 +2432,22 @@ export function apply(ctx, rawConfig = {}) {
           `\`archive?scope=${scopeHint}&q=<关键词>\` 搜**原文层**（含没整理进流水的整段对话），` +
             '字段 **`rows`**（不是 hits），分页 `limit/offset`。',
           '结论层搜不到 ≠ 没发生过 —— 对话原文往往只在 `archive` 里，记得翻。',
+          // ★ 2026-11-15 隔壁项目实盘补（用户带回的缺陷 1+2，合并成一句）：
+          //
+          //   缺陷 1（role）：用户问「我们之前讨论过吃吗」，模型查 archive 看到
+          //   assistant 那大段自己的回答，答成「我们双向讨论过」。
+          //   真相是：archive 每行都带 `role`（user / assistant），
+          //   **assistant 那一侧就是模型自己说的**，不能当成「我们讨论过」。
+          //   数据一直是够的（listArchive 返回 id/ts/scope/role/text/session_id/turn/step），
+          //   缺的只是这一句提示 —— 属「信息齐全但没教怎么读」。
+          //
+          //   缺陷 2（自证）：`search` 命中的 `logs` 也是模型自己整理的结论，
+          //   拿它证明「讨论过 X」等于用自己写的东西证明自己。
+          //   要证明用户说过什么，只能看 archive 里 role=user 的行。
+          //
+          //   两句合成一句，因为它们指向同一个事实：**logs 和 assistant 原文都是自述**。
+          '`rows` 每行带 `role`（user / assistant）：**assistant 那侧就是你自己说的**，别当成「我们讨论过」；',
+          '要确认用户真的说过什么，只认 `role=user` 的行 —— 而 `search` 命中的 `logs` 也是你自己整理的，同样不能当证据。',
           // 2026-11-14 现场补：隔壁项目问「之前想过早上吃什么吗」，
           // 模型查完 archive 答「没有，今天第一次」。数据确实对，但语义错了——
           // archive 是 v4（04:45）才上线的，更早的对话**从来没存过**。
@@ -2572,10 +2689,11 @@ export function apply(ctx, rawConfig = {}) {
       }
 
       const cwd = session?.header?.cwd
-      // 项目名解析：数据库模式下用它作 scope（归档与标记写入共用）
+      // 项目名解析：写入一律用 **scope**（记忆名）。
+      // 改名后目录名可能还是旧的，用 key 会把新数据写回旧 scope。
       const projState = readStateSync(store)
       const projResolved = store.resolveProjectKey(cwd, projState)
-      const projectKey = projResolved?.key
+      const projectKey = projResolved?.scope
 
       // ---- 原始归档（v4）：**所有** assistant 消息，不论有没有 mem 标记 ----
       // 这是「完整记忆」的底层：模型回复原文一条不落。
@@ -2683,13 +2801,63 @@ export function apply(ctx, rawConfig = {}) {
       // 记账收尾：只有「有标记但没落库」才报，正常写入不吵。
       // 这两条是排查「模型说写了、库里没有」的第一现场，
       // 以前这种情况在日志里长得像「这轮本来就没写」。
+      //
+      // ⚠️ 2026-11-16 修：必须区分「真写了但格式错」与「只是提到标记」。
+      //
+      // 实测经过：模型在回复里**引用正则与示例**排查擦除器问题，
+      // 正文因此含 `<!--mem-(?:log|fact|note|fix)` 与 `<!--mem-log ...-->`
+      // 这类**示例字样**（都不在行首），hasMarker 见字就为真，
+      // 而真标记一个没写 → 连续三轮刷 marker-unmatched。
+      //
+      // 这掩盖了真正的问题：那三轮是真的忘了写流水。
+      // 日志把「只是提到」和「写了但坏了」记成同一件事，
+      // 排查时会往格式方向找，方向就错了。
+      //
+      // 判据：`^[ \t]*<!--mem-` 在行首出现 —— 那才是「试图写标记」；
+      // 只出现在行中间（被反引号包住、作为示例引用）→ 记 mention-only，降级为提示。
       if (hasMarker && markerMatched === 0) {
-        diag('marker-unmatched', {
-          textLength: text.length,
-          head: text.slice(0, 80).replace(/\n/g, '\\n'),
-        })
+        const atLineStart = /^[ \t]*<!--mem-/m.test(text)
+        if (atLineStart) {
+          diag('marker-unmatched', {
+            textLength: text.length,
+            head: text.slice(0, 80).replace(/\n/g, '\\n'),
+          })
+        } else {
+          // 只是正文里提到了标记写法（排查格式、引用正则等），不是在写标记。
+          // 不当作错误，但留一条痕迹便于区分「这轮本来就没写」。
+          diag('marker-mention-only', {
+            textLength: text.length,
+            note: '正文提到标记字样但不在行首，视为引用而非写入',
+          })
+        }
       } else if (hasMarker && markerWritten === 0) {
         diag('marker-dropped', { matched: markerMatched, dropped: markerDropped })
+      }
+
+      // ---- 连续写入失败计数（2026-11-16，用户要求兜底）----
+      //
+      // 只在这一处更新：这里已经算清了「本轮到底成功没成功」。
+      // 三种结局：
+      //   成功（markerWritten > 0）        → 清零，说明通道恢复了
+      //   失败（有标记但 0 落库）          → 连续失败 +1
+      //   没写标记（hasMarker 为 false）    → 不影响计数（那是「忘写」，另一个问题）
+      //
+      // 为什么在这里而非 turn-stopping：markerWritten 是**本闭包的局部变量**，
+      // 出了这个 safeOn 回调就没了；而 writeFailStreak 是 apply 闭包级 Map，
+      // 跨轮、跨事件存活，正好承接「本轮结果」→「下轮检查」的接力。
+      const sKey = session?.id === undefined ? undefined : String(session.id)
+      if (sKey !== undefined) {
+        if (markerWritten > 0) {
+          // 成功写入 → 清零连续失败计数
+          if (writeFailStreak.get(sKey) !== 0) {
+            writeFailStreak.set(sKey, 0)
+          }
+        } else if (hasMarker) {
+          // 有写入意图但 0 落库 → 连续失败 +1
+          const prev = writeFailStreak.get(sKey) ?? 0
+          writeFailStreak.set(sKey, prev + 1)
+        }
+        // hasMarker 为 false：不碰计数（忘写是注入规则负责的另一层）
       }
     } catch (error) {
       logger.warn?.(`[dsh-memory] 解析记忆标记失败：${error?.message ?? error}`)
@@ -2824,27 +2992,19 @@ export function apply(ctx, rawConfig = {}) {
     return text
   }
 
-  /** 预算越线才吵：正常写入不打扰，避免每轮刷屏 */
-  function reportBudget(where, usage) {
-    if (!usage) return
-    if (usage.truncated) {
-      diag(
-        'mem-预算告警',
-        `${where} 注入 ${usage.bytes}/${usage.budget} 字节（${usage.percent}%），已超预算：新条目本轮看不到，先精简再写`,
-      )
-    } else if (usage.nearLimit) {
-      diag('mem-预算提示', `${where} 已用 ${usage.percent}%（${usage.bytes}/${usage.budget} 字节），接近上限`)
-    }
-  }
-
-  /**
-   * 判断一条结论像不像「红线」。
-   * 红线类会在注入时优先保留，所以判定要保守 —— 宁可算普通偏好。
-   */
-  function looksLikeRedline(text) {
-    return /永久关闭|绝不|永远不要|禁止|禁用|红线|硬约束|必须|不能|会导致/.test(text)
-  }
-
+  // 注：曾有两个函数在这里 ——
+  //
+  //   reportBudget(where, usage)    预算越线时写 [mem-预算告警] 日志
+  //   measureInjection(markdown, max) 量「文件还能注入多少」，供上面那个判断
+  //
+  // 2026-11-15 确认：**从 1.0.0 首版起就没有任何调用点**
+  // （.md 时代它们配着用过，迁 SQLite 时调用点随 .md 路径一起删了，
+  //   函数本体留了下来）。日志里最后一条 [mem-预算告警] 停在
+  // 2026-11-13T03:57 —— 那是旧代码写的，新代码从未触发过。
+  //
+  // 现在预算提示由 renderFromDb 直接写进注入文案（各段 `truncated` 返回值），
+  // 比「写日志」这条弱通道更有效：模型每轮都看得到，不用翻日志。
+  // 所以这两个函数不是「丢了功能」，而是**被更好的实现取代**，直接删除。
 
   safeOn('session/event', async (session, event) => {
     try {
@@ -2865,7 +3025,8 @@ export function apply(ctx, rawConfig = {}) {
       if (dbStoreExists() && text.trim() !== '') {
         try {
           const cwd = session?.header?.cwd
-          const projKey = store.resolveProjectKey(cwd, readStateSync(store))?.key
+          // 用 scope（记忆名），不是 key（目录名）—— 改名后两者会分叉
+          const projKey = store.resolveProjectKey(cwd, readStateSync(store))?.scope
           const archived = dbStore.appendArchive({
             scope: projKey || null,
             role: 'user',
@@ -3062,6 +3223,30 @@ export function apply(ctx, rawConfig = {}) {
   /** sessionId → 本轮写类操作统计 */
   const turnActivity = new Map()
 
+  /**
+   * sessionId → 连续「写入失败」的轮数。
+   *
+   * ## 为什么单独一个 Map（2026-11-16）
+   *
+   * `turnActivity` 每轮结束就会被 `turnActivity.delete(sessionKey)` 删掉，
+   * 放不下「跨轮累计」。这里需要一个**跨轮存活**的计数器，
+   * 只记录「这轮明明想写流水、最终却 0 条落库」的连续次数。
+   *
+   * ## 兜什么、不兜什么
+   *
+   * 兜：模型**写了标记但写坏**（格式错 / 空正文 / 写库抛异常），连续发生。
+   * 不兜：模型**完全忘了写**——那没有信号可测，靠注入规则「情绪不豁免」兜。
+   *
+   * ## 阈值（用户 2026-11-16 定）：连续 4 轮失败才提醒。
+   *
+   * 历史教训：每轮都提醒曾在两天触发 217 次，用户反馈太吵。
+   * 所以只在连续失败达到阈值时**插一句**，且走 safePushMessage（失败不打扰会话）。
+   */
+  const writeFailStreak = new Map()
+
+  /** 连续失败多少轮才提醒（用户 2026-11-16 定） */
+  const WRITE_FAIL_STREAK_LIMIT = 4
+
   safeOn('tools/result', (exec, result) => {
     try {
       const name = exec?.name
@@ -3161,6 +3346,30 @@ export function apply(ctx, rawConfig = {}) {
       //   2. 这里只留一行诊断日志，不再打断对话；漏记时事后可追溯
       if (record !== undefined && record.writes > 0 && !record.wroteMemory) {
         diag('turn-未记流水', { writes: record.writes, note: '有写操作但未写记忆（仅记录，不打扰）' })
+      }
+
+      // ---- 连续写入失败提醒（2026-11-16，用户要求兜底）----
+      //
+      // 与上面「turn-未记流水」的区别：上面只看「改没改文件」，判断的是
+      // 「有写操作但没写记忆」；这里看的是「**写了标记却 0 条落库**」的
+      // 连续次数 —— 是「通道坏了」而非「模型忘了写」。
+      //
+      // 阈值 4：连续 4 轮「想写却没写进去」才提醒一次，然后清零。
+      // 历史教训（DECISIONS）：每轮提醒两天触发 217 次，太吵，
+      // 所以必须设阈值，且走 safePushMessage（失败不打断会话）。
+      const failStreak = writeFailStreak.get(sessionKey) ?? 0
+      if (failStreak >= WRITE_FAIL_STREAK_LIMIT) {
+        const delivered = safePushMessage(
+          agent,
+          `[dsh-memory] 连续 ${failStreak} 轮尝试写记忆但都没成功落库。\n` +
+            `可能是标记格式问题（topic 不在 13 类、summary 超长、或标记被代码块吞掉）。\n` +
+            `请检查你最近回复里的 mem-log 写法。`,
+          'steer',
+        )
+        if (delivered) {
+          diag('write-fail-reminder', { streak: failStreak })
+          writeFailStreak.set(sessionKey, 0)
+        }
       }
 
       // 弱信号队列没有内容 → 什么都不做
@@ -3353,7 +3562,7 @@ export function apply(ctx, rawConfig = {}) {
                   }
                   const st = await store.readState()
                   const rj = store.resolveProjectKey(cwd, st)
-                  const r = dbStore.appendLog(rj?.key, content)
+                  const r = dbStore.appendLog(rj?.scope, content)
                   return { kind: 'success', text: `已追加到 ${r.project}` }
                 } catch (error) {
                   return { kind: 'error', text: `未追加：${error?.message ?? error}` }
@@ -3374,13 +3583,14 @@ export function apply(ctx, rawConfig = {}) {
                 const rj = store.resolveProjectKey(cwd, st)
                 const rows = dbStore.search(query, {
                   limit: 15,
-                  projectName: rj?.key ?? null,
+                  // 检索按 scope（记忆名），不是目录名
+                  projectName: rj?.scope ?? null,
                   crossProject,
                 })
                 const scopeHint = crossProject
                   ? '· 跨全部项目'
-                  : rj?.key
-                    ? `· 仅本项目「${rj.key}」+ 全局规则`
+                  : rj?.scope
+                    ? `· 仅本项目「${rj.scope}」+ 全局规则`
                     : ''
                 if (rows.length === 0) {
                   return {
@@ -3956,6 +4166,29 @@ export function apply(ctx, rawConfig = {}) {
             const url = new URL(req.url, 'http://localhost')
             const stripped = Number(url.searchParams.get('stripped') || 0)
             const state = url.searchParams.get('state') || 'mounted'
+            // 2026-11-15：新增 DOM 诊断回传。
+            //
+            // 为什么需要（用户报「改完功能后全局 skills 滚动条失效」）：
+            //   擦除器会往 document.head 注入一条全局 CSS
+            //   `[data-dsh-mem-blank] { display:none !important }`，
+            //   并给「擦完只剩空白且无子元素」的任意元素打上该属性。
+            //   唯一守卫是 `el !== document.body` —— **没有限制在对话区**。
+            //   一旦某个滚动容器的子节点被打上，容器 scrollHeight 塌成 0，
+            //   滚动条就消失，且 !important 无法被覆盖。
+            //
+            //   但要修就得知道真实的 DOM 结构（对话区的选择器是什么、
+            //   哪些元素被打上了标记），而浏览器端看不到服务端日志。
+            //   所以把诊断结果作为 query 参数回传，由 diag 落到日志文件里。
+            if (url.searchParams.get('dom') === '1') {
+              // 转成对象存进日志：raw 可能很长，但这是排查用的一次性数据
+              let dom = null
+              try {
+                dom = JSON.parse(url.searchParams.get('detail') || '{}')
+              } catch {
+                dom = { parseError: true }
+              }
+              diag('client-dom-report', dom)
+            }
             diag('client-scrubber', { state, stripped })
             json(res, 200, { ok: true })
           } catch (error) {
@@ -4131,37 +4364,159 @@ export function apply(ctx, rawConfig = {}) {
             if (from === '' || to === '') {
               return json(res, 400, { ok: false, error: '需要 from 与 to' })
             }
+
             if (body.dryRun === true) {
-              // 干跑：只报数不写库。改名前先看清会动多少行 —— 这类迁移没有撤销按钮，
-              // 备份才是唯一的回退手段。
-              const tables = {}
-              let total = 0
-              for (const t of ['rules', 'logs', 'archive']) {
-                const n = dbStore.countScope(t, from)
-                tables[t] = n
-                total += n
+              // 干跑 = 只采「迁前快照」，不写库。
+              //
+              // 这里用的 snapshotScope 与 renameScope 内部**是同一个函数**
+              // （2026-11-15 用户要求「迁移前整理数据量，迁移后报告是否一致」）——
+              // 预览数字与迁移基线必须同源，否则会出现「预览 162、实际动 42」。
+              //
+              // 为什么给两套数字：同一个 scope 在不同入口读出三个数
+              // （dryRun 全部行 / byScope 仅 active 的 rules+logs / archive 完全不进统计）。
+              // 只给一个必然被误读。
+              const before = dbStore.snapshotScope(from)
+              // 目标区域现状 —— 决定这是「改名」还是「合并」
+              const targetBefore = dbStore.snapshotScope(to)
+
+              const occupied = {}
+              for (const t of dbStore.SCOPE_TABLES) {
+                occupied[t] = targetBefore.tables[t].all
               }
-              return json(res, 200, { ok: true, dryRun: true, from, to, tables, total })
+              const conflicts = Object.entries(occupied).filter(([, n]) => n > 0)
+              const hasTarget = conflicts.length > 0
+
+              return json(res, 200, {
+                ok: true,
+                dryRun: true,
+                from,
+                to,
+                // 兼容旧字段（GUI 早期按 tables/total 取值）
+                tables: Object.fromEntries(dbStore.SCOPE_TABLES.map((t) => [t, before.tables[t].all])),
+                total: before.total.all,
+                before,
+                // 目标已有数据 ≠ 不能做，而是「会合并」。2026-11-15 用户明确：
+                // 新建工作区再往里迁记忆是常见路径，必须支持。
+                targetBefore,
+                conflicts: hasTarget ? Object.fromEntries(conflicts) : null,
+                willMerge: hasTarget,
+                // 合并后的预计总量（迁移前就能算出来，给用户看「一共会变成多少」）
+                expectAfter: {
+                  tables: Object.fromEntries(
+                    dbStore.SCOPE_TABLES.map((t) => [
+                      t,
+                      before.tables[t].all + targetBefore.tables[t].all,
+                    ]),
+                  ),
+                  total: before.total.all + targetBefore.total.all,
+                },
+                // 只要有源数据就能做：目标为空 = 改名，目标非空 = 合并
+                canRename: before.total.all > 0,
+                // 顺带把「所有有数据的工作区」给 GUI 当下拉选项。
+                // 不能让它用 /state 的 byScope —— 那个只数 active 的 rules+logs，
+                // 会漏掉「全是停用条目」或「只有 archive」的工作区（2026-11-15 实测）。
+                scopes: dbStore.listScopesWithData(),
+              })
             }
-            const result = dbStore.renameScope(from, to)
-            diag('scope-renamed', { from: result.from, to: result.to, tables: result.tables, total: result.total })
-            // 名字变了，projects 列表要跟着走，否则 state.json 里还留着旧键
+
+            const result = dbStore.renameScope(from, to, {
+              allowMerge: body.allowMerge === true,
+            })
+            diag('scope-renamed', {
+              from: result.from,
+              to: result.to,
+              merged: result.merged,
+              tables: result.tables,
+              total: result.total,
+              verified: result.verify?.ok,
+            })
+
+            // ---- state.json 同步 ----
+            //
+            // ## 先搞清楚：源键不一定是 `from`
+            //
+            // `state.projects` 的键来自 **cwd 的 basename**（目录名），不是 scope 名。
+            // 所以「`from` 不在 projects 里」是**正常情况**，不是出错：
+            // 用户把 `干杂活` 改名成 `SoftTest` 后，键是 `SoftTest`（目录名）、
+            // 而 scope 也是 `SoftTest`，此时从 `干杂活` 找不到任何键。
+            //
+            // 2026-11-15 实测踩到：SoftTest→SoftTestX 之后改回来（SoftTestX→SoftTest），
+            // 源键 `SoftTestX` 不存在 → 整段逻辑跳过 → `scope` 字段**残留旧值**，
+            // 于是库里的 scope 叫 SoftTest、state 却还指 SoftTestX —— 数据看不见。
+            //
+            // 所以要按三个方向找源条目：**键 === from**、**键 === to**、
+            // 或**某条目的 .scope === from**。找到哪个就改哪个，一个都没有才算无关联。
+            //
+            // ## 键该不该跟着改？答案是「不改」
+            //
+            // 键是目录名，改了它，下次开会话按目录名算出的 base 就查不到条目
+            // → 建一个新的空 scope，数据全在旧名下永远见不到。这是最容易漏的一层。
+            // 正确做法：**键保持目录名不动**，只更新 `.scope` 字段。
+            //
+            // 例外：`.scope` 恰好等于键时（即记忆名回到与目录名一致），
+            // 就把字段删掉，让「缺省 = 跟随目录名」这条规则生效，避免留下无意义的冗余。
+            let stateSynced = null
             try {
               const st = await store.readState()
-              if (st.projects && st.projects[from] !== undefined && st.projects[to] === undefined) {
-                const entry = st.projects[from]
-                delete st.projects[from]
-                entry.name = to
-                entry.dir = store.projectDir ? store.projectDir(to, st) : entry.dir
-                st.projects[to] = entry
+              const projects = st.projects ?? {}
+
+              // 依次尝试：键===from → 键===to → .scope===from
+              let key = undefined
+              if (projects[from] !== undefined) key = from
+              else if (projects[to] !== undefined) key = to
+              else {
+                for (const [k, v] of Object.entries(projects)) {
+                  if (v && v.scope === from) { key = k; break }
+                }
+              }
+
+              if (key !== undefined) {
+                const entry = projects[key]
+                if (key === to) {
+                  // 记忆名回到了目录名 → 删掉映射字段，回到「缺省跟随」
+                  delete entry.scope
+                } else {
+                  entry.scope = to
+                }
+                // 若另一侧残留同源键（历史遗留），清掉 —— 它的数据已经迁走了
+                for (const other of new Set([from, to])) {
+                  if (other !== key && projects[other] !== undefined) {
+                    const o = projects[other]
+                    if (o && (o.scope === from || o.scope === to || other === from)) delete projects[other]
+                  }
+                }
                 await store.writeState(st)
+                stateSynced = { key, scope: key === to ? null : to }
               }
             } catch (error) {
               logger.warn?.(`[dsh-memory] scope 改名后同步 state.json 失败：${error?.message ?? error}`)
             }
-            json(res, 200, { ok: true, ...result })
+
+            json(res, 200, { ok: true, ...result, stateSynced })
           } catch (error) {
             json(res, 400, { ok: false, error: String(error?.message ?? error) })
+          }
+        },
+      },
+      {
+        /**
+         * 列出「有数据的工作区」—— 工作区改名页的下拉框数据源。
+         *
+         * 为什么不复用 `/state` 的 `db.byScope`：
+         * 那个只统计 `status='active'` 的 rules + logs，也不看 archive。
+         * 2026-11-15 实测：工作区 `design` 有 18 行 rules **全部停用**，
+         * byScope 里根本没有它 —— 下拉框会漏掉这个有数据的工作区。
+         * 这里按 `snapshotScope` 同一口径（三表全部行），
+         * 保证「下拉框里有的 = 改名时确实会动的」。
+         */
+        kind: 'exact',
+        path: '/api/dsh-memory/scope/list',
+        handler: async (_req, res) => {
+          try {
+            if (!dbStoreExists()) return json(res, 200, { ok: true, scopes: [] })
+            json(res, 200, { ok: true, scopes: dbStore.listScopesWithData() })
+          } catch (error) {
+            json(res, 500, { ok: false, error: String(error?.message ?? error) })
           }
         },
       },

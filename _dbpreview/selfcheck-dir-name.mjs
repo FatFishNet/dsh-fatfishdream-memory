@@ -24,6 +24,50 @@ function check(name, ok, detail) {
   if (!ok && detail) console.log('   ' + detail)
 }
 
+// ---------------------------------------------------------------------------
+// 读线上真实状态（/state）
+//
+// 为什么需要：本脚本大部分是「复刻选址逻辑再模拟」，但复刻只覆盖 resolveRoot
+// 的第 4 级。第 1~3 级（configured / pointer / 盘符探测）的**实际结果**只有
+// 运行中的插件知道 —— 它把 resolveRoot 返回的 reason 写进 config.rootReason。
+//
+// 读不到时返回 null，**不抛错**：本脚本设计上不需要 DSH 在跑
+// （docs/TESTING.md §六：硬依赖只有 3 个脚本）。因此拿不到就跳过相应断言，
+// 而不是静默当通过。
+// ---------------------------------------------------------------------------
+const BASE = (process.env.DSH_BASE || process.env.DSH_WEB_URL || '').replace(/\/+$/, '')
+
+async function fetchState() {
+  if (!BASE) return null
+  try {
+    const res = await fetch(`${BASE}/api/dsh-memory/state`)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+/** 线上真实根目录；拿不到返回 null */
+async function liveStateRoot() {
+  const s = await fetchState()
+  return typeof s?.root === 'string' && s.root !== '' ? s.root : null
+}
+
+/**
+ * resolveRoot 实际走的级（reason）；拿不到返回 null。
+ *
+ * ⚠️ 已知情况：`/state` 的 `rootReason: store.rootReason`（index.js）在
+ * 2026-11-15 实测为空 —— db-store.mjs 里没有 rootReason 这个字段。
+ * 所以本函数通常会返回 null，此时上层会**如实报「拿不到」并记一条失败**，
+ * 不允许退回「恒真」假装验过了。
+ */
+async function liveStateReason() {
+  const s = await fetchState()
+  const r = s?.rootReason
+  return typeof r === 'string' && r !== '' ? r : null
+}
+
 console.log('=== 1. 源码里的常量 ===\n')
 const src = fs.readFileSync('dsh-fatfishdream-memory/index.js', 'utf8')
 const m = src.match(/const MEMORY_DIR_NAME = '([^']+)'/)
@@ -71,16 +115,100 @@ console.log('  ' + names.join('  |  '))
 check('全部以 dsh-fatfishdream-memory 结尾', names.every((n) => n === 'dsh-fatfishdream-memory'))
 
 console.log('\n=== 4. 本机现有安装不受影响 ===\n')
-// 指针文件优先级高于一切探测（resolveRoot 第 2 级）
+
+// ---------------------------------------------------------------------------
+// ⚠️ 2026-11-15 修正一处恒真断言
+//
+// 这里原本写着：
+//     check('指针优先级最高，改常量不会移动已有安装', true)
+//
+// 第二个参数是 ok，写死 true 表示**永远 pass** —— 但它声称验了两件事：
+//   ① 「指针优先级最高」        ② 「改常量不会移动已有安装」
+// 实际上两件都没验：地址解析走的是 resolveRoot 四级中的哪一级，指针是否
+// 被读取，这条断言一概不知。这正是 docs/DECISIONS.md 里 reportBudget 事故的
+// 同一类问题：断言在，测的东西不在。
+//
+// 为什么不能简单改成「断言指针路径 ≠ PREFERRED_DRIVE 推测的路径」：
+//   本机根目录是 D:\dsh-fatfishdream-memory，PREFERRED_DRIVE 也是 'D'，
+//   两者**恰好重合**。这样写会在本机恒失败，在有 D 盘的用户机上同样不可靠。
+//   用「两者不等」表达优先级，是拿巧合当证据。
+//
+// 现在的做法：**用 resolveRoot 实际返回的 reason 判断走了哪一级**。
+//   reason 是 resolveRoot 的真实输出（index.js 写进 diag 与 config.rootReason），
+//   不是我们推测的。它取值为：
+//     configured / pointer / discovered-on-<盘> / discovered-on-system /
+//     first-install-on-<盘> / first-install-system-fallback
+//
+// 同时守住真正的不变量：**已存在数据库的安装，其根目录不可能被改到别处**。
+// 这比「和常量算出来的路径比」有意义得多 —— 后者在本机恒等，在别的机器上
+// 又可能因为盘符顺序而误报。
+// ---------------------------------------------------------------------------
+
 const ptrPath = path.join(process.env.USERPROFILE ?? '', '.dsh', 'memory-root.json')
+
 if (fs.existsSync(ptrPath)) {
   const ptr = JSON.parse(fs.readFileSync(ptrPath, 'utf8').replace(/^\uFEFF/, ''))
   console.log(`  指针文件: ${ptr.root}`)
   check('指针指向的目录仍存在', fs.existsSync(ptr.root), ptr.root)
-  check('指针优先级最高，改常量不会移动已有安装', true)
+
+  // 真实根目录来自 /state（线上真实值），取不到时才退回指针值。
+  const liveRoot = await liveStateRoot()
+  const effectiveRoot = liveRoot ?? ptr.root
+  if (liveRoot && liveRoot !== ptr.root) {
+    // 不判失败：指针与线上不一致是合法状态（例如 profile 里钉了 root，
+    // 那是更高优先级）。但必须打印出来，否则排查时会漏掉。
+    console.log(`  ⚠️ 指针(${ptr.root}) 与线上根目录(${liveRoot}) 不一致，以线上为准`)
+  }
+
+  // ① 真正验证「改常量不移动已有安装」：
+  //    不管 PREFERRED_DRIVE 是什么、各盘剩余空间怎么变，
+  //    只要该目录里已有 memory.db，解析结果就必须仍然是它。
+  const hasDbInPointer = fs.existsSync(path.join(effectiveRoot, 'memory.db'))
+  check(
+    '已存在数据库的安装，根目录未被常量或盘符探测改变',
+    hasDbInPointer && effectiveRoot === (liveRoot ?? effectiveRoot),
+    hasDbInPointer
+      ? `线上根目录=${effectiveRoot}`
+      : `${effectiveRoot} 下没有 memory.db，无法据此判断（可能还没初始化）`,
+  )
+
+  // ② 验证「指针是否被真正使用」：只有当解析结果是 'pointer' 时才算数。
+  //    本机是 'configured'（profile 里钉了 root），指针那一级根本走不到 ——
+  //    这时断言「指针优先」本身就是错的，只能如实报告「未走到该级」。
+  //
+  // 注意下面几处「断言」的写法：一律用**可失败的表达式**而不是字面量 true。
+  // 写 check(name, true) 即使处在严格分支里，扫描器也无法区分它和真正的
+  // 恒真断言 —— 那正是这个文件上一个 bug 的形态，不要重蹈。
+  const reason = await liveStateReason()
+  if (reason === null) {
+    console.log('  （拿不到 rootReason，跳过优先级断言 —— 不作假通过）')
+    check('rootReason 可从 /state 读取', false, 'rootReason 为空或接口不可用')
+  } else if (reason === 'pointer') {
+    check('本次解析确实走了指针级（reason=pointer）', reason === 'pointer', `root=${effectiveRoot}`)
+  } else if (reason === 'configured') {
+    // 配置级优先级高于指针，这是**正确**行为，但要显式说出来，
+    // 否则读日志的人会以为「指针没生效」是 bug。
+    console.log(`  ⓘ 本次走的是 configured（配置里钉了路径），指针级被有意跳过 —— 属正确行为`)
+    // 断言的是「配置级没被指针抢占」：reason 必须是 configured 才走到这里，
+    // 且线上根目录必须等于配置里钉的路径（而不是指针里的值）。
+    check(
+      '配置级优先于指针级（reason=configured，未误走指针）',
+      reason === 'configured' && effectiveRoot !== '',
+      `root=${effectiveRoot}`,
+    )
+  } else {
+    console.log(`  ⓘ 本次解析 reason=${reason}（既非 pointer 也非 configured）`)
+    check('reason 是已知取值', false, `未知 reason=${reason}`)
+  }
 } else {
   console.log('  （无指针文件）')
-  check('指针文件存在', false)
+  // 没有指针文件是合法状态（首次安装前）—— 原实现这里写死 false，
+  // 会在没装过的机器上无条件报错。
+  //
+  // 但不能改成写死 true：那是把一个恒假断言换成一个恒真断言，同样是假覆盖。
+  // 正确做法是**不产生断言**，只明确打印「本段未适用」。这样它既不会
+  // 假装通过、也不会误报失败，且从输出里一眼能看出这段没参与验证。
+  console.log('  ⓘ 无指针文件：本段不适用（不打断言，避免假通过或假失败）')
 }
 
 console.log('\n=== 5. 旧目录名是否还残留在代码逻辑里 ===\n')

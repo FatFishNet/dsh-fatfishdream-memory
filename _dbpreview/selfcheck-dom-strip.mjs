@@ -163,5 +163,72 @@ console.log('\n=== 5. 源码纪律：不许删 React 管的节点（2026-11-14 �
   console.log(`${usesBlankAttr ? '✅' : '❌'} 用 data 标记 + CSS 收掉空段落`)
 }
 
+console.log('\n=== 6. 收窄「打标记」的范围（2026-11-15 滚动条事故）===\n')
+{
+  // 事故：用户报「每次改动功能，全局 skills 的滚动条都失效」。
+  //
+  // 根因：打标记的判据只有 `el !== document.body`，而配套 CSS 是
+  //   `[data-dsh-mem-blank] { display: none !important }` —— 全局、无法覆盖。
+  // 于是滚动容器里的某个子元素被擦空 → 打标记 → display:none
+  //   → 父容器 scrollHeight 塌成 0 → 滚动条消失。
+  //
+  // 这三条断言锁住修复：**不能再退回「除 body 外全都可以隐藏」**。
+  const fs = await import('node:fs')
+  const src = fs.readFileSync('dsh-fatfishdream-memory/client.js', 'utf8')
+  const codeOnly = src
+    .split('\n')
+    .filter((l) => {
+      const t = l.trim()
+      return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*')
+    })
+    .join('\n')
+
+  // ① 必须存在「安全折叠判断」这个函数，且在打标记前被调用
+  const hasGuardFn = /function isSafeToCollapse\s*\(/.test(codeOnly)
+  if (hasGuardFn) pass++
+  else fail++
+  console.log(`${hasGuardFn ? '✅' : '❌'} 存在 isSafeToCollapse 守卫` +
+    (hasGuardFn ? '' : '  ← 没有它就会退化成「除 body 外全能隐藏」'))
+
+  // ⚠️ 这条断言必须精确到「调用发生在 if 条件里」。
+  //
+  // 2026-11-15 变异测试抓到：第一版写的是
+  //     /isSafeToCollapse\s*\(\s*el\s*\)/
+  // 而函数定义本身是 `function isSafeToCollapse(el) {` —— **也匹配**。
+  // 于是把 if 条件里的调用删掉（改成 `true`），断言仍然通过，变异存活。
+  //
+  // 正确判据：`setAttribute('data-dsh-mem-blank'` 之前**紧邻**的条件块里
+  // 必须出现 isSafeToCollapse。用「打标记语句前 400 字符内」做窗口。
+  const markIdx = codeOnly.indexOf("setAttribute('data-dsh-mem-blank'")
+  const guardBeforeMark = markIdx > 0 &&
+    codeOnly.slice(Math.max(0, markIdx - 400), markIdx).includes('isSafeToCollapse(el)')
+  if (guardBeforeMark) pass++
+  else fail++
+  console.log(`${guardBeforeMark ? '✅' : '❌'} 守卫真的挡在打标记之前（不只是定义存在）` +
+    (guardBeforeMark ? '' : '  ← 只查「函数存在」会被「删掉调用点」骗过'))
+
+  // ② 守卫必须检查滚动祖先 —— 这是本次事故的直接防线
+  const checksScrollAncestor =
+    /overflowY\s*===\s*'auto'/.test(codeOnly) && /overflowY\s*===\s*'scroll'/.test(codeOnly)
+  if (checksScrollAncestor) pass++
+  else fail++
+  console.log(`${checksScrollAncestor ? '✅' : '❌'} 守卫排除「祖先里有滚动容器」的元素` +
+    (checksScrollAncestor ? '' : '  ← 这正是滚动条消失的直接原因'))
+
+  // ③ 必须有 tag 白名单（黑名单永远列不全，白名单漏掉只是「少隐藏一个」）
+  const hasTagWhitelist = /SAFE_TAGS/.test(codeOnly)
+  if (hasTagWhitelist) pass++
+  else fail++
+  console.log(`${hasTagWhitelist ? '✅' : '❌'} 只对白名单内的行内元素打标记`)
+
+  // ④ style 注入必须去重（禁用→启用会重置模块变量，但标签还在 head 里）
+  const dedupesStyle =
+    /style\[data-dsh-memory="blank-collapse"\]/.test(codeOnly) ||
+    /querySelector\(['"]style\[data-dsh-memory/.test(codeOnly)
+  if (dedupesStyle) pass++
+  else fail++
+  console.log(`${dedupesStyle ? '✅' : '❌'} 注入样式前先查重（避免重载后堆积）`)
+}
+
 console.log(`\n────────────────\n${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)

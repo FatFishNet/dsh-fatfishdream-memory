@@ -7,11 +7,50 @@
 
 ---
 
+## ~~`meta-mutation-test.mjs` 缺少中断保护~~ —— 已补（2026-11-15）
+
+**当时的问题**：靠 `try/finally` 恢复，进程被 kill 时 `finally` 不一定执行。
+而且注释写着「验证 hash 一致」，**代码里根本没有 hash 校验** —— 一句没兑现的承诺。
+
+**补了什么（三项）**：
+
+| 保护 | 实现 | 验证 |
+|---|---|---|
+① 启动查 `.mutbak` 残留 | 有残留就拒绝运行，打印手动恢复步骤 | 造一个假残留 → exit=1 ✅ |
+② 恢复后 sha256 校验 | 恢复完重读文件比对，不一致抛错并给出 `git checkout` 命令 | 代码路径已接，正常跑时一致 ✅ |
+③ `--dry-run` | 只列出会改哪个文件/片段/是否匹配，不动文件 | 11/11 匹配，exit=0 ✅ |
+
+**仍然保留的要求**：真跑时工作区应干净（`git status`）。`--dry-run` 不受限。
+
+**顺带修的同源问题**：它内部 `spawnSync` 调 `run-all.mjs` 也走管道，
+受限权限下 11 个变异会全变 ERROR（等于工具不可用）。现改走
+`_dbpreview/lib-spawn-capture.mjs`，见下面那条。
+
+---
+
+## ~~`run-all.mjs` 在受限沙箱下报假红~~ —— 已修（2026-11-15）
+
+**症状**：`workspace-write` 权限下跑 `run-all.mjs`，报 **`TOTAL=32 FAIL=32`**、
+每个 `exit=-1`；而 pwsh `foreach` 循环跑是 **32/32 全绿**。
+
+**根因**：受限沙箱不允许程序开命名管道，`spawnSync` 默认 `stdio:'pipe'` → `EPERM`、
+`status=null`；旧代码 `const code = r.status ?? -1` 把「没跑起来」算成「全部失败」。
+
+**修法**：新增 `_dbpreview/lib-spawn-capture.mjs`（先试管道，EPERM 就退回临时文件
+捕获），`run-all.mjs` 与 `meta-mutation-test.mjs` 都改用它。
+并把 **ERROR（没跑起来）与 FAIL（真失败）分开计数** —— ERROR 不进 `FAIL=`，
+但整体 exit≠0，这样变异测试不会把「runner 崩了」误读成「测试抓到了 bug」。
+
+**验证**：32/32 全绿；负向验证了 PASS / FAIL / ERROR 三类分离、
+缺失脚本、真失败（打绿字但 exit=1）四种情况全部判定正确。
+
+---
+
 ## 已发布的 npm 版本落后于仓库（1.0.1 不含项目改名）
 
-**状态**：等这批改动提交后发 `1.0.2`
+**状态**：**暂不发布**（用户 2026-11-15 定）。留作记录，不是因为缺条件。
 **记录时间**：2026-11-15
-**优先级**：高（版本号会误导人 —— 装了 1.0.1 的人以为能改名，其实不能）
+**优先级**：低（在「不发布」的前提下，它只影响外部使用者，不影响本机）
 
 ### 现场
 
@@ -23,26 +62,60 @@ dist-tags.latest = 1.0.1
 1.0.0 发布时刻   = 2026-11-14T06:33:18Z
 ```
 
-而 `/api/dsh-memory/scope/rename` 路由与 `db-store.mjs` 的 `renameScope` /
-`countScope` 是 **2026-11-15** 写的，当时还没提交，更没发布。
-所以 **`1.0.1` 里没有项目改名能力**。
+而 `/api/dsh-memory/scope/rename`、`renameScope` / `snapshotScope` /
+`listScopesWithData`、第七个 GUI 页签「工作区改名」都是 **2026-11-15** 写的，
+**晚于 1.0.1 的发布时刻。所以 `1.0.1` 里没有这些能力。**
 
-### 为什么容易读错
+### 为什么留着不删
 
-交接文档 ① 写「npm ✅ `1.0.1`（`latest` 指向它）」—— 单看没错，
-但读的人很容易理解成「改名能力已发布」。**版本号是给人看的承诺，不是事故记录。**
+`1.0.1` 是公开的 npm 版本，**别人 `dsh plugin add dsh-fatfishdream-memory` 拿到的就是这个**。
+它没有工作区改名。当前不发布是用户的决定（这个项目主要给自己用），
+但**下次决定要发版时必须记起这件事**，否则会以为「功能早就发布了」。
 
-### 做完的条件
+### 真要发的时候
 
-1. 那批改动（含 `.gitignore`）由用户提交
+1. 仓库改动由用户提交
 2. `& $node $pnpm publish --access public --no-git-checks` 发 `1.0.2`
 3. **只用一种方法验证**：新目录里 `& $node $pnpm add dsh-fatfishdream-memory@1.0.2`，
    看到 `downloaded 1, added 1` 才算成功（见 AGENTS.md「已知行为与坑」）
+4. 发完把这条删掉
 
 > 提醒：npm 包内容**不可变**。发错了只能再发一个版本，改不了旧的。
 
 ---
 
+## ~~10 个死函数~~ —— 已于 2026-11-15 全部删除
+
+**状态**：✅ 已完成（删除 10 个，保留教训注释）
+**记录时间**：2026-11-15
+
+### 结果
+
+`verify-functions` C 段（死代码检测）查出的 10 个函数，已全部删除：
+
+| 函数 | 处理 |
+|---|---|
+`reportBudget` / `measureInjection` | 删。预算提示早已由 `renderFromDb` 直接写进注入文案，比写日志更有效 |
+`dbPathOf` / `looksLikeRedline` / `splitMemoryLines` | 删。被更好的实现取代 |
+`monthKey` / `stamp` | 删。迁 SQLite 后时间统一由 `nowIso()` 产生 |
+`findSecret` | 删。**但 `SECRET_PATTERNS` 常量保留**——它记录「哪些形态算密钥」这个知识，将来要加脱敏能直接用 |
+`truncateBytes`（store）/ `tsSortKey` | 删。实际排序用 `TS_ORDER` 常量 |
+
+代码减少 59 行（`index.js` -48、`db-store.mjs` -11）。
+**删除时保留了各处有价值的教训注释**（UTF-8 截断要点、「文件字节 ≠ 注入字节」、
+为什么最终用 id 排序等），没有连知识一起删掉。
+
+### 留下的检测机制
+
+`_dbpreview/verify-functions.mjs` 的 C 段会持续检查：
+自动扫描缩进 ≤2 格的函数声明，除定义行与注释行外零引用即报错。
+白名单现已清空 —— 下次出现死代码会直接让回归变红。
+
+> ⚠️ 白名单的正确用法：**先核实调用点，再决定**。
+> 2026-11-15 踩过：`truncateBytes` 被报出来后我没核实就加进白名单，
+> 而它其实有两处真实调用。白名单最危险的地方是「把没查当成已查」。
+
+---
 ## 该记的轮次没人提醒（模型判断失误时无兜底）
 
 **状态**：已知缺口，下个版本解决（用户 2026-11-14 定）
@@ -93,43 +166,33 @@ if (record.writes > 0 && !record.wroteMemory) diag('turn-未记流水', ...)
 
 ---
 
-## 擦除器没有回传（`client-report` 路由空着）
+## ~~擦除器没有回传~~ —— 已补（2026-11-15）
 
-**状态**：已知缺口，暂缓
-**记录时间**：2026-11-14（修完第五代抖动之后核对出来的）
-**优先级**：中（不影响功能，但每次 DOM 问题都只能靠用户口述症状定位）
+**状态**：✅ 已完成
+**记录时间**：2026-11-14（补于 2026-11-15）
 
-### 现在是什么
+### 补了什么
 
-`client.js` 里**没有任何上报代码**：
+`client.js` 新增 `reportDomDiagnostics()`，并把入口挂到 `window.__dshMemoryReportDom`。
+它回传三类信息到 `/api/dsh-memory/client-report?dom=1&detail=<json>`：
 
-- `/api/dsh-memory/client-report` 路由存在、能收
-- 服务端 `diag('client-scrubber', ...)` 也在
-- 但客户端从来没调用过 —— 日志里 `[client-scrubber]` 计数为 **0**
+| 内容 | 为什么需要 |
+|---|---|
+所有带 `data-dsh-mem-blank` 的元素 + 其父元素的 `overflowY` | 冲突的直接证据 |
+页面上「能滚但滚不动」的容器（`clientH` vs `scrollH`）+ 其中被隐藏的子元素数 | 定位滚动条消失 |
+`document.head` 里我们注入了多少条 style | 检出重载后的堆积 |
 
-而 [`维护手册.md`](维护手册.md) §1 写着「排查不要靠用户开 DevTools，走回传」，
-**这句话目前是空话**。
+**为什么不自动跑**：DOM 诊断要遍历全文档，不该在每次装载时付这个成本。
+需要时在 DevTools 敲 `__dshMemoryReportDom()` 即可，结果直接落到服务端日志
+（`[client-dom-report]`）。
 
-### 补它值在哪
+### 这次就是它救的场
 
-第五代抖动（2026-11-14）全程没有数据，只能靠「整个对话区在抖」这一句描述
-反推「高度以 ~10Hz 振荡」。如果有回传，本可以一眼看到：
-
-- 每秒触发了几次扫描 / 几次真擦除
-- 擦除后多久被 React 写回（`takeRecords` 之后还剩下多少 mutation）
-- 静止窗口实际等到了没有
-
-### 怎么做（最小版）
-
-1. 在 `installMarkerScrubber` 里攒三个计数：`passes` / `stripped` / `rewrites`
-2. 每 10 秒（或每次 `pass` 之后节流）`fetch('/api/dsh-memory/client-report', {...})` 一次
-3. 服务端已有 `diag('client-scrubber', {state, stripped})`，**先看它的字段名再传**，
-   别自己发明
-
-**注意**：这是**客户端**代码，改完必须完整重启客户端才生效（不是禁用→启用）。
+2026-11-15 的「全局 skills 滚动条失效」正是靠这条通道思路定位的：
+先确认擦除器打了全局标记，再顺着 `overflow` 找出被塌陷的滚动容器。
+详见 [`维护手册.md`](维护手册.md) §1.1。
 
 ---
-
 ## 情绪记录只存模板句（text 混了元数据）
 
 **状态**：已知设计债，暂缓

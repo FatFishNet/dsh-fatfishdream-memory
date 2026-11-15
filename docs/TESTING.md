@@ -2,7 +2,7 @@
 
 改动后按这个清单走一遍。标 ⚠️ 的是**必须重启 DSH** 才能可靠验证的项。
 
-## 0. 全量回归（29 个脚本进清单，一条命令跑完）
+## 0. 全量回归（32 个脚本进清单，一条命令跑完）
 
 改完代码先跑这个，全绿再往下走。
 
@@ -16,24 +16,55 @@
 # 本机 node 不在 PATH，用 DSH 自带的运行时；路径模板如下，按你的安装位置替换。
 $node = "<DSH 安装目录>\dsh\node_modules\@deepseek-ai\dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
 $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，见 §6 注
-'verify-functions','verify-map','verify-map-content','selfcheck-full','selfcheck-cap','selfcheck-isolation',
-'selfcheck-paging','selfcheck-marker-hardened','selfcheck-dom-strip',
-'selfcheck-scrubber-loop','selfcheck-ts-sort','selfcheck-migrate-order',
-'selfcheck-migrate-db','selfcheck-copytree-empty','selfcheck-topic-clean',
-'selfcheck-injection-wording','verify-injection-consistency','selfcheck-emotion-guard',
-'selfcheck-emotion-lexicon','selfcheck-entry-by-id','selfcheck-archive','selfcheck-breakdown',
-'selfcheck-dir-name',
-'verify-no-self-trigger','verify-final','verify-doc-links',
-'verify-v3-schema','test-marker-forms','selfcheck-search-tier' |
-  ForEach-Object {
-    & $node "_dbpreview\$_.mjs"
-    "{0,-30} exit={1}" -f $_, $LASTEXITCODE
-  }
+
+# 跑全部（脚本清单只在 run-all.mjs 里维护一份，别在这儿手抄）
+& $node _dbpreview\run-all.mjs
+
+# 加 --verbose 看每个脚本的 exit
+& $node _dbpreview\run-all.mjs --verbose
+
+# 只跑指定的几个（调试用）
+& $node _dbpreview\run-all.mjs --only verify-functions,selfcheck-scope-rename
 ```
+
+### ⚠️ 受限权限下这一点必须知道（2026-11-15）
+
+**症状**：`workspace-write` / `read-only` 权限下跑 `run-all.mjs`，
+曾报出 **`TOTAL=32 FAIL=32`，每个都是 `exit=-1`** —— 而同一时刻用 pwsh
+`foreach` 循环跑，基线是 **32/32 全绿**。
+
+**根因**：整个脚本没有真的跑起来。受限沙箱**不允许程序开命名管道**，
+而 `spawnSync(..., { encoding:'utf8' })` 默认 `stdio: 'pipe'` → 每个子进程
+都拿回 `EPERM`、`status = null`。旧代码写的是 `const code = r.status ?? -1`，
+于是「一个都没跑起来」被算成「32 个全部失败」。
+
+**这是假红，不是插件坏了。** 判据很好记：
+
+| 你看到 | 含义 |
+|---|---|
+| 32 个全是 `exit=-1` 且 `note` 空白 | 管道被拒，**环境问题**，不是代码问题 |
+| 少数几个 `FAIL`，附带了脚本自己的输出 | 真的失败 |
+
+**现在已修**：`run-all.mjs` 走 `_dbpreview/lib-spawn-capture.mjs` —— 先试管道，
+被拒就退回**临时文件捕获**。受限模式下会自动降级，`TOTAL=32 FAIL=0` 正常输出。
+输出里若出现 `（输出经临时文件捕获：… 属正常降级）`，说明走的正是这条降级路径。
+
+**⚠️ 别再用 `r.status ?? -1` 把「没启动」归进失败计数。** 同理，
+任何自写脚本捕获子进程输出都应 import 这个 helper，不要自己 `spawnSync` 带 `encoding`。
+
+**另一种假绿，方向相反，一并记着**：`ERROR`（压根没跑起来）**不计入 `FAIL=`**，
+但整体 exit 会 ≠0。这样变异测试才能把「runner 自己崩了」判成 ERROR 而不是
+「测试抓到了 bug」。**看到 `FAIL=0` 但 exit≠0，就是有脚本没跑起来，本轮结果无效。**
+
+> **⚠️ 2026-11-15 起不再手抄脚本清单。**
+> 以前文档里有一份、pwsh 里有一份，加脚本时漏改过好几次
+> （`selfcheck-collapse-guard` / `selfcheck-pure-utils` 都差点漏）。
+> 现在唯一真相是 `run-all.mjs` 的 `SCRIPTS` 数组。
+> **新增脚本只改那一处**，文档与命令自动跟上。
 
 | 脚本 | 断言数 | 查什么 |
 |---|---|---|
-| `verify-functions` | 112 | 地图里每个「行号 → 函数名」是否对上 |
+| `verify-functions` | 112 + 133 个符号 | 两段：**A** 地图里每个「行号 → 函数名」是否对上；**C 死代码检测** 自动扫描缩进 ≤2 格的函数声明，统计「除定义行、除注释行」外的引用次数，为 0 即死代码（2026-11-15 加，当场查出 10 个，其中 `reportBudget` 已造成预算告警静默失效） |
 | `verify-map` | 117 处引用 | 地图 `L####` 是否越界/落空（**只判非空行，漂移不报**） |
 | `verify-map-content` | 38 | **地图准绳**：每处「`符号`（L####）」那一行必须含该符号；锚点由源码现算 |
 | `chk-map-lines` | 117 处 | 逐条打印每处 `L####` 的真实内容，人工核对「该行是不是说的那个函数」 |
@@ -56,6 +87,7 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | `selfcheck-entry-by-id` | 13 | **按 id 取单条全文**（`/entry?id=&table=`）：正文一致、缺参数 400、未知表 400、不存在 404；旧 `/entry/<id>` 仍 401 |
 | **`selfcheck-archive`** | **49（存储 36 + HTTP 13）** | **v4 原文归档**：存储层（写入/过滤/FTS 中文/分页/统计口径/不污染 `/search`）+ HTTP（`/archive` 200 形状、`role=x` 400、limit）。加 `--no-http` 可只跑存储层 |
 | **`selfcheck-breakdown`** | **18（存储）+ 5（HTTP）** | **v5 库体积分层**：`dbstat` 不列空闲页所以 `core+archive+system+free` 必须**精确等于** `page_count×page_size`；索引归属（`idx_archive_*`→archive、`idx_logs_*`→core）；缓存与失效；**反向断言 `stats()` 里没有 dbstat**。加 `--no-http` 只跑存储层 |
+| **`selfcheck-scope-rename`** | **84** | **工作区改名 + 迁前/迁后数据量比对**（自建临时库）。①`snapshotScope` 口径（all/active/minId/maxId、archive 无 status 列）②正常改名三表九项校验全过 ③异常路径（目标占用/`__global__`/同名/空名/空工作区）④**事务回滚**：用触发器模拟第二张表失败，断言 rules 仍在旧 scope（没事务的话它会被改走）⑤`countScope` 的 `activeOnly` ⑥**`listScopesWithData` 必须包含「全是停用条目」的工作区**（`byScope` 会漏的那种），且默认排除 `__global__` ⑦**合并**：目标已有数据时默认拒绝并提示可勾选合并，`allowMerge:true` 后条数 = 源+目标、行集合取并集（独立临时库，20 项）⑧源码级：`resolveProjectKey` 返回 `scope`、写入用 scope 不用 key、死代码已删 |
 | `selfcheck-dir-name` | 10 | 目录名可移植（四种安装场景） |
 | **`selfcheck-search-tier`** | **12** | **检索按表分层**（自建种子）：段序固定 profile→rules→logs、小 limit 时三表各露一条、组内仍按 bm25、`lastLogTs()` 按 id 取最新；另 3 条源码级断言守着「整理提醒不再只看 `lastConsolidate`」 |
 | `verify-no-self-trigger` | — | 注入文本不会被自己匹配 |
@@ -73,6 +105,96 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 > **改注入文案后**额外跑 `show-injection.mjs`：它打印分段字节账 + token 估算
 > （2026-11-15 实测：4820 字节 / 约 1069 token；改文案前后各跑一次对比）。
 
+## 0.05 测试能力自检：这些测试真的管用吗？
+
+**只看断言数量没有意义。** 这个项目曾经有 112 条断言全绿，而
+`reportBudget` 从 1.0.0 起就没有调用点（功能静默失效两天没人发现）。
+断言测的是「符号还在文件里」，不是「行为对不对」。
+
+所以有两个 meta 工具，定期跑一次。
+
+### `meta-mutation-test.mjs` —— 改坏代码，看测试红不红
+
+**⚠️ 这是唯一会修改生产文件的工具。跑之前先读下面「三项保护」。**
+
+```powershell
+# 先看一眼会改哪里（不动文件，安全）
+& $node _dbpreview\meta-mutation-test.mjs --dry-run
+
+# 真的跑（会临时改坏生产文件）
+& $node _dbpreview\meta-mutation-test.mjs
+```
+
+做法：对每个变异点，备份 → 注入一处语义改变 → 跑全量回归 → 恢复。
+
+| 结果 | 含义 |
+|---|---|
+**KILLED** | 有测试红了 → 这个变异被抓住，测试有效 |
+**SURVIVED** | 全绿 → **测试盲区**，改坏了没人管 |
+**ERROR** | runner 自己崩了 → **本次结果无效**，先修工具 |
+**SKIP** | 变异点没匹配上源码（源码变了）→ 更新 `MUTATIONS` |
+
+⚠️ **必须区分 KILLED 和 ERROR。** 2026-11-15 首版用
+`execSync('node ...')`，而本机 node **不在 PATH** —— 每个变异都执行失败，
+却全被判成 KILLED，报出「100% 杀伤率」。那是假绿：结论完美，证据是空的。
+现在用 `process.execPath`，且解析不出 `TOTAL=/FAIL=` 就记 ERROR。
+
+#### 三项中断保护（2026-11-15 补）
+
+这个工具靠 `try/finally` 恢复，但**进程被 kill 时 `finally` 不一定执行**。
+所以加了三项：
+
+| 保护 | 行为 |
+|---|---|
+① **启动查 `.mutbak` 残留** | 有残留就**拒绝运行**并提示手动恢复 —— 残留说明生产文件可能还是被改坏的状态，此时跑会把坏文件当成「原文」备份，把问题固化 |
+② **恢复后校验 sha256** | 恢复完重新读文件、与原文 hash 比对，不一致就**抛错并打印 `git checkout -- <文件>`** 。（此前注释声称「验证 hash 一致」，代码里却没有校验 —— 一句没兑现的承诺） |
+③ **`--dry-run`** | 只列出每个变异会改哪个文件、哪个片段、是否匹配，**不改任何文件**，exit 0 |
+
+**仍然要求：`git status` 干净时才真跑。** 当前工作区若有大量未提交改动，
+中断后改坏的内容会和未提交改动混在一起分不清（⑩ §三.⑦ 的教训）。
+`--dry-run` 可以随时跑，不受这条限制。
+
+**当前基线（2026-11-15）：11 个变异，KILLED 11 / SURVIVED 0**；
+`--dry-run` 显示 11/11 变异点已匹配。
+
+首轮跑出过一个真盲区：`scrubber-guard` 存活。原因是断言写成
+`/isSafeToCollapse\s*\(\s*el\s*\)/`，而函数定义 `function isSafeToCollapse(el)`
+**也匹配** —— 把 if 条件里的调用删掉（改成 `true`），断言照样通过。
+已改成「打标记语句前 400 字符内必须出现该调用」。
+
+### `meta-audit-coverage.mjs` —— 哪些函数从没被测试执行过
+
+```powershell
+& $node _dbpreview\meta-audit-coverage.mjs
+```
+
+区分三种状态（这个区分很重要）：
+
+| 状态 | 含义 |
+|---|---|
+`CALLED` | 测试代码里真的调用了 |
+`NAMED` | **只在按名字定位的断言里出现 → 等于没测** |
+`NONE` | 完全没出现 |
+
+**当前基线：153 个函数，CALLED 52（34%）/ NAMED 46（30%）/ NONE 55（36%）。**
+
+`NAMED` 这一列最有价值：它暴露的是「看起来有测试、实际没有」的假覆盖。
+
+### 补测试的优先级
+
+零覆盖里**优先补纯函数**（无 I/O、无宿主依赖、出错代价高）：
+
+| 函数 | 出错后果 |
+|---|---|
+`parseJson` | BOM 让裸 `JSON.parse` 抛错，外层 catch 吞成「无数据」→ 记忆突然读不到 |
+`isInside` | 迁移/路径判断错 → 数据搬到子目录里 |
+`slugify` / `isSafeSlug` | 项目名映射错 / 路径穿越 |
+`serialize` | 并发写库互相覆盖（实测丢到只剩 1 条） |
+
+`selfcheck-pure-utils.mjs` 已覆盖前四个（39 项断言），做法是
+**从源码抽取函数体执行**（不是复制一份逻辑），源码改了测试跟着变。
+
+---
 ## 0.1 语法检查
 
 ```bash
@@ -295,10 +417,10 @@ POST /api/dsh-memory/root/move     {"root":"D:\\dsh-fatfishdream-memory"}
 ## 7. GUI 面板
 
 **入口在左侧栏**（`sidebar.panellist` 的「大肥鱼的梦」图标），不是设置页。
-点击后主区域切换到记忆面板，应看到**六个页签**：
+点击后主区域切换到记忆面板，应看到**七个页签**：
 
 ```
-用户画像 / 规则与偏好 / 情绪记录 / 记忆流水 / 收尾语 / 存储设置
+用户画像 / 规则与偏好 / 情绪记录 / 记忆流水 / 工作区改名 / 收尾语 / 存储设置
 ```
 
 各页签确认：
@@ -306,6 +428,9 @@ POST /api/dsh-memory/root/move     {"root":"D:\\dsh-fatfishdream-memory"}
 - **用户画像 / 规则与偏好**：能列出条目、能改字、能停用、能删除；「＋ 新增」表单能落库
 - **情绪记录**：插件自动录入的条目在，可纠正误判
 - **记忆流水**：按时间范围能筛；**列表默认显示 `summary`**（v3），点「展开全文」才看正文
+- **工作区**（2026-11-15 新增）：下拉列出**有数据**的工作区（**不含 `__global__`**，
+  且必须包含「rules 全是停用条目」的 `design`）；选源 + 填新名 → 「预览影响」显示三表行数 →
+  「开始迁移」弹确认 → 「确认迁移」后显示迁前/迁后对照与 9 项校验
 - **收尾语**：输入框里只有那句话本身（不含「这是会话的心跳…」那段执行说明）
 - **存储设置**：显示记忆根目录、是否在系统盘、库体积/条数；有迁移按钮
 - **不应有**「打开文件夹」（已移除）

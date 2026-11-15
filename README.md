@@ -1,121 +1,106 @@
 # FatFishDream · 大肥鱼的梦
 
-给 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）用的**长期记忆插件**。
+面向 [DeepSeek Harness](https://github.com/deepseek-ai)（下称 DSH）的长期记忆插件。
 
-本插件仅依赖 DSH 客户端内置的 Node.js (>=22.5.0) 原生 SQLite 模块。
+仅依赖 DSH 客户端内置的 Node.js 原生 SQLite 模块，**零第三方运行时依赖**。
 
-它让 AI 跨会话记得「我们之前一起做过什么」——不是记得更多技术细节，
-而是记得**这段关系里发生过什么**。
+插件在会话之间持久化记忆数据，使模型在新会话中仍可访问此前记录的结论、规则与流水。
 
 ---
-<img width="986" height="754" alt="image" src="https://github.com/user-attachments/assets/7ece94ae-e3a4-47e9-b323-8ba3803f8ad6" />
----
 
-## 它解决什么问题
+## 功能
 
-DSH 的会话是隔离的。关掉窗口再打开，AI 不知道昨天你们改过什么、踩过什么坑、
-你说过不喜欢什么。
+本插件采用**零工具**设计：不向模型注册任何工具，记忆的读写通过四条数据通道完成。
 
-这个插件补上那一层：每轮对话自动注入「当前项目的结论」，
-模型照常干活时顺手把值得留的写下来，下一轮/下次会话就能读到。
-
-和别的记忆插件最大的不同：**零工具**。
-
-| 能力 | 走哪条通道 | 模型要做什么 |
+| 能力 | 通道 | 模型侧操作 |
 |---|---|---|
-| **读** | `systemPrompt.context` 每轮注入 | 什么都不用做，内容已经在上下文里 |
-| **写** | 回复正文里写 `mem-log` 标记 | 顺手写几行标记，插件监听 `session/event` 自己入库 |
-| **查** | 本机 HTTP 接口 | 用 pwsh 发请求 |
-| **情绪** | 插件自动监听 | 完全无感知 |
+| 读 | `systemPrompt.context` 每轮注入结论 | 无需操作 |
+| 写 | 回复正文内嵌 `mem-log` 标记 | 插件监听 `session/event` 自行落库 |
+| 查 | 本机 HTTP 接口 | 通过 pwsh 发起请求 |
+| 情绪 | 插件自动监听用户消息 | 无感知 |
 
-**为什么不做成工具**：工具 schema 会进每次请求的 `tools` 数组，某些反代/中转通道
-（实测 WorkBuddy）会以「参数结构不符合要求」**拒绝整个请求** ——
-该 profile 下所有会话都发不出消息。本项目因此实际中断过两次，
-每次都要用户手动卸载插件才能恢复。
+**不使用工具的原因**：工具 schema 会进入每次请求的 `tools` 数组。部分反代/中转通道
+（已实测 WorkBuddy）会以「参数结构不符合要求」为由拒绝整个请求，导致该 profile
+下所有会话无法发送消息。本项目因此实际中断过两次，均需手动卸载插件才能恢复。
 
-所以这里做了个反向选择：**放弃工具的便利，换取「永远不会因为自己而让会话发不出消息」**。
-
-**适合谁用**：个人开发者，或一两个人维护的小项目。
-
-典型场景是一个长期做下去的项目 —— 会话会断、窗口会关，
-但「上次那个坑踩过没有」「我说过不喜欢什么」不该跟着断。
-
-本插件假定记忆属于**一个人**，所以不做多用户、不做跨设备同步、不做集中审计。
-它最初就是为这个场景写的；需要这些能力的团队与平台场景，它不是合适的选择。
+据此作出的取舍是：**放弃工具调用能力，换取「不因自身原因导致会话不可用」**。
 
 ---
 
-## 装它
+## 适用场景
+
+面向**个人开发者或一至两人的小型项目**。
+
+本插件假定记忆数据归属单一用户，不提供多用户隔离、跨设备同步或集中审计能力。
+需要上述能力的团队或平台场景不适用。
+
+---
+
+## 安装
 
 ```bash
-# 从 npm 装（推荐）
-dsh plugin --profile <你的profile> add dsh-fatfishdream-memory
+# npm 安装（推荐）
+dsh plugin --profile <profile> add dsh-fatfishdream-memory
 
-# 或从 GitHub 装（插件在仓库的子目录里，用 #path: 指定）
-dsh plugin --profile <你的profile> add "git+https://github.com/FatFishNet/dsh-fatfishdream-memory.git#path:/dsh-fatfishdream-memory"
+# GitHub 安装（插件位于仓库子目录，通过 #path: 指定）
+dsh plugin --profile <profile> add "git+https://github.com/FatFishNet/dsh-fatfishdream-memory.git#path:/dsh-fatfishdream-memory"
+
+# 本地安装（已 clone 至本地时）
+dsh plugin --profile <profile> add <clone 路径>/dsh-fatfishdream-memory
 ```
 
-装完**完整重启 DSH**（不是禁用→启用，是重启客户端 —— `client.js` 是浏览器模块）。
+安装后须**完整重启 DSH 客户端**。禁用后重新启用不能替代重启 —— `client.js`
+为浏览器模块，禁用/启用不会触发其重新加载。
 
-装好后侧边栏出现「大肥鱼的梦」图标，点开是六个页签：
+安装成功的判定依据是日志中出现：
 
-| 页签 | 干什么 |
+```
+[health-check-verdict] 通过：9 项全部就位
+```
+
+九项分别为：四个事件监听、注入层、`/memory` 命令、HTTP 路由、库可读、根目录可读。
+任一缺失会在日志中明确列出失败项，用于排查 DSH 升级后的静默失效。
+
+安装完成后，侧边栏出现「大肥鱼的梦」入口，展开为七个页签：
+
+| 页签 | 用途 |
 |---|---|
-| 用户画像 | 跨项目的事实与偏好，可增删改停用 |
-| 规则与偏好 | 按项目维护的约定，可按项目/类型筛选 |
-| 情绪记录 | 插件自动录的，可纠正误判 |
-| 记忆流水 | 模型写的工作日志，按项目+时间筛选，分页 30 条 |
-| 收尾语 | 每轮固定结尾那句话 |
-| 存储设置 | 记忆根目录迁移、**库体积构成** |
+| 用户画像 | 跨项目的事实与偏好，支持增删改与停用 |
+| 规则与偏好 | 按项目维护的约定，支持按项目/类型筛选 |
+| 情绪记录 | 插件自动记录，可修正误判 |
+| 记忆流水 | 模型写入的工作日志，按项目与时间筛选 |
+| 工作区改名 | 改名或合并：选源 → 预览数据量 → 确认 → 执行并比对迁前迁后；目标已有数据时自动转为合并 |
+| 收尾语 | 每轮固定结尾语句 |
+| 存储设置 | 记忆根目录迁移、库体积构成 |
 
 ---
 
-## 它把数据存哪
+## 存储
 
-**单库 SQLite**（`<记忆根目录>/memory.db`，WAL 模式），四张业务表 + 一张原文层：
+单库 SQLite（`<记忆根目录>/memory.db`，WAL 模式），含四张业务表与一张原文层：
 
-| 表 | 存什么 | 注入吗 | 谁写 |
+| 表 | 内容 | 是否注入 | 写入方 |
 |---|---|---|---|
-| `profile` | 用户画像（跨项目） | ✅ 每轮 | 用户在 GUI |
-| `rules` | 规则与偏好（带 `scope` / `kind`） | ✅ 按项目 | 用户在 GUI |
-| `emotion` | 情绪记录 | ❌ **也不进检索** | 插件自动 |
-| `logs` | 记忆流水 | ❌ 只检索 | 模型标记 |
-| `archive` | user/assistant **原文一条不落**（v4 起，2026-11-14 04:45 之后） | ❌ 只按 `/archive` 回溯 | 插件自动 |
+| `profile` | 用户画像（跨项目） | 是，每轮 | 用户在 GUI |
+| `rules` | 规则与偏好（含 `scope` / `kind`） | 是，按项目 | 用户在 GUI |
+| `emotion` | 情绪记录 | 否，也不进检索 | 插件自动 |
+| `logs` | 记忆流水 | 否，仅检索 | 模型标记 |
+| `archive` | user/assistant 原文逐条留存 | 否，仅按 `/archive` 回溯 | 插件自动 |
 
-> ⚠️ `archive` **只从 2026-11-14 04:45（v4 上线）开始有原文**，更早的对话没有回填。
-> 所以它查不到时要说「我没有这段记录」，不能说「没发生过」。
+> `archive` 仅从 2026-11-14 04:45（v4 起）开始留存原文，此前对话未回填。
+> 查询无结果时应表述为「无此段记录」，而非「未发生过」。
 
-**`logs` 是结论层**（整理过的、一眼能看的），**`archive` 是原文层**（不可变、可追溯）。
-整理会漏会判错，但只要原文还在就还能翻回来 —— 这是「记忆就是完整的，而不是取舍」的落地方式。
+`logs` 为结论层（经整理），`archive` 为原文层（不可变、可追溯）。
+结论整理可能遗漏或误判，但原文留存使数据可回溯。
 
-**为什么不用 Markdown 文件**：不是容量问题，是**查询形态**。
-`.md` 按主题检索只能靠 grep 做子串匹配，换个说法就搜不到；
-SQLite 的 FTS5 能分词、`GROUP BY` 能现算索引、`UPDATE` 能改错。
-
-### 唯一在内存根目录的 .md 是 `policy.md`
-
-它装「每轮必须执行、不可被截断」的行为规则（含收尾语），不进数据库、
-不与 `rules` 抢预算。这是刻意的：混进 rules 会和 pref 共享预算，规则可能被静默挤掉。
-
-### 记忆根目录怎么定
-
-四级选址，顺序是刻意设计的：
-
-```
-1. 用户手写的明确路径（cordis.patch.yml 里留空 = 跳过）
-2. 指针文件 ~/.dsh/memory-root.json —— 上次实际用过的目录
-3. 盘上已有的同名目录（兼容没有指针的老安装）
-4. 首次安装：优先 D 盘 → 其他非系统盘按剩余空间 → 都没有才落「文档」目录
-```
-
-**包里的 `cordis.patch.yml` 刻意不写 `root`** —— 写死了开发机路径会随包分发给所有人，
-造成「没 D 盘就启动失败」或「记忆被塞进他从没指定过的位置」。要固定请用 GUI 的存储设置。
+根目录选址、表结构、FTS 设计、备份迁移与体积构成详见
+[`dsh-fatfishdream-memory/STORAGE.md`](dsh-fatfishdream-memory/STORAGE.md)。
 
 ---
 
-## 怎么用（模型侧）
+## 使用（模型侧）
 
-### 写记忆：在回复正文里写标记
+### 写入：回复正文内嵌标记
 
 ```
 <!--mem-log topic=开发日志 summary=修好并发写库丢失 keywords=FTS｜bm25
@@ -123,134 +108,95 @@ SQLite 的 FTS5 能分词、`GROUP BY` 能现算索引、`UPDATE` 能改错。
 -->
 ```
 
-**参数顺序固定 `topic` → `summary` → `keywords`，与 topic 同一行。**
-写反时后面的参数会被前一个整段吞掉（summary 丢失、keywords 被污染），**而且不报错**。
+参数顺序固定为 `topic` → `summary` → `keywords`，且与 `topic` 同行。
+顺序颠倒时，后续参数会被前一参数整体吞并（summary 丢失、keywords 污染），且不报错。
 
-**三条禁令**（每条都实际踩过，`node --check` 查不出来）：
-
-| 禁止 | 会发生什么 |
+| 参数 | 约束 |
 |---|---|
-| 写 `<!--/mem-log-->` 这类闭合标签 | 不会被剥离，变成正文**永久写进库并每轮注入** |
-| 开标签自带 `-->` 后再加闭合标签 | 同上 |
-| 整条压成一行 | **正则匹配不上，整条静默丢失，无任何报错** |
+| `topic` | 13 个分类之一，封闭集合，不在集合内会被白名单拒绝 |
+| `summary` | 一句话概述，**≤35 字**；超出会被截断并记录诊断日志 |
+| `keywords` | 检索用技术名词，以全角竖线 `｜` 分隔（不用逗号）；无名词时写 `无` |
 
-**收尾的 `-->` 必须单独起一行。**
-
-**13 个 topic**（封闭集合，不在其中的会被白名单拒收）：
-开发日志 / 技术讨论 / 构建/编译 / 注入/预算 / 插件/装载 / 路径/沙箱 /
+13 个 topic：开发日志 / 技术讨论 / 构建/编译 / 注入/预算 / 插件/装载 / 路径/沙箱 /
 格式/编码 / 文档/行号 / 情绪判据 / 用户画像 / 数据清理 / GUI/界面 / Git
 
-### 查记忆：本机 HTTP 接口
+三条禁止写法（均无法通过 `node --check` 发现）：
+
+| 禁止 | 后果 |
+|---|---|
+| 书写 `<!--/mem-log-->` 闭合标签 | 不会被剥离，作为正文永久入库并逐轮注入 |
+| 开标签自带 `-->` 后再加闭合标签 | 同上 |
+| 整条压缩为一行 | 正则不匹配，整条静默丢失，无报错 |
+
+结尾 `-->` 必须独占一行。正文需提及标记字样时须拆分书写（反引号包裹亦无效，解析器处理的是原文）。
+
+### 查询：本机 HTTP 接口
 
 ```powershell
-# 检索（scope 必带，不传返回 400）
-$env:DSH_WEB_URL/api/dsh-memory/search?q=<关键词>&scope=<项目名>
+# 结论层检索（scope 必填，缺省返回 400）
+$env:DSH_WEB_URL/api/dsh-memory/search?q=<关键词>&scope=<项目名>&summary=1
 
-# 先看摘要省 token，确认相关再按 id 取全文
-&summary=1
-entry?id=<id>&table=<table>
+# 先取摘要，确认相关后按 id 取全文
+$env:DSH_WEB_URL/api/dsh-memory/entry?id=<id>&table=<table>
 
-# 原文层回溯（不含在默认 search 里）
-archive?scope=<项目>&q=<关键词>
+# 原文层回溯（不在默认 search 范围内）
+$env:DSH_WEB_URL/api/dsh-memory/archive?scope=<项目名>&q=<关键词>&limit=50
 ```
 
-**端口每次启动都变**，必须读 `$env:DSH_WEB_URL`，不要写死。
+| 端点 | 返回字段 | 说明 |
+|---|---|---|
+| `/search` | `hits` | 仅检索结论层（流水 / 规则 / 画像） |
+| `/archive` | `rows` | 仅检索原文层，分页参数 `limit` / `offset` |
+| `/entries` | `entries` | GUI 分页，`table` 必填（四表 id 各自编号） |
+| `/entry` | `entry` | 按 id 取单条，须携带 `table` |
 
-**检索只查 `profile` / `rules` / `logs` 三张表**：
-`archive` 是原文层（会把结论淹掉），`emotion` 是个人记录（不进上下文也不需要查询）。
+端口在每次启动时变化，须读取 `$env:DSH_WEB_URL`，不得硬编码。
 
 ---
 
 ## 情绪捕获
 
-用户表达情绪时插件自己识别入库，**模型无感知**。
+插件自动识别并记录用户消息中的情绪，模型无感知。
 
-- **六簇**：爱意 / 夸赞 / 吐槽 / 友善 / 喜悦 / 低落
-- 判定 = 情感词典打分 + 否定/程度/转折三条语言学规则 + 反讽检测
-- **命中即记**：每一条都入库，`confidence` 只标强（≥0.62）/ 弱，**不再按阈值丢弃**
-- 只认真人消息：代码块、行内代码、引号内被讨论的字样、URL 都不计入
+- 六个类别：爱意 / 夸赞 / 吐槽 / 友善 / 喜悦 / 低落
+- 判定由情感词典打分叠加否定、程度、转折规则与反讽检测、后置限定词降权构成
+- 命中即记：逐条入库，`confidence` 仅标强（≥0.62）/ 弱，不按阈值丢弃
+- 仅处理真实用户消息，代码块、行内代码、被讨论的引号内容与 URL 不计入
+- 不进检索、不进注入，仅供用户在 GUI 查看
 
-**有形态闸门**：超过 1000 字符或 20 行的输入直接跳过 ——
-否则会把提示词片段或交接文档当成「用户说了什么」录进来（实际发生过，误判了 28016 字）。
-
-> **为什么"命中即记"而不筛选**：判错了还能回 `archive` 原文追溯，判漏了就永远没了。
-> 误判靠扩充 `NON_EMOTION_COMPOUNDS`（麻烦≠烦 / 积累≠累 / 无语义≠无语）修词典，
-> **不要退回按阈值丢**。
+> 「命中即记」的依据：误判可通过 `archive` 原文追溯，漏判则永久丢失。
+> 修正误判通过扩充复合词词典实现，不退回按阈值丢弃。
 
 ---
 
 ## 开发
 
-**动手前先读 [`docs/项目地图.md`](docs/项目地图.md)** —— 它是结构索引
-（函数在哪、谁调谁、改哪影响什么），不是目录清单。
+改动前须先阅读 [`docs/项目地图.md`](docs/项目地图.md)（结构索引）。
 
 ```
 FatFishDream/
   dsh-fatfishdream-memory/   插件本体（可独立安装）
     index.js                 Host：注入、情绪分析、标记写入、原文归档、HTTP 路由、健康自检
-    client.js                Client：侧边栏入口 + 主面板（六页签）+ 标记擦除器
+    client.js                Client：侧边栏入口 + 主面板（七页签）+ 标记擦除器
     db-schema.mjs            schema 定义 + 迁移 + FTS 辅助
-    db-store.mjs             存储适配层（读写检索维护）
+    db-store.mjs             存储适配层
     cordis.patch.yml         bundle patch（各段预算；root 刻意留空）
-    README.md / STORAGE.md   ← 给使用者的说明（随包分发，只讲使用面）
-  docs/                      开发文档（见下表）
-  _dbpreview/                回归测试脚本（33 个，其中 29 个进全量回归）
-  _dbbackup/                 真实库备份（★ 回退点，**绝不能删**）
-  _archive/                  已退役内容
+  docs/                      开发文档
+  _dbpreview/                回归测试脚本
+  _dbbackup/                 真实库备份（回退点，不可删除）
 ```
 
-### 最短流程（完整版见维护手册 §4，别跳过备份与回归）
+完整开发文档见 `docs/` 目录，硬约束清单见 [`AGENTS.md`](AGENTS.md)。
 
-```
-1. 读地图定位函数，确认 §9 影响面
-2. 备份 index.js
-3. 改代码 → node --check
-4. 改 schema → 按硬约束 7 写迁移（⚠️ 先备份再改 SCHEMA_VERSION）
-5. 跑 _dbpreview/ 回归（清单见 docs/TESTING.md）
-6. 重载插件或重启 DSH → 看日志
-7. 改了 index.js → 按符号名重算地图行号
-8. 同步受影响文档
-```
-
-**改注入比改文档更重要** —— 文档错了没人看，注入错了每轮都错。
-真正生效的是 `index.js` 的 `usageLines`，不是 `policy.md` 里那条同名小节。
-
-### 硬约束
-
-完整清单见 [`AGENTS.md`](AGENTS.md)（编号 1–16 加 10b / 10c / 11b / 12b，共 21 条）。
-最容易踩的：
-
-- **不要注册任何工具**（见上）
-- **不要用 `write` / `edit` / pwsh 直写 `memory.db`** —— 那是**损坏数据库**，不是被拒绝
-- **改 schema 必须先备份再改版本号** —— HMR 会把新代码立刻装进运行中的插件并自动迁移，
-  等你想起备份时库已经变了（2026-11-14 实踩）
-- **`POLICY_TEMPLATE` 改了，`policy.md` 也要同步** —— 模板只在首次安装时生成
-- **删除表必须在迁移条目里带 `drops: true`**，否则不会 VACUUM，体积一分不省
-
-### 文档在哪
-
-| 要查什么 | 去哪 |
-|---|---|
-| 某个函数在哪、改哪影响什么 | [`docs/项目地图.md`](docs/项目地图.md) |
-| 为什么这么设计、踩过哪些坑 | [`docs/DECISIONS.md`](docs/DECISIONS.md) |
-| 改完怎么验证 | [`docs/TESTING.md`](docs/TESTING.md) |
-| 擦除器 / 标记细节 / 已知坑 | [`docs/维护手册.md`](docs/维护手册.md) |
-| 已知待办 | [`docs/TODO.md`](docs/TODO.md) |
-| 存储位置规则 | [`dsh-fatfishdream-memory/STORAGE.md`](dsh-fatfishdream-memory/STORAGE.md)（根目录选址、表结构、备份与迁移） |
-
-### 测试怎么跑
+### 测试
 
 ```powershell
-$env:ELECTRON_RUN_AS_NODE = 1        # 本机 node 不在 PATH，用 Electron 当 node
-$env:DSH_BASE = $env:DSH_WEB_URL     # 端口每次启动都变，不要写死
-
-& $env:DSH_NODE_EXECUTABLE _dbpreview\verify-map-content.mjs
+$node = "D:\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"
+$env:DSH_BASE = $env:DSH_WEB_URL
+& $node _dbpreview\run-all.mjs
 ```
 
-完整清单（29 个脚本）见 [`docs/TESTING.md`](docs/TESTING.md) §0。
-
-> ⚠️ **临时脚本用 `write` 工具落盘，不要用 pwsh `Set-Content`** ——
-> 实测会出现「写完 `Test-Path=True`，node 却报 `MODULE_NOT_FOUND`」。
+完整清单见 [`docs/TESTING.md`](docs/TESTING.md)。
 
 ---
 
@@ -258,36 +204,38 @@ $env:DSH_BASE = $env:DSH_WEB_URL     # 端口每次启动都变，不要写死
 
 | 项 | 值 |
 |---|---|
-| 包版本 | `1.0.1`（MIT，已发布到 npm） |
-| schema | **v5** |
-| 代码规模 | `index.js` 4302 行 / `client.js` 1632 行 / `db-store.mjs` 1126 行 / `db-schema.mjs` 422 行 |
-| HTTP 路由 | **18 条** |
-| 回归测试 | **33 个脚本，29 个进全量回归** |
-| 每轮注入 | 约 **4.7 KB / 约 1069 token**（2026-11-15 实测 `show-injection.mjs`：4820 字节 / 1069 token） |
-| 第三方依赖 | **零**（只用 Node 内置：`node:sqlite` / `fs` / `path` / `os` / `crypto`） |
+| 包版本 | `1.1.0`（MIT，npm 最新版） |
+| schema | v5 |
+| 代码规模 | `index.js` 4657 行 / `client.js` 2361 行 / `db-store.mjs` 1375 行 / `db-schema.mjs` 422 行 |
+| HTTP 路由 | 19 条 |
+| 回归测试 | 33 个脚本全量回归 + 23 个变异测试 |
+| 每轮注入 | 约 5.6 KB / 约 1243 token（按实际内容计费） |
+| 第三方依赖 | 零（仅 Node 内置模块） |
 | 平台 | Windows（macOS 未验证） |
-| 健康自检 | 启动后核验 **9 项**挂载点 |
+| 健康自检 | 启动后核验 9 项挂载点 |
 
-### 已验证
+### 相对 1.0.1 的变更
 
-（2026-11-15，回归 29/29 全绿，约 700+ 断言）
+| 类别 | 内容 |
+|---|---|
+| 新增：工作区改名 | 第七页签，支持改名与合并；后端 `renameScope` 重写为事务 + 自校验，新增 `GET /scope/list` |
+| 修复：情绪判定 | 新增后置限定词降权与完成度削弱词，修正「成功了一半」「部分搞定」等误判 |
+| 修复：rootReason 字段 | `/state` 的 `rootReason` 此前恒为空，现已真实返回 |
+| 修复：擦除器 | `isSafeToCollapse` 三道守卫，修正全局滚动条失效 |
+| 新增：测试体系 | `run-all.mjs`（唯一清单）、`meta-mutation-test.mjs`（变异）、`meta-audit-coverage.mjs`（覆盖率）、`lib-spawn-capture.mjs`（沙箱降级） |
+| 变更：注入规则 | 「正文不写空行」「情绪不豁免记流水」「marker-unmatched 区分提及与写错」 |
+| 清理：死代码 | 删除 10 个死函数（含静默失效的 `reportBudget`） |
+| 新增：写入失败提醒 | 连续 4 轮「写了标记却零落库」时经 `safePushMessage` 提醒一次 |
 
-- 空库建库、v2→v3→v4→v5 迁移、旧数据可读、FTS 可检索
-- 中文 2 字词检索、按项目硬隔离、标记 5 种畸形写法
-- 原文归档两侧写入（user / assistant）、情绪退出检索
-- GUI 六页签数据源、健康自检 9 项
-- 库体积分层（`core` / `archive` / `system` / `free` 四类合计精确等于总量）
-
-### 已知限制（真实存在，不粉饰）
+### 已知限制
 
 | 限制 | 说明 |
 |---|---|
-| **macOS 未验证** | 选址逻辑假设 Windows 盘符体系，会静默落到怪路径 |
-| **`archive` 只增不减** | 没有保留期或体积上限，膨胀比约 6×（5000 轮 ≈ 118 MB），见 `docs/TODO.md` |
-| **情绪理解不了反讽** | 词典 + 规则，客套/压抑/委婉否定识别不了 |
-| **标记写错会静默丢** | 整条压成一行会完全不匹配、零报错、整条丢失 |
-| **注入是固定开销** | 约 4.7 KB / 1069 token 每轮（2026-11-15 实测）。项目结论满了会裁剪中间几条 |
-| **项目段预算 4096 字节** | 写满要人进 GUI 精简或标 stale，没有自动压缩 |
+| macOS 未验证 | 选址逻辑基于 Windows 盘符体系 |
+| `archive` 只增不减 | 无保留期或体积上限 |
+| 情绪无法识别反讽 | 词典 + 规则，无法识别客套、压抑、委婉否定 |
+| 标记写错静默丢失 | 整条压缩为一行时不匹配、零报错 |
+| 检索为关键词匹配 | 非语义检索，换用表述即无法命中 |
 
 ---
 
@@ -295,9 +243,6 @@ $env:DSH_BASE = $env:DSH_WEB_URL     # 端口每次启动都变，不要写死
 
 MIT。见 [`dsh-fatfishdream-memory/LICENSE`](dsh-fatfishdream-memory/LICENSE)。
 
-本项目早期衍生自 [chidaic/dsh-light-memory](https://github.com/chidaic/dsh-light-memory)（作者 chidaic，MIT）。
-当前版本在存储架构、写入通道、注入策略上均已完全重写，
-完整衍生关系与改动清单见 [`dsh-fatfishdream-memory/NOTICE`](dsh-fatfishdream-memory/NOTICE)。
-
-代码全部是中文注释，重点解释**为什么这样写**而不只是做了什么，
-每个不显然的决定都附日期与事故经过。
+本插件早期版本衍生自 [chidaic/dsh-light-memory](https://github.com/chidaic/dsh-light-memory)
+（作者 chidaic，MIT）。当前版本在存储架构、写入通道、注入策略上均已重写，
+衍生关系与差异清单见 [`dsh-fatfishdream-memory/NOTICE`](dsh-fatfishdream-memory/NOTICE)。

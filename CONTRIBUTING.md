@@ -52,7 +52,7 @@
 
 ### 提交前跑一遍
 
-**不需要 DSH 在运行**的最小验证（33 个脚本里的 28 个）：
+**不依赖 DSH 在运行**的最小验证（下面这 12 个，够挡住绝大多数回归）：
 
 ```powershell
 $node = "<你的 node 路径>"
@@ -72,7 +72,14 @@ foreach ($s in 'verify-functions','verify-map','verify-map-content','selfcheck-f
 改完必须**禁用→启用插件**。HMR 有两种坏法（只重装入口、或干脆不触发），
 别指望它，也别拿「日志里有 `[apply-start]`」当生效判据 —— 只能按行为验一次。
 
-完整回归清单（含需要 `DSH_BASE` 的 5 个脚本）见 `docs/TESTING.md`。
+完整回归清单（含硬依赖 DSH 的 3 个脚本）见 `docs/TESTING.md`。
+
+> **「不需要 DSH」的判定是实测的，不是看代码里有没有 `DSH_BASE` 猜的**（2026-11-15）：
+> 清空 `DSH_BASE` / `DSH_WEB_URL` 后把 33 个脚本全跑一遍，只有 3 个失败 ——
+> `selfcheck-e2e-memory`、`selfcheck-entry-by-id`、`selfcheck-paging`。
+> 另外 3 个虽然会读环境变量，但缺环境时**自动跳过 HTTP 段并以 0 退出**：
+> `selfcheck-archive`（36 项存储层照跑）、`selfcheck-breakdown`（18 项）、
+> `verify-injection-consistency`。所以**硬依赖只有那 3 个**。
 
 ### 代码风格
 

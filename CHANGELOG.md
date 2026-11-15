@@ -6,6 +6,38 @@
 
 ---
 
+## 未发布（仓库已就绪，待发 1.0.2）
+
+### 新增
+
+- **项目改名（`POST /api/dsh-memory/scope/rename`）**：把一个工作区（`scope`）在
+  `rules` / `logs` / `archive` 三张表里的数据整体改挂到新名字下。
+  传 `dryRun: true` 只报数不写库。**`scope` 不参与任何 FTS 索引**，所以是纯 `UPDATE`，
+  不需要同步索引；`profile` / `emotion` 不分项目，不受影响。
+  拒绝 `__global__` 与新旧同名。
+- 存储层配套导出 `renameScope(from, to)` / `countScope(table, scope)`。
+
+### 修复
+
+- **`selfcheck-paging` 的封顶断言依赖数据量**：原来断言「最多的项目 `total === 100`」，
+  等于要求库里必有项目超过 100 条，数据掉下来就红。改为先查真实条数再断言
+  `total === min(真实, 100)`，与用户数据解耦。
+- **`diag-julianday` 断链**：`docs/TESTING.md` 与 `db-store.mjs` 注释里都指向一个
+  已被清理掉的一次性脚本。改为指向 `selfcheck-ts-sort.mjs` 第 1 节里固化下来的断言。
+- **`.dsh-handoff/` 未被忽略**：交接文档里有本机绝对路径（仓库是公开的），
+  已加进 `.gitignore`。
+
+### 文档
+
+- 按符号名重算 `docs/项目地图.md` 全部 117 处行号（`db-store.mjs` 因新增两个函数
+  整体后移，`index.js` 因新增一条路由后移）。
+- 同步过期的规模数字：`index.js` 4302 行 / `client.js` 1632 / `db-store.mjs` 1126、
+  路由 18 条、注入 4820 字节 / 约 1069 token、回归 29 个脚本。
+
+> **`1.0.1` 不含以上任何内容。** 它发布于 2026-11-14T06:59Z，早于这批改动。
+
+---
+
 ## 1.0.1 — 2026-11-14
 
 ### 修复

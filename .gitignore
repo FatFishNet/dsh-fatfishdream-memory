@@ -48,8 +48,9 @@ desktop.ini
 _*/
 
 # ---- 但测试脚本要跟着仓库走 ----
-# _dbpreview/ 下是 31 个脚本（其中 27 个进全量回归）/ 约 520 项回归断言，属于可复用资产，
-# 不是临时产物 —— docs/项目地图.md 与 docs/TESTING.md 都在引用它们，
+# _dbpreview/ 下的脚本是回归资产（2026-11-15 实测：33 个文件，其中 29 个进全量回归，
+# 其余 4 个是 backup-db / chk-map-lines / selfcheck-e2e-memory / show-injection 这类运维脚本），
+# 属于可复用资产，不是临时产物 —— docs/项目地图.md 与 docs/TESTING.md 都在引用它们，
 # 不放行就是永久断链（见 AGENTS.md 硬约束 16）。
 # 2026-11-13 清理过一次（62 个一次性脚本，4.33 MB）；
 # 2026-11-14 又把 60 个一次性脚本移到 _archive/dbpreview-oneoff-20261114/，
@@ -69,6 +70,14 @@ _*/
 # 反而是「为什么这么设计」的最好说明。
 # （历史：这里曾被忽略，理由是「不属于开源内容」；文档引用起来之后这个理由不成立了。）
 # AGENTS.md
+
+# ---- 会话交接文档（本机私有，绝不公开）----
+# 2026-11-15 加：`.dsh-handoff/` 里写着本机绝对路径 ——
+# `D:\workspace\dsh-fatfishdream-memory`、`D:\dsh-fatfishdream-memory`、
+# `D:\DeepSeek Harness\resources\...` 都有（实测 13 行）。仓库是公开的，
+# 提交上去就是路径泄露。它也不以 `_` 开头，躲不过上面的 `_*/`。
+# 交接文档只给本机的下一个会话看，不承担开源文档的职责。
+.dsh-handoff/
 
 # ---- 打包产物（如果发布到 npm）----
 *.tgz

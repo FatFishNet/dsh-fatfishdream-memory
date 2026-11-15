@@ -34,23 +34,23 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | 脚本 | 断言数 | 查什么 |
 |---|---|---|
 | `verify-functions` | 112 | 地图里每个「行号 → 函数名」是否对上 |
-| `verify-map` | 111 处引用 | 地图 `L####` 是否越界/落空（**只判非空行，漂移不报**） |
+| `verify-map` | 117 处引用 | 地图 `L####` 是否越界/落空（**只判非空行，漂移不报**） |
 | `verify-map-content` | 38 | **地图准绳**：每处「`符号`（L####）」那一行必须含该符号；锚点由源码现算 |
-| `chk-map-lines` | 111 处 | 逐条打印每处 `L####` 的真实内容，人工核对「该行是不是说的那个函数」 |
-| `selfcheck-full` | 38 | 存储与注入总检（含 `schema v5`、`archive` 表与 FTS 一致性、**entries 已删 / confidence 已归一化 / search 不含 emotion**；流水为空时跳过中文检索段） |
+| `chk-map-lines` | 117 处 | 逐条打印每处 `L####` 的真实内容，人工核对「该行是不是说的那个函数」 |
+| `selfcheck-full` | 41 | 存储与注入总检（含 `schema v5`、`archive` 表与 FTS 一致性、**entries 已删 / confidence 已归一化 / search 不含 emotion**；流水为空时跳过中文检索段） |
 | `selfcheck-cap` | 13 | cap 分页逻辑（**自建 150 条种子**，不依赖真实流水） |
 | `selfcheck-isolation` | 18 | 检索按项目隔离（**自建 3 个项目种子**）；含 4 项「emotion 不在检索池」断言 |
-| `selfcheck-paging` | 15 | 流水页分页（**需 `DSH_BASE`**；流水 <130 条时整脚本跳过） |
+| `selfcheck-paging` | 15 | 流水页分页（**需 `DSH_BASE`**；流水 <130 条时整脚本跳过）。**2026-11-15 修**：原来断言「最多的项目 total === 100」，等于要求库里必有项目超过 100 条 —— 数据掉下来就红。现在先查真实条数再断言 `total === min(真实, 100)`，与数据量解耦 |
 | `selfcheck-marker-hardened` | 12（7 正则 + 5 源码级） | 标记正则行首锚点；**D 段断言解析失败必须记账**（`markerMatched`/`markerWritten`/`marker-unmatched`/`marker-dropped`/`empty-body`） |
 | `selfcheck-dom-strip` | 17 | 界面擦除正则（含「别吃掉说明文字」） |
 | `selfcheck-scrubber-loop` | 13 | **擦除器调度（第五代：静止窗口）**：连续变化只在安静后扫一次、一直不安静时有兜底上限、无变化不扫；另 7 条源码级断言守着「只认含标记的变化 / 扫完 takeRecords / 旧时间窗已移除」 |
-| `selfcheck-ts-sort` | 7（+真实库段） | 流水排序（锁定「三种按时间排的写法全错」；真实库段在空库时跳过） |
+| `selfcheck-ts-sort` | 9（+真实库段） | 流水排序（锁定「三种按时间排的写法全错」；真实库段在空库时跳过） |
 | `selfcheck-migrate-order` | 9 | 迁移时全局按时间排序 |
 | `selfcheck-migrate-db` | 11 | 迁移时用 VACUUM INTO 复制主库（含「文本复制会损坏库」反证） |
 | `selfcheck-copytree-empty` | 14 | 空目录迁移不产生空壳 |
 | `selfcheck-topic-clean` | 37 | topic 不被 `-->` 污染（含白名单） |
 | `selfcheck-injection-wording` | 25 | 注入文案无自相矛盾 |
-| `verify-injection-consistency` | 42 | 注入里「写禁读通」表述一致（含 `archive?scope=` 入口、**情绪不在检索里**两句必须存在） |
+| `verify-injection-consistency` | 48 | 注入里「写禁读通」表述一致（含 `archive?scope=` 入口、**情绪不在检索里**两句必须存在） |
 | `selfcheck-emotion-guard` | 19 | 情绪录入的形态闸门（不误吞提示词） |
 | `selfcheck-emotion-lexicon` | 27 | **情绪词典复合词闸门**：麻烦≠烦 / 积累≠累 / 无语义≠无语，且不误伤「好烦」「累死了」 |
 | `selfcheck-entry-by-id` | 13 | **按 id 取单条全文**（`/entry?id=&table=`）：正文一致、缺参数 400、未知表 400、不存在 404；旧 `/entry/<id>` 仍 401 |
@@ -60,16 +60,18 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | **`selfcheck-search-tier`** | **12** | **检索按表分层**（自建种子）：段序固定 profile→rules→logs、小 limit 时三表各露一条、组内仍按 bm25、`lastLogTs()` 按 id 取最新；另 3 条源码级断言守着「整理提醒不再只看 `lastConsolidate`」 |
 | `verify-no-self-trigger` | — | 注入文本不会被自己匹配 |
 | `verify-final` | — | 数据总览 |
-| `verify-doc-links` | 43 处 | 文档路径引用无断链（防开源后失效） |
+| `verify-doc-links` | 40 处 | 文档路径引用无断链（防开源后失效） |
 | `verify-v3-schema` | 55 | **三层记忆 v3 + 原文归档 v4 + v5 收尾**：现有库迁移 / 空库全建 / 存储层读写检索 / `archive` 写入与回溯（用 `_dbbackup` 副本，不碰真实库） |
 
-> **哪些不需要 DSH**：`verify-functions` / `verify-map` / `verify-map-content` /
-> `selfcheck-dom-strip` / `selfcheck-scrubber-loop` / `verify-doc-links` /
-> `verify-v3-schema` / `selfcheck-archive --no-http` / `test-marker-forms`
-> 是纯静态的，插件没跑也能验证。其余要连 HTTP 接口或读真实库。
+> **哪些不需要 DSH**（2026-11-15 实测：清空 `DSH_BASE` / `DSH_WEB_URL` 后全跑 33 个，
+> 只有 3 个失败）：**硬依赖只有 `selfcheck-e2e-memory` / `selfcheck-entry-by-id` /
+> `selfcheck-paging` 这 3 个**。另外 3 个会读环境变量但缺省时自动跳过 HTTP 段、以 0 退出：
+> `selfcheck-archive`（存储层 36 项照跑，加 `--no-http` 效果相同）、
+> `selfcheck-breakdown`（存储层 18 项）、`verify-injection-consistency`（纯源码文本断言）。
+> 其余全是纯静态或自建临时库，插件没跑也能验证。
 >
 > **改注入文案后**额外跑 `show-injection.mjs`：它打印分段字节账 + token 估算
-> （2026-11-14 加 archive 一行后约 3.9 KB / 约 870 token；改文案前后各跑一次对比）。
+> （2026-11-15 实测：4820 字节 / 约 1069 token；改文案前后各跑一次对比）。
 
 ## 0.1 语法检查
 
@@ -259,7 +261,7 @@ $j.db.byTable.Profile    # 拿不到就说明字段又丢了
 ($j.db.byTable.PSObject.Properties.Value | Measure-Object -Sum).Sum -eq $j.db.total   # 应 True
 ```
 
-**条目接口**（GUI 与模型共用，共 16 条路由）：
+**条目接口**（GUI 与模型共用，共 18 条路由）：
 
 ```
 GET  /api/dsh-memory/entries?table=rules&scope=__global__&limit=20
@@ -428,7 +430,10 @@ console.log('条数',ids.length,'范围',ids[0],'~',ids[ids.length-1],
 1. **两种 ts 格式**：`#1~#234` 无时区后缀（`.md` 迁移来的本地时间），
    `#235` 起带 `Z`（UTC）。字符串比较时 `02:12` > `00:35Z`。
 2. **`julianday` 救不了**：实测 SQLite 对无后缀字符串**一律按 UTC 解读**
-   （`julianday('...T00:00:00')` 与 `...00:00:00Z` 完全相等）。见 `diag-julianday.mjs`。
+   （`julianday('...T00:00:00')` 与 `...00:00:00Z` 完全相等）。
+   这条已固化成断言：`_dbpreview/selfcheck-ts-sort.mjs` 第 1 节
+   （用例名「julianday 也把 #2 排到后面」）。当初的一次性探查脚本
+   `diag-julianday.mjs` 已随清理移走，结论留在断言里。
 3. **老数据本身有 4 处时间逆序**，最大差 44.6 小时 ——
    `db-migrate.mjs` 当初按目录名逐项目导入，项目之间没有全局排序。
 

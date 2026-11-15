@@ -4119,6 +4119,52 @@ export function apply(ctx, rawConfig = {}) {
           }
         },
       },
+      {
+        kind: 'exact',
+        path: '/api/dsh-memory/scope/rename',
+        handler: async (req, res) => {
+          try {
+            if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            const body = await readBody(req)
+            const from = typeof body.from === 'string' ? body.from.trim() : ''
+            const to = typeof body.to === 'string' ? body.to.trim() : ''
+            if (from === '' || to === '') {
+              return json(res, 400, { ok: false, error: '需要 from 与 to' })
+            }
+            if (body.dryRun === true) {
+              // 干跑：只报数不写库。改名前先看清会动多少行 —— 这类迁移没有撤销按钮，
+              // 备份才是唯一的回退手段。
+              const tables = {}
+              let total = 0
+              for (const t of ['rules', 'logs', 'archive']) {
+                const n = dbStore.countScope(t, from)
+                tables[t] = n
+                total += n
+              }
+              return json(res, 200, { ok: true, dryRun: true, from, to, tables, total })
+            }
+            const result = dbStore.renameScope(from, to)
+            diag('scope-renamed', { from: result.from, to: result.to, tables: result.tables, total: result.total })
+            // 名字变了，projects 列表要跟着走，否则 state.json 里还留着旧键
+            try {
+              const st = await store.readState()
+              if (st.projects && st.projects[from] !== undefined && st.projects[to] === undefined) {
+                const entry = st.projects[from]
+                delete st.projects[from]
+                entry.name = to
+                entry.dir = store.projectDir ? store.projectDir(to, st) : entry.dir
+                st.projects[to] = entry
+                await store.writeState(st)
+              }
+            } catch (error) {
+              logger.warn?.(`[dsh-memory] scope 改名后同步 state.json 失败：${error?.message ?? error}`)
+            }
+            json(res, 200, { ok: true, ...result })
+          } catch (error) {
+            json(res, 400, { ok: false, error: String(error?.message ?? error) })
+          }
+        },
+      },
     ]
 
     const disposers = routes.map((route) => {

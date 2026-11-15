@@ -151,7 +151,7 @@ const tsSortKey = (col = 'ts') => `substr(${col}, 1, 16)`
  *      `julianday('2026-11-13T00:00:00')` 与
  *      `julianday('2026-11-13T00:00:00Z')` 完全相等。
  *      所以两种格式还是压在一条错位的时间轴上，等于没修。
- *      验证脚本：_dbpreview/diag-julianday.mjs
+ *      结论已固化为断言：_dbpreview/selfcheck-ts-sort.mjs 第 1 节（探查脚本已移走）。
  *
  *   3. `ORDER BY substr(ts,1,16)`（截到分钟再比）
  *      仍然错：`02:12` 的字符串依旧大于 `00:35`。
@@ -533,6 +533,49 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     const d = open()
     d.prepare(`UPDATE ${table} SET review=?, review_note=? WHERE id=?`).run(review, note, id)
     return { ok: true, id }
+  }
+
+  /**
+   * 把一个 scope 的所有数据改名成另一个（项目改名用）。
+   *
+   * 2026-11-15 加：用户把工作区 `干杂活` 改名成 `SoftTest`，
+   * 但库里 129 条数据仍挂在旧 scope 上 —— 查新名字一条都查不到。
+   *
+   * **为什么只 UPDATE 就够了（不需要同步 FTS）**：
+   * `scope` **不参与任何 FTS 索引**（看 FTS_COLUMNS：只有 text / topic / seg /
+   * summary / keywords），所以改 scope 不影响检索，也不存在索引失配。
+   * 这点已核对 db-schema.mjs 的 FTS_COLUMNS 与建表语句，不是推测。
+   *
+   * @param {string} from 旧 scope
+   * @param {string} to   新 scope
+   * @returns {{ok:boolean, from:string, to:string, tables:Record<string,number>, total:number}}
+   */
+  function renameScope(from, to) {
+    const a = String(from ?? '').trim()
+    const b = String(to ?? '').trim()
+    if (a === '' || b === '') throw new Error('需要 from 与 to')
+    if (a === b) throw new Error('新旧名字相同')
+    // 全局 scope 是保留值，改名会破坏「跨项目」语义
+    if (a === GLOBAL || b === GLOBAL) throw new Error(`${GLOBAL} 是保留值，不能改名`)
+
+    const d = open()
+    const tables = {}
+    let total = 0
+    // 只有这两张表有 scope 列（profile / emotion 是「用户这个人」，不分项目）
+    for (const t of ['rules', 'logs', 'archive']) {
+      const before = d.prepare(`SELECT COUNT(*) c FROM ${t} WHERE scope=?`).get(a).c
+      if (before > 0) d.prepare(`UPDATE ${t} SET scope=? WHERE scope=?`).run(b, a)
+      tables[t] = before
+      total += before
+    }
+    return { ok: true, from: a, to: b, tables, total }
+  }
+
+  /** 数一个 scope 在某表里有多少行（干跑用） */
+  function countScope(table, scope) {
+    const t = String(table ?? '')
+    if (!['rules', 'logs', 'archive'].includes(t)) throw new Error(`该表没有 scope 列：${t}`)
+    return open().prepare(`SELECT COUNT(*) c FROM ${t} WHERE scope=?`).get(String(scope ?? '')).c
   }
 
   /** 项目规则升级为全局（单向，不提供降级） */
@@ -1069,6 +1112,8 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     appendLog, appendFact, appendProjectNote, recordEmotion, createEntry, appendArchive,
     // 维护
     setReview, softDelete, setStatus, updateText, upgradeToGlobal, removeGlobalByRegex, setTopic,
+    // 改名（项目 scope 迁移，2026-11-15）
+    renameScope, countScope,
     // 检索
     search, listEntries, listScopes, getById, stats, scanPersona, listArchive, lastLogTs,
     // 体积分层（单独一条路由用，别塞进 stats）

@@ -82,21 +82,49 @@ const allScopes = (scopesResp.scopes ?? []).map((s) => (typeof s === 'string' ? 
 if (allScopes.length < 2) {
   console.log('  跳过：库里不足 2 个项目，无法对比')
 } else {
-  // 逐个查 scope 拿到真实条数
+  // 逐个查 scope 拿到真实条数。
+  //
+  // ⚠️ 2026-11-15 修：原来直接拿「cap 后的 total」当作真实条数，再断言它 === 100。
+  // 那等于断言「必有一个项目超过 100 条」—— 数据掉到 100 以下就红，
+  // 而代码完全没问题（本机实测：最多的项目 72 条）。
+  // 这又是「测试比被测代码还脆」的老毛病，只是这次脆在**数据量**上。
+  //
+  // 现在分两步：① 不带 cap 查真实条数；② 断言 cap 后的 total === min(真实条数, 100)。
+  // 这样无论库里 5 条还是 500 条都成立，而且 cap 语义仍然被严格验证。
   const withCounts = []
   for (const sc of allScopes) {
-    const r = await get(logUrl(0, '&scope=' + encodeURIComponent(sc)))
-    withCounts.push({ scope: sc, total: r.total, first: r.entries.length })
+    // 不带 cap：拿到该 scope 的全部条数
+    const raw = await get(
+      `/api/dsh-memory/entries?table=logs&status=active&limit=1&scope=${encodeURIComponent(sc)}`,
+    )
+    // 带 cap：验证封顶语义
+    const capped = await get(logUrl(0, '&scope=' + encodeURIComponent(sc)))
+    withCounts.push({
+      scope: sc,
+      rawTotal: raw.total,
+      total: capped.total,
+      first: capped.entries.length,
+      expect: Math.min(raw.total, MAX_VIEWABLE),
+    })
   }
-  withCounts.sort((a, b) => b.total - a.total)
+  withCounts.sort((a, b) => b.rawTotal - a.rawTotal)
   const big = withCounts[0]
   const small = withCounts[withCounts.length - 1]
-  console.log(`  数据最多的项目：${big.scope}（cap 后 total=${big.total}）`)
-  console.log(`  数据最少的项目：${small.scope}（cap 后 total=${small.total}）`)
+  console.log(`  数据最多的项目：${big.scope}（真实 ${big.rawTotal} 条，cap 后 total=${big.total}）`)
+  console.log(`  数据最少的项目：${small.scope}（真实 ${small.rawTotal} 条，cap 后 total=${small.total}）`)
 
-  // 最多的那个：total 应被封顶，首页应满页
-  check(`${big.scope} total 封顶 ${MAX_VIEWABLE}`, big.total === MAX_VIEWABLE, `${big.total}`)
-  check(`${big.scope} 首页 ${PAGE_SIZE} 条`, big.first === PAGE_SIZE, `${big.first}`)
+  // 最多的那个：cap 后的 total 必须 = min(真实条数, 100)
+  check(
+    `${big.scope} total = min(真实 ${big.rawTotal}, ${MAX_VIEWABLE})`,
+    big.total === big.expect,
+    `${big.total}`,
+  )
+  // 首页条数 = min(真实条数, 30)：数据不足 30 条时不该硬要满页
+  check(
+    `${big.scope} 首页 ${Math.min(big.rawTotal, PAGE_SIZE)} 条`,
+    big.first === Math.min(big.rawTotal, PAGE_SIZE),
+    `${big.first}`,
+  )
 
   // 回归：按 scope 过滤后，返回的条目必须全部属于该 scope
   const scopedCheck = await get(logUrl(0, '&scope=' + encodeURIComponent(big.scope)))

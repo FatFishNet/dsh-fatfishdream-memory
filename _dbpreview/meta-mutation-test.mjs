@@ -316,7 +316,10 @@ const MUTATIONS = [
     id: 'write-fail-threshold-removed',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '连续失败阈值被改成 1（退回每轮提醒，217 次太吵）',
-    from: 'const WRITE_FAIL_STREAK_LIMIT = 4',
+    // ⚠️ 2026-11-17：阈值从 4 改为 2（用户定），锚点同步。
+    // 改阈值时**必须同时改这里** —— 否则锚点失配 → 真跑变 SKIP，
+    // 而 SKIP 现在计入失败（2026-11-16 已修），表现为「突然红了」。
+    from: 'const WRITE_FAIL_STREAK_LIMIT = 2',
     to: 'const WRITE_FAIL_STREAK_LIMIT = 1',
   },
   {

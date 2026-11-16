@@ -173,7 +173,11 @@ console.log('\n=== F. 连续写入失败提醒（2026-11-16）===\n')
 
 // ① 计数器声明 + 阈值常量
 const hasStreakMap = INDEX_SRC.includes('const writeFailStreak = new Map()')
-const hasLimitConst = INDEX_SRC.includes('WRITE_FAIL_STREAK_LIMIT = 4')
+// ⚠️ 2026-11-17：阈值从 4 改为 **2**（用户定）。
+// 这里是**故意写死具体数值**的 —— 改阈值必须显式改这一行，
+// 否则「某天有人把 4 改成 100」，这道防线会在无人察觉时失效。
+// 不要改成「只要常量存在就算过」那种宽松判据。
+const hasLimitConst = INDEX_SRC.includes('WRITE_FAIL_STREAK_LIMIT = 2')
 
 // ② 写入结果必须更新计数 —— v2 改成「按轮结算」，判据移到 G 段断言。
 //    （v1 的 streakSuccessReset / streakFailIncrement 两条已随逻辑改写删除，
@@ -186,7 +190,7 @@ const reminderResetsOnDelivered = /if \(delivered\) \{[\s\S]*?writeFailStreak\.s
 
 for (const [label, ok, detail] of [
   ['有 writeFailStreak 计数器', hasStreakMap, '缺它 → 无法跨轮累计'],
-  ['阈值常量 = 4', hasLimitConst, '改阈值必须显式，不能埋魔法数字'],
+  ['阈值常量 = 2（2026-11-17 由 4 改）', hasLimitConst, '改阈值必须显式，不能埋魔法数字'],
   ['提醒走 safePushMessage', reminderUsesSafePush, '不走它 → turn-stopping 异常会中断会话'],
   ['提醒有阈值判断', reminderChecksLimit, '缺它 → 退回每轮提醒（217 次太吵）'],
   ['投递成功后清零', reminderResetsOnDelivered, '不清零 → 下轮仍触发，重复提醒'],

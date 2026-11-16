@@ -80,7 +80,7 @@ foreach ($s in 'verify-functions','verify-map','verify-map-content','selfcheck-f
 > 另外 4 个虽然会读环境变量，但缺环境时**自动跳过 HTTP 段并以 0 退出**：
 > `selfcheck-archive`（存储层 36 项照跑）、`selfcheck-breakdown`（存储层 18 项）、
 > `verify-injection-consistency`、`selfcheck-log-alive`。所以**硬依赖只有那 3 个**。
-> 脚本总数不写死 —— 唯一真相是 `run-all.mjs` 的 `SCRIPTS` 数组（当前 37 个）。
+> 脚本总数不写死 —— 唯一真相是 `run-all.mjs` 的 `SCRIPTS` 数组（当前 41 个）。
 
 ### 代码风格
 

@@ -103,8 +103,23 @@ check('时间范围（未来）排除该条', !e3.json?.entries?.some((e) => e.i
 const e4 = await get(`/api/dsh-memory/entries?table=logs&scope=${encodeURIComponent(SCOPE)}&limit=1`)
 check('分页 limit=1 生效', e4.json?.entries?.length === 1, `len=${e4.json?.entries?.length}`)
 
-const e5 = await get(`/api/dsh-memory/entries?table=logs&status=deleted&limit=50`)
-check('软删条目不在 active 列表', !e4.json?.entries?.some((e) => e.status !== 'active'))
+// ⚠️ 2026-11-17 修（审计代理 P0 #13）：
+//
+//   旧代码请求了 `status=deleted` 存进 `e5`，但断言检查的却是 **`e4`**
+//   （`limit=1`，只有 1 条）—— 等于「软删不混进 active」这条防线退化成看 1 行，
+//   而 `e5` 成了彻头彻尾的死变量。删掉 `limit=1` 那条路径也发现不了。
+//
+//   现在断言真的挂在 `e5` 上：它请求的是「deleted 列表」，
+//   要求**每一行的 status 都必须是 deleted**（而不是混进 active 的）。
+const e5 = await get(
+  `/api/dsh-memory/entries?table=logs&scope=${encodeURIComponent(SCOPE)}&status=deleted&limit=50`,
+)
+const deletedRows = e5.json?.entries ?? []
+check(
+  'deleted 列表里每一行的 status 都是 deleted',
+  Array.isArray(deletedRows) && deletedRows.every((e) => e.status === 'deleted'),
+  `len=${deletedRows.length}`,
+)
 
 // 5) 中文 2 字词（自适应：从刚写入的正文里取）
 // 不能写死「沙箱」这类历史词 —— 流水清空后就不存在了（2026-11-14 踩过）。

@@ -69,7 +69,7 @@ schema 版本用 `PRAGMA user_version` 管理。
    - `POLICY_TEMPLATE`（代码里的模板）= 我们的，**只用于新装用户的初始文件**；
    - `policy.md`（运行时文件）= **用户的**，与 `memory.db` 同级，归用户所有。
 
-   代码事实（`index.js` L1836）：`if (!(await exists(paths.policy)))` ——
+   代码事实（`index.js` L1847）：`if (!(await exists(paths.policy)))` ——
    只在**文件不存在**时写入模板，之后一个字都不碰。
 
    **所以**：

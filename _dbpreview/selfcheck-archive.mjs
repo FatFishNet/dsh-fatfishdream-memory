@@ -225,9 +225,15 @@ if (skipHttp) {
   check('limit=1 生效', lim.status === 200 && (lim.body?.rows?.length ?? 0) <= 1,
     `len=${lim.body?.rows?.length}`)
 
+  // ⚠️ 2026-11-17 修（审计代理 P0 #12）：
+  //   旧写法只断 `huge.status === 200` —— 把「钳到 500」那段代码整段删掉
+  //   也照样绿。名字承诺的是数量约束，判据却只看状态码。
+  //   现在同时断数量：`limit=99999` 必须被钳到 500 以内。
   const huge = await get('/api/dsh-memory/archive?limit=99999')
+  const hugeLen = huge.body?.rows?.length
   check('limit 超上限被钳到 500（不返回 500 条以外的东西）',
-    huge.status === 200, `status=${huge.status}`)
+    huge.status === 200 && typeof hugeLen === 'number' && hugeLen <= 500,
+    `status=${huge.status} len=${hugeLen}`)
 
   const q = await get('/api/dsh-memory/archive?q=' + encodeURIComponent('迁移'))
   check('q 走 FTS 不报错', q.status === 200 && q.body?.ok === true, `status=${q.status}`)

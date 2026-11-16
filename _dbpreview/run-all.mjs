@@ -63,6 +63,10 @@ export const SCRIPTS = [
   'verify-functions',
   'verify-map',
   'verify-map-content',
+  // 2026-11-17 新增：补齐另外四种行号形态（表格列 / 行首 / 正文内联 / 行号在前）。
+  // 为什么必须加：上面两个脚本只覆盖 108 处里的 26 处，其余 82 处
+  // 「该行非空就算过」—— 实测抽查 45 处全部错位，而它们自报 0 落空。
+  'verify-map-forms',
   'selfcheck-full',
   'selfcheck-cap',
   'selfcheck-isolation',

@@ -237,9 +237,26 @@ const incrementsWhenNotWritten = /const wroteThisTurn[\s\S]{0,400}?writeFailStre
 // 不是守某一句具体文案 —— 所以这里认两种形态都算数：
 //   走 HTTP：文案里出现 /api/dsh-memory/log
 //   退化标记：文案里出现 mem-log 标记的写法
-// 若两条都消失，说明提醒退化成了「你忘了写」这种没有下一步的话，那时才该红。
+//
+// ⚠️⚠️ 2026-11-17 修（审计代理 P0 #3，很关键）：
+//
+//   旧写法在**整个 index.js** 上测 `/\/api\/dsh-memory\/log/` —— 而 index.js
+//   里那个 HTTP 路由 `path: '/api/dsh-memory/log',` 本身就包含该字符串！
+//   于是这条断言**永远为真**：提醒文案哪怕退化成「你忘了写」，照样绿。
+//
+//   这与文件 L247 记的教训是同一个病（「只查有没有、不查在哪用」），
+//   只是这次连文件都没限定。修法：**只在提醒文案那一段里找**。
+//
+//   怎么定位那一段：`safePushMessage(` 调用里那句以「[dsh-memory] 已连续」开头的模板串。
+const REMIND_ANCHOR = '已连续'
+const remindIdx = INDEX_SRC.indexOf(REMIND_ANCHOR)
+const remindSeg =
+  remindIdx < 0 ? '' : INDEX_SRC.slice(remindIdx, remindIdx + 900)
+// 自检：定位不到时判红而不是判绿 —— 否则「找不到文案」会被当成「文案没问题」。
+const remindLocated = remindIdx >= 0
 const reminderActionable =
-  /\/api\/dsh-memory\/log/.test(INDEX_SRC) || /请在回复正文里补一条 mem-log 标记/.test(INDEX_SRC)
+  remindLocated &&
+  (/\/api\/dsh-memory\/log/.test(remindSeg) || /mem-log/.test(remindSeg))
 // ⑥ 清零必须在 wroteThisTurn 为真时执行 ——
 //    ⚠️ 这条是变异测试抓出来的漏：`write-fail-reset-removed` 把
 //    `if (wroteThisTurn)` 改成 `if (false)`，而上面 ⑤ 条只断言
@@ -255,6 +272,9 @@ for (const [label, ok, detail] of [
   ['assistant/message 不直接改 streak', noCountInAssistantMsg.ok, noCountInAssistantMsg.detail],
   ['turn-stopping 按轮结算', settlesPerTurn, '缺它 → 粒度错了'],
   ['没写过也 +1（v2 核心）', incrementsWhenNotWritten, '缺它 → 回到 v1，忘写仍然零检测'],
+  // ⚠️ 这一条必须排在「提醒文案可执行」前面：定位不到文案时，
+  //    「可执行」若仍判真就是假的（找不到 ⇒ 什么都测不到）。
+  ['能定位到提醒文案（否则下一条无意义）', remindLocated, 'index.js 里找不到「已连续」锚点，文案可能被改写'],
   ['提醒文案可执行', reminderActionable, '只说「没写」不够，要告诉怎么补'],
   ['写过时真的会清零（不是 if(false)）', resetsWhenWrote, '清零被跳过 → 提醒一次后永远卡在阈值'],
 ]) {

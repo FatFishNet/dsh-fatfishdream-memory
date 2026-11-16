@@ -128,21 +128,39 @@ console.log('\n=== 5. 第六代：完整标记同步快擦（切会话不闪）=
 
   // ⑦ 行为模型：模拟切会话（一次性挂载 34 条完整标记）
   //    期望：pass（400ms 那条）跑 0 次，因为全部由同步快擦处理掉了。
+  //
+  // ⚠️ 2026-11-17 修（审计代理 P0 #8 / #9 / #10）：
+  //
+  //   这里原来有三条**完全没有被测代码参与**的断言：
+  //     `let synced = 0; for (...) synced++` 然后断言 `synced === 34`
+  //       —— 自增与被测代码无关，恒真；
+  //     `check('…不再需要 400ms', s.passes === 0)` —— `s = makeScheduler()`
+  //       从创建到断言**从未被调用过**，`passes` 恒为 0；
+  //     `let flag=false; flag=true; flag=false; check(... flag === false)`
+  //       —— 三行字面量赋值，结论由赋值决定。
+  //
+  //   三条都声称在验「切会话时走同步快擦」，实际**一条代码路径都没执行**。
+  //   按 AGENTS.md 的规矩：**没有断言可写时就不要产生断言**，
+  //   只 console.log 说明「本段不适用」——把一个恒真断言改成另一个恒真断言，
+  //   同样是假覆盖。
   const s = makeScheduler()
-  let synced = 0
   const mountedMessages = 34
-  for (let i = 0; i < mountedMessages; i++) synced++ // 每次 addedNode 同步擦一拍
-  check('切会话 34 条完整标记全部走同步路径', synced === mountedMessages)
-  check('同步擦完后不再需要 400ms 那条路径', s.passes === 0, `实际 ${s.passes} 次`)
+  console.log(`\n  （本段不适用：纯模型里无法驱动 client.js 的 fastStrip，`)
+  console.log(`    故不产生「切会话 ${mountedMessages} 条走同步路径」这类断言 ——`)
+  console.log(`    能断言它的唯一办法是真跑浏览器 DOM，那不在本脚本范围。）`)
+  console.log(`    makeScheduler() 已创建（passes=${s.passes}），仅作展示。`)
 }
 
 console.log('\n=== 6. 为什么不能用布尔标志（仍然成立）===\n')
 {
   // MutationObserver 回调是异步的：在 flush 里置位再复位，回调时读不到。
-  let flag = false
-  flag = true
-  flag = false
-  check('布尔标志在异步回调时已复位（故不可用）', flag === false)
+  //
+  // ⚠️ 2026-11-17：原来是 `let flag=false; flag=true; flag=false;` 再断言
+  //   `flag === false` —— 那是纯演示，结论由三行赋值决定，没有任何被测代码。
+  //   改成只说明，不产生断言。
+  console.log('  说明：MutationObserver 回调是异步的 ——')
+  console.log('  在 flush 里置位再复位，回调执行时读到的一定是复位后的值。')
+  console.log('  所以「用布尔标志跨异步边界传递状态」不可用。本段为原理说明，不产生断言。')
 }
 
 console.log(`\n${fail === 0 ? '全部通过' : '有失败'}：${pass} 通过 / ${fail} 失败`)

@@ -163,14 +163,38 @@ if (fs.existsSync(ptrPath)) {
   // ① 真正验证「改常量不移动已有安装」：
   //    不管 PREFERRED_DRIVE 是什么、各盘剩余空间怎么变，
   //    只要该目录里已有 memory.db，解析结果就必须仍然是它。
+  //
+  // ⚠️ 2026-11-17 修（审计代理 P0 #7）：
+  //   旧写法是 `hasDbInPointer && effectiveRoot === (liveRoot ?? effectiveRoot)`。
+  //   而 `effectiveRoot` 就是 `liveRoot ?? ptr.root` 算出来的 —— **同一个表达式
+  //   和自己比较，永远为真**。于是这条断言实际只等于 `hasDbInPointer`，
+  //   名字里说的「未被常量或盘符探测改变」一件都没验。
+  //   （文件 L120-145 的注释正是把它从 `check(..., true)` 改过来的，
+  //    但只改掉了一半。）
+  //
+  //   现在按名字拆成两条，各自可失败：
+  //     a) 线上根目录必须指向一个**确实有 memory.db** 的目录（进程实际在用的就是它）
+  //     b) 指针值与线上值的关系必须**说得清**：要么一致，要么明确是
+  //        「profile 里钉了更高优先级的 root」——后者只打印，不判红（合法状态）。
   const hasDbInPointer = fs.existsSync(path.join(effectiveRoot, 'memory.db'))
   check(
-    '已存在数据库的安装，根目录未被常量或盘符探测改变',
-    hasDbInPointer && effectiveRoot === (liveRoot ?? effectiveRoot),
-    hasDbInPointer
-      ? `线上根目录=${effectiveRoot}`
-      : `${effectiveRoot} 下没有 memory.db，无法据此判断（可能还没初始化）`,
+    '线上根目录下确实有 memory.db（进程在用的就是这个目录）',
+    hasDbInPointer,
+    hasDbInPointer ? `线上根目录=${effectiveRoot}` : `${effectiveRoot} 下没有 memory.db，可能还没初始化`,
   )
+  // b) ⚠️ 不要在分支里写 `? true :` —— 那正是本项目反复警告的「恒真断言」
+  //    换了件衣服（`x === undefined ? true : ...` 在取不到时永远通过，
+  //    而「取不到」恰恰是最需要警惕的情况）。
+  //    正确做法：**没有断言可写时就不产生断言**，只打印说明「本段不适用」。
+  if (liveRoot === undefined) {
+    console.log('  （本段不适用：未取到 liveRoot，跳过「线上根目录是绝对路径」检查）')
+  } else {
+    check(
+      '线上根目录是绝对路径',
+      typeof liveRoot === 'string' && /^([A-Za-z]:[\\/]|\/)/.test(liveRoot),
+      `liveRoot=${liveRoot}`,
+    )
+  }
 
   // ② 验证「指针是否被真正使用」：只有当解析结果是 'pointer' 时才算数。
   //    本机是 'configured'（profile 里钉了 root），指针那一级根本走不到 ——

@@ -112,9 +112,22 @@ const searchFnEnd = storeSrcFile.indexOf('function listEntries', searchFnAt)
 const searchBody = searchFnAt > -1 && searchFnEnd > searchFnAt
   ? storeSrcFile.slice(searchFnAt, searchFnEnd)
   : ''
-check('search() 里没有 emotion 查询', !/push\('emotion'/.test(searchBody),
-  searchBody ? '' : '未定位到 search() 函数体')
-check('search() 也不 query emotion_fts', !/FROM emotion_fts/.test(searchBody))
+// ⚠️ 2026-11-17 修（审计代理 P0 #11）：
+//
+//   旧写法在 `searchBody === ''`（切片失败）时，`!/X/.test('')` 恒为 true ——
+//   两条**否定**断言立刻变成恒真，而且第二条连 detail 都没有。
+//   「定位不到函数体」恰恰是最该报警的情况，却变成了「检查通过」。
+//
+//   修法：先单独断「能定位到 search() 函数体」，再断内容。
+//   定位失败时第一条就红，后面两条自然不会产生误导性的绿。
+const searchLocated = searchBody !== ''
+if (searchLocated) {
+  check('search() 里没有 emotion 查询', !/push\('emotion'/.test(searchBody))
+  check('search() 也不 query emotion_fts', !/FROM emotion_fts/.test(searchBody))
+} else {
+  // 没有断言可写就不产生断言 —— 但**必须让整体判红**，否则等于静默通过。
+  check('能定位到 search() 函数体（否则下面两条无法验证）', false, 'db-store.mjs 结构变了？')
+}
 // 反过来：别把 emotion_fts 整个删掉 —— GUI 情绪页签的搜索框还要用
 check('emotion_fts 仍存在（GUI 页签用）', /emotion_fts/.test(storeSrcFile) &&
   /emotion_fts/.test(storeSrcSchema))
@@ -204,7 +217,27 @@ check('无 facts.md', !rootFiles.includes('facts.md'))
 check('有 memory.db', rootFiles.includes('memory.db'))
 check('有 policy.md', rootFiles.includes('policy.md'))
 check('有 state.json', rootFiles.includes('state.json'))
-check('无项目模板目录', !rootFiles.some((f) => f !== 'logs' && fs.statSync(`${MEM_ROOT}/${f}`).isDirectory()))
+// 这条断言守的是「记忆根目录里不该出现**项目模板目录**」——
+// 早期实现会为每个项目在根下建一个同名目录（`<项目名>/`），那是要防的形态。
+//
+// 2026-11-17 改成**白名单**（用户当时的 `assets/` 被旧判据误报成违规，
+// 旧写法是「除 logs 外任何目录都算失败」，比本意苛刻）。
+// 白名单里**只放会长期存在的目录**：
+//   - `logs/`  插件自己的诊断日志
+//
+// ⚠️ `assets/` 曾被登记过，2026-11-17 02:40 用户把该目录拿走后退掉了。
+//   **不要为了「让当前这棵目录树变绿」去加白名单** —— 那次误报的根因是
+//   用户放了真实资产，登记是合理的；但目录取走后继续留着，就成了一条
+//   永远不会命中的例外，反而让「这里允许放什么」变得含混。
+//   新增目录时先问：它是长期目录，还是一次性的东西？
+const ALLOWED_ROOT_DIRS = ['logs']
+const rootDirs = rootFiles.filter((f) => fs.statSync(`${MEM_ROOT}/${f}`).isDirectory())
+const unexpectedDirs = rootDirs.filter((d) => !ALLOWED_ROOT_DIRS.includes(d))
+check(
+  '无项目模板目录（仅 logs 例外）',
+  unexpectedDirs.length === 0,
+  unexpectedDirs.length ? `多出: ${unexpectedDirs.join(', ')}` : `已登记: ${rootDirs.join(', ')}`,
+)
 
 d.close()
 

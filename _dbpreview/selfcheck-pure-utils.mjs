@@ -164,19 +164,28 @@ console.log('\n=== 5. 日期工具 ===\n')
 // ============================================================
 console.log('\n=== 6. expandRoot：路径解析 ===\n')
 {
+  // ⚠️ 2026-11-17：expandRoot 新增了 IS_WINDOWS 分支与 posixFallbackRoot()，
+  //   假环境里必须一并提供，否则 new Function 抛 ReferenceError
+  //   （表现是「整个脚本崩了」，不是「断言失败」—— 更容易误判成环境问题）。
+  //   这里显式模拟 **POSIX**（/home/u），与下面「空值落点」的断言一致。
   const expandRoot = extract('expandRoot', {
+    IS_WINDOWS: false,
     resolve: (...a) => a.join('/').replace(/\/+/g, '/'),
     homedir: () => '/home/u',
     DEFAULT_CONFIG: { root: '' },
     PREFERRED_DRIVE: 'D',
     MEMORY_DIR_NAME: 'mem',
     join: (...a) => a.join('/').replace(/\/+/g, '/'),
+    posixFallbackRoot: () => '/home/u/.dsh/mem',
   })
 
   check('`~` 展开成 home', expandRoot('~') === '/home/u')
   check('`~/x` 展开成 home/x', expandRoot('~/x') === '/home/u/x')
   check('空值走默认（含 MEMORY_DIR_NAME）', expandRoot('').includes('mem'))
   check('普通路径原样 resolve', expandRoot('/a/b') === '/a/b')
+  // 2026-11-17 新增：POSIX 下空值不得产出 Windows 盘符路径（会建进工作区）
+  check('POSIX 空值落 ~/.dsh（不是 D:\\）', expandRoot('') === '/home/u/.dsh/mem', `实际 = ${expandRoot('')}`)
+  check('POSIX 空值不含反斜杠盘符', !/^[A-Za-z]:[\\/]/.test(expandRoot('')), `实际 = ${expandRoot('')}`)
 }
 
 // ============================================================

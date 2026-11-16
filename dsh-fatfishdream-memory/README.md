@@ -6,7 +6,7 @@
 
 只依赖 DSH 客户端内置的 Node.js 原生 SQLite 模块，**零第三方运行时依赖**。
 
-> 版本 `1.2.0` · MIT 许可 · [npm](https://www.npmjs.com/package/dsh-fatfishdream-memory)
+> 版本 `1.3.0` · MIT 许可 · [npm](https://www.npmjs.com/package/dsh-fatfishdream-memory)
 
 ---
 

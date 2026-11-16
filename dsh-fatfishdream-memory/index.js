@@ -68,7 +68,7 @@ const PACKAGE_VERSION = (() => {
     //   2026-11-16 实测：克隆到 `D:/我的 项目/` 时版本号静默变空。
     const here = dirname(fileURLToPath(import.meta.url))
     const raw = readFileSync(join(here, 'package.json'), 'utf8')
-    // ⚠️ 这里刻意**不调用 parseJson()**：它定义在文件后半段（L431 附近），
+    // ⚠️ 这里刻意**不调用 parseJson()**：它定义在后面（L455），
     // 虽然函数声明会提升、实际能跑，但让模块顶部的常量依赖后面才出现的工具
     // 太脆弱了 —— 将来有人把它改成 const 箭头函数就会在加载期炸掉。
     // 只用 Node 内置的 JSON.parse 就够，这份文件是包作者自己写的，不会有 BOM。
@@ -200,6 +200,22 @@ const DEFAULT_CONFIG = {
 const MEMORY_DIR_NAME = 'dsh-fatfishdream-memory'
 const PREFERRED_DRIVE = 'D'
 
+/**
+ * 是否 Windows。**必须显式判断，不能靠「有没有 SystemDrive」推断。**
+ *
+ * 2026-11-17 加：此前所有选址逻辑都假设 Windows 盘符体系。
+ * 在 macOS / Linux 上不会崩，但会**静默走到错误的位置**：
+ *
+ *   `expandRoot('')` → `join('D:\\', NAME)` = `'D:\\dsh-fatfishdream-memory'`
+ *   → 在 POSIX 下这是**相对路径** → `resolve()` 补成
+ *     `<cwd>/D:\dsh-fatfishdream-memory`
+ *
+ * 于是记忆会**建进当前工作区**，而工作区是「LLM 可以随意操作」的地方
+ * —— 恰好违反硬约束 11b（记忆目录必须留在工作区之外，那是安全边界）。
+ * 比「找不到记忆」严重得多：用户会以为记忆丢了，实际是写到了仓库里。
+ */
+const IS_WINDOWS = process.platform === 'win32'
+
 // ---------------------------------------------------------------- 路径工具
 
 function systemDriveLetter() {
@@ -209,20 +225,52 @@ function systemDriveLetter() {
 }
 
 function isSystemDriveTarget(target) {
+  // 非 Windows 没有「盘符」概念：`/` 是唯一根，全部算系统盘。
+  // 不能让它恒返回 false —— 那样「记忆在系统盘」的警告永远不会触发。
+  if (!IS_WINDOWS) return true
   const letter = String(target ?? '').trim().slice(0, 1).toUpperCase()
   return /^[A-Z]$/.test(letter) && letter === systemDriveLetter()
 }
 
+/**
+ * 非 Windows 上的默认落点。
+ *
+ * 选 `~/.dsh/<名称>` 而不是 `~/Documents/<名称>`，理由：
+ *   ① 与指针文件 `~/.dsh/memory-root.json` 同处，用户找起来是一处不是两处；
+ *   ② macOS 的 `~/Documents` 受 TCC 保护，首次访问会弹「想访问你的文稿」对话框，
+ *      而且大概率被 iCloud Drive 同步 —— 记忆库是 SQLite（WAL 模式），
+ *      被同步服务在写入中途抓取有损坏风险（硬约束 5 的同源问题）；
+ *   ③ `~/.dsh` 是 DSH 自己的目录，语义上就是「这个工具的私有数据」。
+ *
+ * 本机已证实 `~/.dsh` 存在（`$env:DSH_HOME = C:\Users\ZC\.dsh`）。
+ */
+function posixFallbackRoot() {
+  const dshHome = String(process.env.DSH_HOME ?? '').trim()
+  if (dshHome !== '') return join(dshHome, MEMORY_DIR_NAME)
+  return join(homedir(), '.dsh', MEMORY_DIR_NAME)
+}
+
 function expandRoot(raw) {
   const value = String(raw ?? '').trim()
-  if (value === '') return resolve(DEFAULT_CONFIG.root || join(`${PREFERRED_DRIVE}:\\`, MEMORY_DIR_NAME))
+  if (value === '') {
+    // ⚠️ 这里必须分平台，否则 POSIX 下 `D:\...` 会被当相对路径建进工作区。
+    if (!IS_WINDOWS) return posixFallbackRoot()
+    return resolve(DEFAULT_CONFIG.root || join(`${PREFERRED_DRIVE}:\\`, MEMORY_DIR_NAME))
+  }
   if (value === '~') return homedir()
   if (value.startsWith('~/') || value.startsWith('~\\')) return resolve(homedir(), value.slice(2))
   return resolve(value)
 }
 
-/** 枚举非系统盘，D 优先，其余按剩余空间降序。 */
+/**
+ * 枚举非系统盘，D 优先，其余按剩余空间降序。
+ *
+ * 非 Windows 直接返回 `[]`：没有盘符这东西。
+ * 2026-11-17 前这里会循环试 `D:\`~`Z:\` 共 23 次，每次 statSync 都失败 ——
+ * 不崩，但白做 23 次同步 IO，且日志里看着像「磁盘全都不可用」。
+ */
 function listCandidateDrives() {
+  if (!IS_WINDOWS) return []
   const systemLetter = systemDriveLetter()
   const found = []
   for (let code = 68; code <= 90; code += 1) {
@@ -313,6 +361,9 @@ function writePointer(root) {
  * 还写着「Documents\dsh-memory」，界面上显示的是旧名字。
  */
 function systemFallbackRoot() {
+  // ⚠️ 2026-11-17：非 Windows 走独立分支，不再复用「~/Documents」。
+  //   原因见 posixFallbackRoot() 的注释（TCC 弹窗 + iCloud 同步 SQLite 的风险）。
+  if (!IS_WINDOWS) return posixFallbackRoot()
   const home = homedir()
   const documents = join(home, 'Documents')
   try {
@@ -348,7 +399,42 @@ function systemFallbackRoot() {
  */
 function resolveRoot(rawRoot, log) {
   const explicit = String(rawRoot ?? '').trim()
-  if (explicit !== '' && explicit.toLowerCase() !== 'auto') {
+
+  // ⚠️ 2026-11-17 防护：配置里写了 Windows 盘符路径，但当前不是 Windows。
+  //
+  //   典型现场：用户把 `cordis.patch.yml` 连同 `root: 'D:\dsh-fatfishdream-memory'`
+  //   一起带到了 Mac 上（或跟着 profile 同步过去）。此时：
+  //     · `resolve('D:\dsh-...')` 在 POSIX 下把它当**相对路径**
+  //     · 结果 = `<当前工作区>/D:\dsh-...` —— 一个名字里带反斜杠和冒号的怪目录
+  //     · 记忆**建进工作区**，违反硬约束 11b（安全边界）
+  //
+  //   这里不静默接受：打警告并**丢弃这个值**，走自动选址。
+  //   宁可落到 ~/.dsh 让用户能找回来，也不要建进工作区。
+  //
+  // ⚠️ 2026-11-17 修：原来的判据是「像不像 Windows 盘符」`/^[A-Za-z]:[\\/]/`，
+  //   它要求冒号后必须有分隔符，于是这四种形态**全部漏过**（已实测）：
+  //     `D:`            → POSIX resolve 成 `<cwd>/D:`
+  //     `D:mem`         → `<cwd>/D:mem`
+  //     `\\server\share`（UNC）    → `<cwd>/\\server\share`
+  //     `\\?\C:\mem`（长路径前缀） → `<cwd>/\\?\C:\mem`
+  //   全部把记忆建进工作区，正是这条守卫要防的事。
+  //
+  //   现在改成**正向判据**：非 Windows 上，这个值必须是「本平台可用的绝对路径」
+  //   或 `~` 开头，否则一律丢弃。这比「枚举几种像 Windows 的写法」可靠得多 ——
+  //   黑名单永远会漏，白名单不会。
+  const isPosixAcceptable =
+    process.platform !== 'win32'
+      ? isAbsolute(explicit) || explicit.startsWith('~')
+      : true // Windows 上另外两个分支会处理，这里不干预
+  const rejectOnPosix = explicit !== '' && explicit.toLowerCase() !== 'auto' && !IS_WINDOWS && !isPosixAcceptable
+  if (rejectOnPosix) {
+    log?.(
+      `[dsh-memory] 配置里的记忆根目录不是当前系统可用的绝对路径（${explicit}），` +
+        `当前系统不是 Windows。已忽略它并改用自动选址 —— ` +
+        `否则会把这个路径当相对路径，把记忆建进当前工作区里。` +
+        `请在配置里改成绝对路径（如 /Users/<你>/...）、'~/...' 或 'auto'。`,
+    )
+  } else if (explicit !== '' && explicit.toLowerCase() !== 'auto') {
     const resolved = expandRoot(explicit)
     if (isSystemDriveTarget(resolved)) {
       log?.(
@@ -381,7 +467,11 @@ function resolveRoot(rawRoot, log) {
     }
   }
   // 系统盘上的两个历史位置都要认，否则老用户的记忆会凭空消失。
-  for (const candidate of [join(`${systemDriveLetter()}:\\`, MEMORY_DIR_NAME), systemFallbackRoot()]) {
+  // ⚠️ 非 Windows 没有 `<C>:\` 这种路径，只查 fallback 那一个。
+  const systemCandidates = IS_WINDOWS
+    ? [join(`${systemDriveLetter()}:\\`, MEMORY_DIR_NAME), systemFallbackRoot()]
+    : [systemFallbackRoot()]
+  for (const candidate of systemCandidates) {
     if (syncPathExists(join(candidate, 'state.json')) || syncPathExists(join(candidate, 'memory.db'))) {
       writePointer(candidate)
       return { root: candidate, reason: 'discovered-on-system' }
@@ -686,6 +776,31 @@ async function exists(path) {
   try {
     await stat(path)
     return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 这个路径是否**存在且是目录**。
+ *
+ * ⚠️ 2026-11-17 新增。为什么不能直接用 `exists()`：
+ * `exists()` 走的是 `stat()`，**文件和目录都返回 true**。
+ *
+ * 而 `/log` 的 cwd 校验需要的是「这是个真实的工作区目录」这个判断。
+ * 2026-11-17 实测复现：我在 `C:\Users\ZC\.dsh\profiles\desktop` 下执行命令
+ * （pnpm 操作留下的 cwd），POST /log 时不传 scope、只传 cwd →
+ * `exists(cwd)` 为真 → `resolveProjectKey` 取 basename = `desktop`
+ * → **凭空建出一个只有 2 条流水的假工作区**。
+ *
+ * 更极端的形态：传一个**文件**路径（如 `.../AGENTS.md`）也能通过校验，
+ * 于是 `AGENTS.md` 成为一个真实 scope，污染 /state 的 byScope、
+ * GUI 的工作区下拉框、以及注入里的「记忆索引」。
+ */
+async function isDirectoryPath(path) {
+  try {
+    const info = await stat(path)
+    return info.isDirectory()
   } catch {
     return false
   }
@@ -1839,11 +1954,25 @@ export function createStore(config) {
       `这是会话的「心跳」，用来确认本轮执行完整。放在最后一行，不用解释、不用变形。`
     let updated
     if (hasLine) {
-      updated = current.replace(blockRe, `${newLine}\n`)
+      // ⚠️ 2026-11-17 修：**必须用函数形式做 replacement**。
+      //
+      // 原写法 `current.replace(blockRe, `${newLine}\n`)` 把 newLine 当**替换字符串**，
+      // 于是用户输入的 `$&`、`` $` ``、`$'` 会被 String.replace 当成特殊模式展开：
+      //   `$&`  = 整个匹配到的原文（那一行本身）
+      //   `` $` `` = 匹配位置**之前**的全部内容（会把 policy.md 前缀整段插进这一行）
+      //   `$'` = 匹配位置之后的内容
+      // 2026-11-17 实测：用户把收尾语写成「模板 $` 开头」，
+      // 结果那一行变成「- 每轮回复的结尾，加固定一句：模板 # 给模型的规则」——
+      // 整份 policy.md 的结构被破坏，且 80 字节上限拦不住（这些只有 2 个字符）。
+      //
+      // 函数形式的返回值**不做 $ 展开**，这是唯一正确的写法。
+      updated = current.replace(blockRe, () => `${newLine}\n`)
     } else {
       const anchor = /^(#{1,2}\s*.*给模型的规则[^\n]*\n)/m
+      // 这里故意**保留** `$1`：那是我们有意的捕获组回填，不是用户输入。
+      // 但 newLine 必须走函数形式，所以在匹配成功时用 replace(anchor, (...args) => ...)。
       updated = anchor.test(current)
-        ? current.replace(anchor, `$1\n${newLine}\n`)
+        ? current.replace(anchor, (_m, heading) => `${heading}\n${newLine}\n`)
         : `${current.trimEnd()}\n\n${newLine}\n`
     }
     await atomicWrite(paths.policy, updated)
@@ -2253,7 +2382,17 @@ export function createStore(config) {
     if (nextRoot === root) {
       throw new Error(`目标就是当前记忆目录（${root}），无需迁移。请填写一个新路径。`)
     }
-    if (isInside(nextRoot, root)) throw new Error('新位置不能是当前记忆目录的子目录')
+    // ⚠️ 2026-11-17 修：参数顺序原来写反了。
+    //
+    // `isInside(container, target)` 的第一参是**容器**（见 L543 的定义与 L2410 的正确用法）。
+    // 原代码写的是 `isInside(nextRoot, root)`，它判定的是「**当前根**在新位置里」，
+    // 也就是「新位置是当前根的祖先」——而报错文案说的是「新位置不能是子目录」。
+    // 两者方向正好相反，后果是：
+    //   · 迁到**父目录**被误拒（文案对但判定错）
+    //   · 迁到**子目录**被放行 → migrateRoot 会 copyTree(root\sub → root\sub\sub)，
+    //     把刚复制的整棵树再复制进它自己的子目录，迁移「成功」但结构错乱
+    // 2026-11-17 实测：isInside(child, root)=false（放行）、isInside(parent, root)=true（拒绝）。
+    if (isInside(root, nextRoot)) throw new Error('新位置不能是当前记忆目录的子目录')
     if (await exists(nextRoot)) {
       const entries = await readdir(nextRoot).catch(() => [])
       if (entries.length > 0) throw new Error(`目标目录非空：${nextRoot}`)
@@ -2417,7 +2556,10 @@ export function createStore(config) {
       const state = await readState()
       const current = projectDir(key, state)
       if (resolve(current) === nextDir) return { key, dir: nextDir, moved: 0 }
-      if (isInside(nextDir, current)) throw new Error('新位置不能是当前项目文件夹的子目录')
+      // ⚠️ 2026-11-17 修：同 migrateRoot —— 参数顺序原来写反了，
+      //   实际拦的是「目标包含当前目录」，放过了「目标在当前目录内部」。
+      //   后者会让 copyTree 把项目目录复制进它自己的子目录。
+      if (isInside(current, nextDir)) throw new Error('新位置不能是当前项目文件夹的子目录')
       if (await exists(nextDir)) {
         const entries = await readdir(nextDir).catch(() => [])
         if (entries.length > 0) throw new Error(`目标目录非空：${nextDir}`)
@@ -3113,8 +3255,10 @@ export function apply(ctx, rawConfig = {}) {
           // ## 为什么合并到这里（原来分散在两处）
           //
           // 旧文案分两句、相隔 55 行：
-          //   L3093「情绪记录不在检索里（只给用户自己在 GUI 看），搜不到不等于没记过。」
-          //   L3148「……判成情绪不影响写流水。」
+          //   原 L3093「情绪记录不在检索里（只给用户自己在 GUI 看），搜不到不等于没记过。」
+          //   原 L3148「……判成情绪不影响写流水。」
+          //   ⚠️ 2026-11-17：以上两行是**历史行号**，两处文案都已合并迁移，
+          //   现在只剩 L3131 那一句（合并后的版本）。行号不再维护，按符号/引文找。
           //
           // 两句各自都对，但**各自只说了一半**。我（模型）在需要时只读到其中一半，
           // 就得出过「这轮情绪已经记了，流水可以省」的错误推断 ——
@@ -3186,7 +3330,7 @@ export function apply(ctx, rawConfig = {}) {
           // 流水长度给死数字：含糊的「3~5 行」实测被违反十几次（写到 400~900 字）。
           '正文 **≤150 字**（最多 5 行，一行一个要点）。超了就把细节留在对话里。',
           // ⚠️ 2026-11-17：这里原来还有一句「判成情绪不影响写流水」，
-          // 已上移到「情绪与流水并行记录」那条（L3093 附近）一次性说清。
+          // 已上移到「情绪与流水并行记录」那条（L3131）一次性说清。
           // 理由：同一件事说两遍、还隔 55 行，我只会读到其中一半。
           // ★ 2026-11-17 用户改写（原话）：「对话本身就是有意义的事情 必须记录」。
           //
@@ -3784,11 +3928,14 @@ export function apply(ctx, rawConfig = {}) {
         : `- 每轮回复的结尾，加固定一句：${sentence} ` +
           `这是会话的「心跳」，用来确认本轮执行完整。放在最后一行，不用解释、不用变形。`
       if (hasLine) {
-        updated = current.replace(blockRe, `${newLine}\n`)
+        // ⚠️ 2026-11-17 修：同 restoreHeartbeat —— 必须用函数形式。
+        // replacement 字符串里的 `$&` / `` $` `` / `$'` 会展开，
+        // 用户写一个 `$` 就能把整份 policy.md 的结构改坏。见那段的长注释。
+        updated = current.replace(blockRe, () => `${newLine}\n`)
       } else {
         const anchor = /^(#{1,2}\s*.*给模型的规则[^\n]*\n)/m
         updated = anchor.test(current)
-          ? current.replace(anchor, `$1\n${newLine}\n`)
+          ? current.replace(anchor, (_m, heading) => `${heading}\n${newLine}\n`)
           : `${current.trimEnd()}\n\n${newLine}\n`
       }
     }
@@ -4917,14 +5064,37 @@ export function apply(ctx, rawConfig = {}) {
             // 两条通道必须共用一套校验 —— 否则同一份内容走不同通道会得到不同结果，
             // 那是最难查的一类不一致（2026-11-16 教训：模型把 topic 写成
             // 「测试/验证」被拒收置空，而如果 HTTP 通道另写一套就会放过它）。
-            const topicRaw = typeof body.topic === 'string' ? body.topic : ''
+            const topicRaw = typeof body.topic === 'string' ? body.topic.trim() : ''
             const topic = sanitizeTopic(topicRaw)
-            if (topicRaw.trim() !== '' && topic === null) {
+            // ⚠️ 2026-11-17 修：原来这里只 diag、**不拒绝**，于是出现「假成功」：
+            //   调用方收到 ok:true（因为 appendLog 确实写进去了），
+            //   但落库的条目 topic=null / summary=null —— 是「写了但查不到」的残缺数据。
+            //   这类条目既不进 topic 索引，摘要检索也命中不了，等于对模型隐形。
+            //
+            // 判据：
+            //   · topic 传了但不在 13 类 → 400（是调用方写错，必须让它知道）
+            //   · summary 缺失          → 400（硬性要求，见注入里的「topic 与 summary 必填」）
+            //   · topic 完全没传        → 放行（标记通道允许，保持两通道一致）
+            if (topicRaw !== '' && topic === null) {
               diag('topic-rejected', { raw: topicRaw.slice(0, 40), via: 'http' })
+              return json(res, 400, {
+                ok: false,
+                error:
+                  `topic 不在允许的 13 类里：${JSON.stringify(topicRaw.slice(0, 40))}。` +
+                  `请改用其中之一（开发日志 / 技术讨论 / GUI/界面 / 注入/预算 / 插件/装载 / ` +
+                  `用户画像 / 文档/行号 / Git / 数据清理 / 路径/沙箱 / 构建/编译 / 情感交流 / 待办）。` +
+                  `这条没有被写入 —— 残缺的 topic 会让流水无法被索引。`,
+              })
             }
             const summary = sanitizeSummary(body.summary)
             const keywords = sanitizeKeywords(body.keywords)
-            if (summary === null) diag('summary-missing', { topic, via: 'http' })
+            if (summary === null) {
+              diag('summary-missing', { topic, via: 'http' })
+              return json(res, 400, {
+                ok: false,
+                error: '缺少 summary（必填，≤35 字）。这条没有被写入 —— 没有摘要的流水在检索里等于不存在。',
+              })
+            }
 
             // scope 解析：默认取请求方所在会话的项目名（与标记通道同源，
             // 都用 resolveProjectKey 的 scope，而不是目录名 key）。
@@ -4944,10 +5114,15 @@ export function apply(ctx, rawConfig = {}) {
             if (scope === '') {
               scopeFrom = 'cwd'
               const cwd = typeof body.cwd === 'string' ? body.cwd : process.cwd()
-              if (!(await exists(cwd))) {
+              // ⚠️ 2026-11-17 修：这里必须是 isDirectoryPath 而不是 exists。
+              //    exists 走 stat()，**文件也算存在** —— 传一个文件路径能通过校验，
+              //    然后 basename 变成 scope 名（实测传 .../AGENTS.md → 建出 scope "AGENTS.md"）。
+              //    另外「在别的目录下跑命令」时 cwd 是真实存在的目录但不属于任何项目，
+              //    也会被发现——这一点由下面的 resolveProjectKey 兜底，不在本函数职责内。
+              if (!(await isDirectoryPath(cwd))) {
                 return json(res, 400, {
                   ok: false,
-                  error: `cwd 不存在：${cwd}。请传正确的 cwd，或直接传 scope。`,
+                  error: `cwd 不是存在的目录：${cwd}。请传正确的工作区目录，或直接传 scope。`,
                   scopeFrom,
                 })
               }

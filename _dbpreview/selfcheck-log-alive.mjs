@@ -372,8 +372,13 @@ if (src !== '') {
   check('HTTP 通道拒绝非 POST', /req\.method !== 'POST'/.test(logRoute))
   // 2026-11-16 自测发现的坑：resolveProjectKey 对任何路径都算 basename，
   // 传错 cwd 会凭空造假工作区（实测写出过「不存在的目录xyz」这个 scope）。
-  check('cwd 不存在时拒绝（不造假工作区）', /!\(await exists\(cwd\)\)/.test(logRoute),
-    '缺它 → 传错 cwd 会凭空建出一个假 scope 污染 byScope / 下拉框 / 索引')
+  //
+  // ⚠️ 2026-11-17 升级：原来的判据 `exists(cwd)` 不够 ——
+  //    `exists()` 走 `stat()`，**文件也算存在**。实测传 `.../AGENTS.md` 能通过，
+  //    然后建出 scope "AGENTS.md"。现在改判 `isDirectoryPath(cwd)`。
+  //    断言也同步：必须查新函数名，否则守的是一条已经不存在的防线。
+  check('cwd 必须是存在的**目录**（不造假工作区）', /!\(await isDirectoryPath\(cwd\)\)/.test(logRoute),
+    '缺它 → 传文件路径或跑错目录都会凭空建出假 scope，污染 byScope / 下拉框 / 索引')
 }
 
 // ---- 6) 防呆已移除（2026-11-16 决定，保留说明）----

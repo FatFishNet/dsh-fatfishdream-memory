@@ -273,6 +273,20 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
    *
    * 为什么不用「只保头部」：最新的记忆追加在末尾，
    * 只保头部会让最该看的新结论最先被丢掉。
+   *
+   * ⚠️ 2026-11-17 修：**单条就超预算**时，原来会整条消失。
+   *
+   *   head/tail 两个循环都要求 `used + b <= 预算`，若某一条自己就比预算还大，
+   *   两个循环都不会收它（head 立刻 break，tail 也立刻 break）→ head 与 tail 全空
+   *   → 输出只剩一句「…（省略 1 条）…」。
+   *
+   *   实测（一条 1400 字的红线规则，projectBytes=4096）：
+   *     count=1 truncated=true，注入文本只有 10 字节，「红线红线」出现次数 0
+   *   也就是说：**库里唯一的红线规则，注入里一个字都没有**，而模型完全不知道。
+   *
+   *   修法：收尾时若 head 与 tail 都空（说明被丢的都是「太大」而不是「太多」），
+   *   取最长的那条按字符边界截断塞进去 —— 宁可是「截断的一条」，也不要「零条」。
+   *   截断用 byteLen 回退到完整字符，避免切断多字节汉字/emoji。
    */
   function joinWithBudget(lines, maxBytes) {
     if (lines.length === 0) return { text: '', truncated: false, count: 0 }
@@ -301,9 +315,33 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
       used += b
     }
     const omitted = lines.length - head.length - tail.length
+
+    // ① 正常情况：头尾都收到了一些
+    if (head.length > 0 || tail.length > 0) {
+      return {
+        text: [...head, `…（省略 ${omitted} 条）…`, ...tail].join('\n'),
+        truncated: true,
+        count: lines.length,
+      }
+    }
+
+    // ② 全军覆没：说明每条都超过预算。取最长的一条，硬截到 tailBudget。
+    //    「最长」而不是「第一条」：最长的那条通常信息量最大（例如红线规则）。
+    let longest = lines[0]
+    for (const l of lines) {
+      if (byteLen(l) > byteLen(longest)) longest = l
+    }
+    let cut = longest
+    // 按完整字符回退，不切断多字节
+    while (byteLen(cut) > Math.max(0, tailBudget - 20) && cut.length > 0) {
+      cut = cut.slice(0, Math.max(0, cut.length - Math.max(1, Math.ceil(cut.length / 10))))
+    }
+    const marker = omitted > 0 ? `…（超预算，已截断，共 ${lines.length} 条）…\n` : ''
     return {
-      text: [...head, `…（省略 ${omitted} 条）…`, ...tail].join('\n'),
+      text: marker + cut + (cut.length < longest.length ? '…' : ''),
       truncated: true,
+      // ⚠️ emptied 让上层能把文案改准：这不是「按头尾保留」，是「截断了一条」
+      emptied: true,
       count: lines.length,
     }
   }
@@ -1633,13 +1671,28 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     if (role !== 'user' && role !== 'assistant') {
       return { written: false, reason: `bad-role:${role}` }
     }
-    const d = open()
-    const r = d
-      .prepare(`INSERT INTO archive(ts,scope,role,text,session_id,turn,step) VALUES(?,?,?,?,?,?,?)`)
-      .run(nowIso(), scope || GLOBAL, role, body, sessionId ?? null, turn ?? null, step ?? null)
-    const id = Number(r.lastInsertRowid)
-    syncFts(d, 'archive', id, { text: body })
-    return { id, written: true, role }
+    // ⚠️ 2026-11-17 修：主表 + FTS **必须在同一个事务里**。
+    //
+    // 这是 `insertInto` 早就要修过的同一个病（见本文件 L380-402 的长注释）：
+    // 「先 INSERT 主表 → 再 syncFts」两步裸跑，一旦 syncFts 失败，
+    // 主表已提交、索引没写 —— 于是这条原文**按 id 查得到、按关键词永远搜不到**。
+    //
+    // 更糟的是调用方（index.js 的 archive 写入处）把异常 catch 成一条 diag，
+    // 于是三方认知全不一致：
+    //   数据库：写了     调用方：失败了     用户检索：查不到
+    //
+    // 2026-11-17 实测复现（人为 DROP archive_fts 后写一条）：
+    //   抛错 "no such table: archive_fts"，而 archive 主表实际是 2 行。
+    //
+    // 修法照 `insertInto`：整段包进 withFtsTransaction，失败一起回滚。
+    return withFtsTransaction((d) => {
+      const r = d
+        .prepare(`INSERT INTO archive(ts,scope,role,text,session_id,turn,step) VALUES(?,?,?,?,?,?,?)`)
+        .run(nowIso(), scope || GLOBAL, role, body, sessionId ?? null, turn ?? null, step ?? null)
+      const id = Number(r.lastInsertRowid)
+      syncFts(d, 'archive', id, { text: body })
+      return { id, written: true, role }
+    })
   }
 
   /**

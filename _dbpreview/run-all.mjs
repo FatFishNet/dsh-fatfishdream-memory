@@ -75,6 +75,10 @@ export const SCRIPTS = [
   'selfcheck-emotion-lexicon',
   'selfcheck-emotion-limiter',
   'selfcheck-entry-by-id',
+  // ★ 2026-11-16 新增：流水通道存活检查。
+  //   守的是「最近 N 分钟有没有成功写入过流水」—— 抓「模型压根没写」这类
+  //   解析层测试看不见的失效。详见脚本头部注释。
+  'selfcheck-log-alive',
   'selfcheck-archive',
   'selfcheck-breakdown',
   'selfcheck-dir-name',

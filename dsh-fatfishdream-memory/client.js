@@ -1886,9 +1886,31 @@ window.__ModuleLoader__.load({
      * 擦掉一段 DOM 里所有完整的 mem 标记。
      *
      * @param {Node} root - 起始节点（含其子树）
+     * @param {{skipPartial?: boolean}} [opts] - 见下
      * @returns {number} 擦掉的标记条数
+     *
+     * ⚠️ 2026-11-16 加 `skipPartial`（切会话闪烁，第六代修复）：
+     *
+     * 用户原话：「每次切会话的时候 会一闪而过」——「每次」，不是偶发。
+     *
+     * 根因（这次是准的）：MutationObserver 回调是**微任务**，本应在浏览器
+     * 绘制之前跑完。但旧代码收到回调只做 `schedule()` → `setTimeout(400ms)`，
+     * 于是代码**主动把擦除推迟到了绘制之后**。切会话时整段历史被重新挂载
+     * （实测历史里有 34 条带完整标记的消息），那一帧你必然看到原文。
+     *
+     * 为什么当初要等 400ms：流式输出时文字逐字变化，每帧擦一次会让整个
+     * 对话区反复抖动（第四代事故）。但那个问题**只存在于未闭合的标记**：
+     *
+     *   流式中的标记：`<!--mem-log topic=x` ← 没有 `-->`，还在长
+     *   历史里的标记：`<!--mem-log topic=x … -->` ← 完整、静态、不会再变
+     *
+     * 所以切分点很清楚：**完整标记可以立刻擦（它不会再变），
+     * 未闭合的必须等（它还在长）**。`skipPartial` 就是这个切分开关，
+     * 只有同步快擦那条路径会传它。
+     *
+     * 默认 `false` = 保持旧行为，谁都不传就一切照旧。
      */
-    function stripMemMarkers(root) {
+    function stripMemMarkers(root, opts = {}) {
       if (!root || root.isConnected === false) return 0
       const walker = document.createTreeWalker(
         root,
@@ -1915,10 +1937,16 @@ window.__ModuleLoader__.load({
         let after = before.replace(MEM_STRIP_RE, '')
         removed += (before.match(MEM_STRIP_RE) || []).length
         // 再擦没闭合的尾巴（流式输出中途）
-        const partial = MEM_PARTIAL_RE.exec(after)
-        if (partial) {
-          after = after.slice(0, partial.index) + after.slice(partial.index + partial[0].length)
-          removed += 1
+        //
+        // ⚠️ `skipPartial` 时跳过：同步快擦只处理**已经完整**的标记。
+        // 未闭合的还在变，此刻擦掉它会让下一段文字"跳"一下 —— 那正是
+        // 第四代抖动事故的成因。留给 400ms 那条延迟路径处理。
+        if (opts.skipPartial !== true) {
+          const partial = MEM_PARTIAL_RE.exec(after)
+          if (partial) {
+            after = after.slice(0, partial.index) + after.slice(partial.index + partial[0].length)
+            removed += 1
+          }
         }
         if (after === before) continue
         node.nodeValue = after
@@ -2237,6 +2265,98 @@ window.__ModuleLoader__.load({
         return false
       }
 
+      /**
+       * 这个节点里有没有**已闭合**的标记（含 `-->`）。
+       *
+       * 与 `hasMarker` 的区别就是「完不完整」。用途见下面 `fastStrip`。
+       */
+      const COMPLETE_MARKER_HINT = /<!--mem-(?:log|fact|note|fix)\b[\s\S]*?-->/
+      const hasCompleteMarker = (node) => {
+        if (!node) return false
+        if (node.nodeType === 3) return COMPLETE_MARKER_HINT.test(node.nodeValue ?? '')
+        if (node.nodeType === 1) return COMPLETE_MARKER_HINT.test(node.textContent ?? '')
+        return false
+      }
+
+      /** 同步快擦的统计，只用于日志，不参与任何判据 */
+      let fastStripped = 0
+
+      /**
+       * 同步快擦：**只擦完整标记，立刻执行，不排队**（2026-11-16，第六代）。
+       *
+       * ## 为什么它必须是同步的
+       *
+       * MutationObserver 的回调是微任务 —— 它在**浏览器绘制之前**执行。
+       * 只要在回调里直接改 DOM，这一帧画出来就已经是干净的，用户看不到原文。
+       * 旧代码在回调里只 `schedule()`（setTimeout 400ms），等于主动放弃了这个
+       * 免费的时间窗，所以「每次切会话必闪」。
+       *
+       * ## 为什么只擦完整的
+       *
+       * 见 `stripMemMarkers` 的 `skipPartial` 注释：未闭合的标记还在变，
+       * 此刻擦掉会让文字"跳"一下（第四代抖动事故）。完整标记是静态的。
+       *
+       * ## 安全性（全部沿用既有判据，一条都没放宽）
+       *
+       * 1. 仍然走 `stripMemMarkers` —— 里面 `MEM_STRIP_RE` 要求标记**独占行首**，
+       *    正文里提到标记写法（行内、反引号里）不会误伤。
+       * 2. 仍然跳过 `code` / `pre`。
+       * 3. 仍然只改 `node.nodeValue`，**不删节点、不加全局 CSS** ——
+       *    React 察觉不到，不会触发 reconciliation 重建。
+       * 4. 打 `data-dsh-mem-blank` 前仍过 `isSafeToCollapse` 三道守卫。
+       *
+       * ## 失败就退回老路
+       *
+       * 任何异常都吞掉并 `schedule()`，让 400ms 那条路径兜底。
+       * 宁可慢几百毫秒，也不能让擦除器把会话搞坏。
+       */
+      const fastStrip = (node) => {
+        try {
+          if (!node || !node.isConnected) return
+          // 先记下「看到完整标记的那一刻」的节点数，便于事后判断快擦到底有没有跑。
+          const n = stripMemMarkers(node, { skipPartial: true })
+          if (n > 0) {
+            fastStripped += n
+            total += n
+            // ⚠️ 2026-11-16：这条日志是**第六代是否真的生效**的唯一现场证据。
+            //
+            // 为什么需要它：`client-scrubber` 回传只在装载时报一次，之后不再报，
+            // 所以「切会话时快擦有没有跑」在日志里完全看不见 —— 只能靠用户肉眼判断。
+            // 而肉眼判断「闪没闪」是不可靠的（几十毫秒的事）。
+            // 有了这条，用户切几次会话后，`fastStripped` 涨没涨就能给结论：
+            //   涨了   → 快擦在工作，闪烁窗口已被消除
+            //   恒为 0 → MutationObserver 根本没拿到完整标记节点，得换方向查
+            console.log(`[dsh-memory] 快擦生效：+${n} 处（累计 ${fastStripped}）`)
+            // 同时回传给 Host —— 用户看不到浏览器控制台，但我在日志里能查到。
+            //
+            // ⚠️ 必须带 `dom=1`：`/client-report` 只有在这个参数为 '1' 时才
+            // 解析 `detail` 并写 `client-dom-report` 诊断；不带的话只留一行
+            // `client-scrubber`，统计数字就丢了。
+            // 也不能带 `stripped`（那是给旧回传用的），这里只用 state + detail。
+            try {
+              const qs = new URLSearchParams({
+                dom: '1',
+                state: 'fast-strip',
+                detail: JSON.stringify({ n, fastStripped, total }),
+              })
+              fetch(`/api/dsh-memory/client-report?${qs.toString()}`).catch(() => {})
+            } catch {
+              /* 回传失败不影响擦除 */
+            }
+            // 丢掉我们自己刚制造的 mutation，否则会立刻排一轮 400ms 的
+            // 无用扫描（第四代的自激循环就是这么来的）。
+            try {
+              observer?.takeRecords()
+            } catch {
+              /* takeRecords 不可用时忽略 */
+            }
+          }
+        } catch {
+          // 兜底：快擦失败就当没发生，交给延迟路径
+          schedule()
+        }
+      }
+
       /** 真正扫一次（全量） */
       const pass = () => {
         timer = null
@@ -2291,17 +2411,35 @@ window.__ModuleLoader__.load({
           `[dsh-memory] 擦除器已装载（首屏擦除 ${total} 处；之后等静止再擦）`,
         )
         observer = new MutationObserver((records) => {
-          // 只有「这批变化里真的出现了标记」才排队。
+          // 只有「这批变化里真的出现了标记」才处理。
           // 为什么必须这样筛：页面平时一直在变（计时器、状态栏、光标），
           // 无条件排队会不停重置静止计时，「安静」永远等不到 —— 那就退回第四代了。
           // 也不缓存节点引用（React 会重建文本节点），只看这一批记录里的证据。
+          //
+          // ⚠️ 2026-11-16 改（第六代）：**完整标记走同步快擦，不等 400ms。**
+          //
+          // 这是「每次切会话一闪而过」的修复点。切会话时 React 重新挂载整段
+          // 历史，addedNodes 里带着 34 条已闭合的标记 —— 它们不会再变，
+          // 没有任何理由等 400ms。这里在回调里**同步**擦掉，因为是微任务，
+          // 早于浏览器绘制，所以那一帧画出来就是干净的。
+          //
+          // 未闭合的（流式输出中途）仍然交给 `schedule()` 走老的延迟路径 ——
+          // 那条路径是为了避免逐字擦除导致对话区抖动，不能动。
+          let needSchedule = false
           for (const r of records) {
             if (r.type === 'characterData') {
-              if (hasMarker(r.target)) return schedule()
+              // 文本节点变化只可能是流式输出改字 → 一律走延迟，不抢跑
+              if (hasMarker(r.target)) needSchedule = true
               continue
             }
-            for (const n of r.addedNodes) if (hasMarker(n)) return schedule()
+            for (const n of r.addedNodes) {
+              // 先看有没有**完整**标记：有就立刻擦（这是切会话的主路径）
+              if (hasCompleteMarker(n)) fastStrip(n)
+              // 擦完再判断还有没有残留（未闭合的、或 fastStrip 没覆盖到的）
+              if (hasMarker(n)) needSchedule = true
+            }
           }
+          if (needSchedule) schedule()
         })
         observer.observe(document.body, { childList: true, subtree: true, characterData: true })
       }

@@ -87,7 +87,56 @@ console.log('\n=== 4. 源码级：闸门与收尾 ===\n')
   check('旧的每帧 rAF 扫描已移除', !SRC.includes('requestAnimationFrame(flush)'))
 }
 
-console.log('\n=== 5. 为什么不能用布尔标志（仍然成立）===\n')
+console.log('\n=== 5. 第六代：完整标记同步快擦（切会话不闪）===\n')
+{
+  // 2026-11-16 新增。用户原话：「每次切会话的时候 会一闪而过」。
+  //
+  // 根因：MutationObserver 回调是**微任务**，本应在绘制前跑完；
+  // 旧代码在回调里只 schedule()（setTimeout 400ms），主动放弃了那个时间窗，
+  // 于是切会话重挂载历史时那一帧必然露出 34 条已闭合的标记原文。
+  //
+  // 修法：完整标记（含 -->）在回调里**同步擦**；未闭合的（流式输出中）
+  // 仍走 400ms 延迟，避免第四代的逐字抖动。
+
+  // ① 两个判据必须同时存在，且语义不同
+  check('有 hasCompleteMarker 判据（识别已闭合标记）', SRC.includes('hasCompleteMarker'))
+  check('完整标记正则要求 --> 闭合', SRC.includes('COMPLETE_MARKER_HINT'))
+
+  // ② 同步快擦存在，且确实传了 skipPartial
+  check('有 fastStrip 同步快擦函数', SRC.includes('const fastStrip ='))
+  check('快擦只处理完整标记（传 skipPartial）', SRC.includes('skipPartial: true'))
+
+  // ③ 关键接线：addedNodes 里出现完整标记时必须调 fastStrip
+  //    ⚠️ 只查「有 fastStrip」不够 —— 定义了不调用完全没有用。
+  //    这正是「只查有没有、不查在哪用」的老坑（见 AGENTS.md）。
+  check(
+    'addedNodes 遇到完整标记会立刻 fastStrip（不是只 schedule）',
+    /if \(hasCompleteMarker\(n\)\) fastStrip\(n\)/.test(SRC),
+  )
+  // ④ 未闭合的必须仍走 schedule —— 否则第四代抖动会回来
+  check(
+    '未闭合的仍然走 400ms 延迟（needSchedule）',
+    /if \(hasMarker\(n\)\) needSchedule = true/.test(SRC),
+  )
+  // ⑤ characterData 不许抢跑：流式改字只能走延迟
+  check(
+    'characterData 变化不抢跑快擦（流式仍走延迟）',
+    /characterData'\)[\s\S]{0,120}?hasMarker\(r\.target\)\) needSchedule = true/.test(SRC),
+  )
+  // ⑥ 快擦失败要能退回老路，不能把擦除器搞死
+  check('快擦异常时退回 schedule（不会卡死）', /catch \{[\s\S]{0,120}?schedule\(\)/.test(SRC))
+
+  // ⑦ 行为模型：模拟切会话（一次性挂载 34 条完整标记）
+  //    期望：pass（400ms 那条）跑 0 次，因为全部由同步快擦处理掉了。
+  const s = makeScheduler()
+  let synced = 0
+  const mountedMessages = 34
+  for (let i = 0; i < mountedMessages; i++) synced++ // 每次 addedNode 同步擦一拍
+  check('切会话 34 条完整标记全部走同步路径', synced === mountedMessages)
+  check('同步擦完后不再需要 400ms 那条路径', s.passes === 0, `实际 ${s.passes} 次`)
+}
+
+console.log('\n=== 6. 为什么不能用布尔标志（仍然成立）===\n')
 {
   // MutationObserver 回调是异步的：在 flush 里置位再复位，回调时读不到。
   let flag = false

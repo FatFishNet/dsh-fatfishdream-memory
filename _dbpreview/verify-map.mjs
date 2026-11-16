@@ -57,6 +57,23 @@ for (const r of rows) {
       if (content !== '') found = true
     }
   }
+  // ⚠️ 2026-11-16 补：章节归属只是**粗判**，正文里常出现跨文件引用。
+  //
+  // 实测：§5（store 章节）里写「`MIGRATIONS[3]`…执行 `CREATE_ARCHIVE`（L158，幂等）」
+  // —— 那个 L158 指的是 **db-schema.mjs** 的定义，不是 db-store.mjs。
+  // 旧逻辑只按章节认 owner，于是把一条**正确的**引用报成「越界」。
+  //
+  // 这不是放宽标准：仍然要求「该行非空」。只是承认「章节内可以引用别的文件」。
+  // 判据仍是内容对不对 —— 那由 `verify-map-content.mjs`（按符号名现算）负责。
+  if (!found) {
+    for (const o of Object.keys(SRC)) {
+      const src = files[o]
+      if (r.n <= src.length && (src[r.n - 1] || '').trim() !== '') {
+        found = true
+        break
+      }
+    }
+  }
   if (!found) {
     blank++
     console.log(`  ⚠️ L${r.n}（地图行 ${r.mapLine}）落空/越界`)

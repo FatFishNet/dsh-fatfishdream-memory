@@ -175,23 +175,88 @@ console.log('\n=== F. 连续写入失败提醒（2026-11-16）===\n')
 const hasStreakMap = INDEX_SRC.includes('const writeFailStreak = new Map()')
 const hasLimitConst = INDEX_SRC.includes('WRITE_FAIL_STREAK_LIMIT = 4')
 
-// ② 写入结果必须更新计数（成功清零 / 有标记但失败 +1）
-const streakSuccessReset = /if \(markerWritten > 0\) \{[\s\S]*?writeFailStreak\.set\(sKey, 0\)/.test(INDEX_SRC)
-const streakFailIncrement = /writeFailStreak\.set\(sKey, prev \+ 1\)/.test(INDEX_SRC)
+// ② 写入结果必须更新计数 —— v2 改成「按轮结算」，判据移到 G 段断言。
+//    （v1 的 streakSuccessReset / streakFailIncrement 两条已随逻辑改写删除，
+//      留着会去匹配已经不存在的老正则，变成永远 FAIL 的噪声。）
 
 // ③ 提醒必须走 safePushMessage + 有阈值判断 + 成功后清零
-const reminderUsesSafePush = /safePushMessage\(\s*agent,\s*`\[dsh-memory\] 连续/.test(INDEX_SRC)
+const reminderUsesSafePush = /safePushMessage\(\s*agent,\s*`\[dsh-memory\] 已连续/.test(INDEX_SRC)
 const reminderChecksLimit = /failStreak >= WRITE_FAIL_STREAK_LIMIT/.test(INDEX_SRC)
 const reminderResetsOnDelivered = /if \(delivered\) \{[\s\S]*?writeFailStreak\.set\(sessionKey, 0\)/.test(INDEX_SRC)
 
 for (const [label, ok, detail] of [
-  ['有 writeFailStreak 计数器', hasStreakMap, '缺它 → 无法跨轮累计失败'],
+  ['有 writeFailStreak 计数器', hasStreakMap, '缺它 → 无法跨轮累计'],
   ['阈值常量 = 4', hasLimitConst, '改阈值必须显式，不能埋魔法数字'],
-  ['成功写入清零计数', streakSuccessReset, '成功不清零 → 提醒一次后永远卡在阈值'],
-  ['失败轮次 +1', streakFailIncrement, '缺它 → 计数永不增长，提醒永不触发'],
   ['提醒走 safePushMessage', reminderUsesSafePush, '不走它 → turn-stopping 异常会中断会话'],
   ['提醒有阈值判断', reminderChecksLimit, '缺它 → 退回每轮提醒（217 次太吵）'],
   ['投递成功后清零', reminderResetsOnDelivered, '不清零 → 下轮仍触发，重复提醒'],
+]) {
+  if (ok) { pass++; console.log(`  OK   ${label}`) }
+  else { fail++; console.log(`  FAIL ${label} — ${detail}`) }
+}
+
+// ---------------------------------------------------------------------------
+// G. 连续未写流水的「按轮」判据（2026-11-16 v2）
+//
+// ## 为什么改
+//
+// v1 只在「有标记但 0 落库」时计数，对 `hasMarker === false` 显式不计数。
+// 用户 2026-11-16 实报「闲聊为什么没进流水」—— 查出来是模型**连续 10 轮
+// 压根没写标记**，而 v1 对这种恰好零检测。
+//
+// ## 为什么必须按轮、不能按条
+//
+// 一次回复会触发多条 assistant/message（每个工具调用步一条，实测 4~5 条）。
+// 若按条计数，阈值 4 会在一轮内被顶穿 —— 等于退回「每轮提醒」的老路
+// （DECISIONS 记着：两天 217 次，用户反馈太吵）。
+//
+// ## 这组断言的边界（重要）
+//
+// **测不了真实行为**：脚本无法伪造 assistant/message 事件
+// （见 selfcheck-e2e-memory.mjs 顶部注释）。所以这里只做源码级断言，
+// 守住「结构没被改坏」，不宣称「行为已验证」。
+// ---------------------------------------------------------------------------
+console.log('\n=== G. 未写流水按轮计数（2026-11-16 v2）===\n')
+
+// ① turnActivity 记录必须带 wroteLog 字段
+const hasWroteLogField = /\{ writes: 0, wroteMemory: false, wroteLog: false \}/.test(INDEX_SRC)
+// ② assistant/message 里只在成功时置位（不能在那里 +1 计数）
+const setsWroteLog = /rec\.wroteLog = true/.test(INDEX_SRC)
+const noCountInAssistantMsg = {
+  ok: !/writeFailStreak\.set\(sKey, prev \+ 1\)/.test(INDEX_SRC),
+  detail: 'assistant/message 里不该直接改 streak —— 粒度是「条」，会一轮顶穿阈值',
+}
+// ③ turn-stopping 里按「轮」结算
+const settlesPerTurn = /const wroteThisTurn = record !== undefined && record\.wroteLog === true/.test(INDEX_SRC)
+// ④ 没写过也要 +1（这是 v2 的核心：v1 恰恰漏了这一半）
+const incrementsWhenNotWritten = /const wroteThisTurn[\s\S]{0,400}?writeFailStreak\.set\(sessionKey, prev \+ 1\)/.test(INDEX_SRC)
+// ⑤ 提醒文案必须能指导行动（不能只说「没写」）
+//
+// ⚠️ 2026-11-16 改：写入通道从「正文标记」改成「HTTP 接口」，
+// 所以「怎么补」的答案也变了。断言守的是**可执行性**（给了具体动作），
+// 不是守某一句具体文案 —— 所以这里认两种形态都算数：
+//   走 HTTP：文案里出现 /api/dsh-memory/log
+//   退化标记：文案里出现 mem-log 标记的写法
+// 若两条都消失，说明提醒退化成了「你忘了写」这种没有下一步的话，那时才该红。
+const reminderActionable =
+  /\/api\/dsh-memory\/log/.test(INDEX_SRC) || /请在回复正文里补一条 mem-log 标记/.test(INDEX_SRC)
+// ⑥ 清零必须在 wroteThisTurn 为真时执行 ——
+//    ⚠️ 这条是变异测试抓出来的漏：`write-fail-reset-removed` 把
+//    `if (wroteThisTurn)` 改成 `if (false)`，而上面 ⑤ 条只断言
+//    「wroteThisTurn 的定义还在」，定义没动，于是照样绿。
+//    教训：**只查有没有、不查在哪用**，和我 2026-11-15 踩的是同一个坑。
+const resetsWhenWrote = /if \(wroteThisTurn\) \{\s*if \(\(writeFailStreak\.get\(sessionKey\) \?\? 0\) !== 0\) \{\s*writeFailStreak\.set\(sessionKey, 0\)/.test(
+  INDEX_SRC,
+)
+
+for (const [label, ok, detail] of [
+  ['turnActivity 带 wroteLog 字段', hasWroteLogField, '缺字段 → 无法记录「本轮写过」'],
+  ['成功时置位 wroteLog', setsWroteLog, '缺它 → 永远算「没写过」'],
+  ['assistant/message 不直接改 streak', noCountInAssistantMsg.ok, noCountInAssistantMsg.detail],
+  ['turn-stopping 按轮结算', settlesPerTurn, '缺它 → 粒度错了'],
+  ['没写过也 +1（v2 核心）', incrementsWhenNotWritten, '缺它 → 回到 v1，忘写仍然零检测'],
+  ['提醒文案可执行', reminderActionable, '只说「没写」不够，要告诉怎么补'],
+  ['写过时真的会清零（不是 if(false)）', resetsWhenWrote, '清零被跳过 → 提醒一次后永远卡在阈值'],
 ]) {
   if (ok) { pass++; console.log(`  OK   ${label}`) }
   else { fail++; console.log(`  FAIL ${label} — ${detail}`) }

@@ -1,8 +1,8 @@
 {
   "name": "dsh-fatfishdream-memory",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
-  "description": "DeepSeek Harness 记忆插件（大肥鱼的梦）：零工具长期记忆，结论注入 + 标记写入 + 全局/项目规则。",
+  "description": "DeepSeek Harness 记忆插件（大肥鱼的梦）：零工具长期记忆，结论注入 + HTTP 写入 + 原文归档。",
   "engines": {
     "dsh": ">=0.2.2-rc.3"
   },

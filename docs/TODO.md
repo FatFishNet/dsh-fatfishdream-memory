@@ -7,6 +7,69 @@
 
 ---
 
+## 收录进 awesome-dsh-plugin 插件市场（暂缓，用户 2026-11-16 决定以后再说）
+
+**状态**：npm 上当前是 `1.1.0`（`1.2.0` 已在仓库里、正在准备发布）。
+硬性条件除「npm 已发布 1.2.0」外**都已满足**，用户决定暂不投稿。
+
+### 已核实的条件（2026-11-16 实测）
+
+| 要求 | 状态 |
+|---|---|
+仓库声明 `dsh.bundle` | ✅（**最常见被拒原因**，我们没问题） |
+`cordis.patch.yml` 存在 | ✅（在子目录 `dsh-fatfishdream-memory/`） |
+有真实可用代码 | ✅ 8400+ 行，34 脚本回归 + 34 变异 |
+仓库满 1 天 | ✅ 首次提交 2026-11-14T13:03 |
+`dsh-plugin` topic | ✅ 用户截图确认已有 |
+npm 已发布 | ⏳ 待发 `1.2.0`（当前 npm 上是 `1.1.0`） |
+`repository` 指回本仓库 | ✅ 一致 |
+`category: memory` | ✅ 在有效清单内 |
+
+### 投稿材料（已备好，直接用）
+
+**文件路径**：`data/plugins/FatFishNet__dsh-fatfishdream-memory.yml`
+
+```yaml
+url: https://github.com/FatFishNet/dsh-fatfishdream-memory
+name: FatFishNet/dsh-fatfishdream-memory
+category: memory
+description:
+  en: Zero-tool long-term memory with SQLite storage, per-turn injection, and full-text archive.
+  zh: 零工具长期记忆插件，SQLite 存储、每轮注入、原文归档。
+```
+
+**描述为什么这么写**：他们会**对着代码核对**每个说法。四个声明都实测属实
+（`tools.register` 0 次 / SQLite / `systemPrompt.context` / `archive` 表 + FTS）。
+**刻意不提具体数字**（如「19 条路由」），数字最容易被逐个核对。
+
+**注意**：描述里若有 `: `（冒号+空格）必须加引号，否则 YAML 解析失败。当前文本没有，不用加。
+
+### 投稿流程
+
+Fork → 在 `data/plugins/` 下新建上述文件 → 提 PR（标题 `Add FatFishNet/dsh-fatfishdream-memory`）。
+**不要手工编辑两个 README**，它们由脚本从 `data/plugins/*.yml` 生成。
+
+### 可选：截图
+
+在插件目录下放 `screenshots.json`，里面列 1-8 张图片路径（相对于该文件）。
+不写也行，市场会从 README 自动抽取。
+
+### ⚠️ 相关：macOS 兼容问题（同一时期讨论，未做）
+
+用户 2026-11-16 提出「macOS 要不要改成放插件默认目录」。查证结论：
+
+- **DSH 没有给插件「默认数据目录」**，本插件的选址是自己实现的四级逻辑。
+- macOS 上 `listCandidateDrives()` 会循环试 `D:\`~`Z:\`（23 次无效调用），
+  全部失败后落 `systemFallbackRoot()` → `~/Documents/dsh-fatfishdream-memory`。
+  **按代码推断不会崩，但未在 Mac 上实测。**
+- 合理改法：`process.platform !== 'win32'` 时直接跳过盘符探测。
+- **未做的原因**：没有 Mac 可验证；且刚发完版本，改动需要再发一版。
+
+**如果以后要做**：改 `systemFallbackRoot()` + `listCandidateDrives()` 加平台判断，
+重跑回归、重算地图行号、把 README 的「macOS 未验证」更新成「已调整但未实机验证」。
+
+---
+
 ## ~~`meta-mutation-test.mjs` 缺少中断保护~~ —— 已补（2026-11-15）
 
 **当时的问题**：靠 `try/finally` 恢复，进程被 kill 时 `finally` 不一定执行。
@@ -18,12 +81,12 @@
 |---|---|---|
 ① 启动查 `.mutbak` 残留 | 有残留就拒绝运行，打印手动恢复步骤 | 造一个假残留 → exit=1 ✅ |
 ② 恢复后 sha256 校验 | 恢复完重读文件比对，不一致抛错并给出 `git checkout` 命令 | 代码路径已接，正常跑时一致 ✅ |
-③ `--dry-run` | 只列出会改哪个文件/片段/是否匹配，不动文件 | 11/11 匹配，exit=0 ✅ |
+③ `--dry-run` | 只列出会改哪个文件/片段/是否匹配，不动文件 | 全匹配 exit=0、有未匹配 exit=1，均实测 ✅ |
 
 **仍然保留的要求**：真跑时工作区应干净（`git status`）。`--dry-run` 不受限。
 
 **顺带修的同源问题**：它内部 `spawnSync` 调 `run-all.mjs` 也走管道，
-受限权限下 11 个变异会全变 ERROR（等于工具不可用）。现改走
+受限权限下**所有**变异都会变 ERROR（等于工具不可用）。现改走
 `_dbpreview/lib-spawn-capture.mjs`，见下面那条。
 
 ---
@@ -46,13 +109,12 @@
 
 ---
 
-## 已发布的 npm 版本落后于仓库（1.0.1 不含项目改名）
+## ~~已发布的 npm 版本落后于仓库（1.0.1 不含项目改名）~~ —— 已随 1.1.0 解决
 
-**状态**：**暂不发布**（用户 2026-11-15 定）。留作记录，不是因为缺条件。
-**记录时间**：2026-11-15
-**优先级**：低（在「不发布」的前提下，它只影响外部使用者，不影响本机）
+**状态**：**已关闭**（2026-11-15 发了 `1.1.0`，工作区改名等能力已带出去）。
+留作记录，因为下一次发版仍要看「发之前先确认版本号没落后」这件事。
 
-### 现场
+### 现场（当时）
 
 registry 实测（2026-11-15）：
 

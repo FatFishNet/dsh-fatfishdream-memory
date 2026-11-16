@@ -2,7 +2,7 @@
 
 改动后按这个清单走一遍。标 ⚠️ 的是**必须重启 DSH** 才能可靠验证的项。
 
-## 0. 全量回归（32 个脚本进清单，一条命令跑完）
+## 0. 全量回归（34 个脚本进清单，一条命令跑完）
 
 改完代码先跑这个，全绿再往下走。
 
@@ -31,7 +31,8 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 
 **症状**：`workspace-write` / `read-only` 权限下跑 `run-all.mjs`，
 曾报出 **`TOTAL=32 FAIL=32`，每个都是 `exit=-1`** —— 而同一时刻用 pwsh
-`foreach` 循环跑，基线是 **32/32 全绿**。
+`foreach` 循环跑，基线是 **32/32 全绿**。（32 是当时的脚本数，现在是 34 ——
+这条记的是**现象与判据**，不是当前清单。）
 
 **根因**：整个脚本没有真的跑起来。受限沙箱**不允许程序开命名管道**，
 而 `spawnSync(..., { encoding:'utf8' })` 默认 `stdio: 'pipe'` → 每个子进程
@@ -42,11 +43,11 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 
 | 你看到 | 含义 |
 |---|---|
-| 32 个全是 `exit=-1` 且 `note` 空白 | 管道被拒，**环境问题**，不是代码问题 |
+| 全部脚本都是 `exit=-1` 且 `note` 空白 | 管道被拒，**环境问题**，不是代码问题 |
 | 少数几个 `FAIL`，附带了脚本自己的输出 | 真的失败 |
 
 **现在已修**：`run-all.mjs` 走 `_dbpreview/lib-spawn-capture.mjs` —— 先试管道，
-被拒就退回**临时文件捕获**。受限模式下会自动降级，`TOTAL=32 FAIL=0` 正常输出。
+被拒就退回**临时文件捕获**。受限模式下会自动降级，正常输出 `TOTAL=34 FAIL=0`。
 输出里若出现 `（输出经临时文件捕获：… 属正常降级）`，说明走的正是这条降级路径。
 
 **⚠️ 别再用 `r.status ?? -1` 把「没启动」归进失败计数。** 同理，
@@ -64,46 +65,52 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 
 | 脚本 | 断言数 | 查什么 |
 |---|---|---|
-| `verify-functions` | 112 + 133 个符号 | 两段：**A** 地图里每个「行号 → 函数名」是否对上；**C 死代码检测** 自动扫描缩进 ≤2 格的函数声明，统计「除定义行、除注释行」外的引用次数，为 0 即死代码（2026-11-15 加，当场查出 10 个，其中 `reportBudget` 已造成预算告警静默失效） |
-| `verify-map` | 117 处引用 | 地图 `L####` 是否越界/落空（**只判非空行，漂移不报**） |
-| `verify-map-content` | 38 | **地图准绳**：每处「`符号`（L####）」那一行必须含该符号；锚点由源码现算 |
-| `chk-map-lines` | 117 处 | 逐条打印每处 `L####` 的真实内容，人工核对「该行是不是说的那个函数」 |
+| `verify-functions` | 108 通过 + 124 个符号死代码扫描 | 两段：**A** 地图里每个「行号 → 函数名」是否对上（现算锚点，不平移旧行号）；**C 死代码检测** 自动扫描缩进 ≤2 格的函数声明，统计「除定义行、除注释行」外的引用次数，为 0 即死代码（2026-11-15 加，当场查出 10 个，其中 `reportBudget` 已造成预算告警静默失效） |
+| `verify-map` | 113 处引用 | 地图 `L####` 是否越界/落空（**只判非空行，漂移不报**） |
+| `verify-map-content` | 35（34 个锚点现算） | **地图准绳**：每处「`符号`（L####）」那一行必须含该符号；锚点由源码现算 |
+| `chk-map-lines` | 113 处 | 逐条打印每处 `L####` 的真实内容，人工核对「该行是不是说的那个函数」 |
 | `selfcheck-full` | 41 | 存储与注入总检（含 `schema v5`、`archive` 表与 FTS 一致性、**entries 已删 / confidence 已归一化 / search 不含 emotion**；流水为空时跳过中文检索段） |
 | `selfcheck-cap` | 13 | cap 分页逻辑（**自建 150 条种子**，不依赖真实流水） |
 | `selfcheck-isolation` | 18 | 检索按项目隔离（**自建 3 个项目种子**）；含 4 项「emotion 不在检索池」断言 |
 | `selfcheck-paging` | 15 | 流水页分页（**需 `DSH_BASE`**；流水 <130 条时整脚本跳过）。**2026-11-15 修**：原来断言「最多的项目 total === 100」，等于要求库里必有项目超过 100 条 —— 数据掉下来就红。现在先查真实条数再断言 `total === min(真实, 100)`，与数据量解耦 |
-| `selfcheck-marker-hardened` | 12（7 正则 + 5 源码级） | 标记正则行首锚点；**D 段断言解析失败必须记账**（`markerMatched`/`markerWritten`/`marker-unmatched`/`marker-dropped`/`empty-body`） |
-| `selfcheck-dom-strip` | 17 | 界面擦除正则（含「别吃掉说明文字」） |
-| `selfcheck-scrubber-loop` | 13 | **擦除器调度（第五代：静止窗口）**：连续变化只在安静后扫一次、一直不安静时有兜底上限、无变化不扫；另 7 条源码级断言守着「只认含标记的变化 / 扫完 takeRecords / 旧时间窗已移除」 |
+| `selfcheck-marker-hardened` | 32（正则 + 源码级 + 按轮计数） | 标记正则行首锚点；**D 段断言解析失败必须记账**（`markerMatched`/`markerWritten`/`marker-unmatched`/`marker-dropped`/`empty-body`）；**E 段**区分「写错标记」与「只是提到标记」；**F 段**写入失败提醒；**G 段** `writeFailStreak` 按轮计数（不是按条） |
+| `selfcheck-dom-strip` | 22 | 界面擦除正则（含「别吃掉说明文字」） |
+| `selfcheck-scrubber-loop` | **23** | **擦除器调度（第五代：静止窗口 + 第六代：完整标记同步快擦）**：连续变化只在安静后扫一次、一直不安静时有兜底上限、无变化不扫；**段 5 守第六代**（`hasCompleteMarker` 判据、`fastStrip` 只擦完整标记、接线在 `addedNodes`、未闭合仍走延迟、`characterData` 不抢跑、异常退回 `schedule`），共 10 条 |
 | `selfcheck-ts-sort` | 9（+真实库段） | 流水排序（锁定「三种按时间排的写法全错」；真实库段在空库时跳过） |
 | `selfcheck-migrate-order` | 9 | 迁移时全局按时间排序 |
 | `selfcheck-migrate-db` | 11 | 迁移时用 VACUUM INTO 复制主库（含「文本复制会损坏库」反证） |
 | `selfcheck-copytree-empty` | 14 | 空目录迁移不产生空壳 |
 | `selfcheck-topic-clean` | 37 | topic 不被 `-->` 污染（含白名单） |
 | `selfcheck-injection-wording` | 25 | 注入文案无自相矛盾 |
-| `verify-injection-consistency` | 48 | 注入里「写禁读通」表述一致（含 `archive?scope=` 入口、**情绪不在检索里**两句必须存在） |
+| `verify-injection-consistency` | 69 | 注入里「写禁读通」表述一致（含 `archive?scope=` 入口、**情绪不在检索里**两句必须存在）；2026-11-16 起守「每轮必记」且**反向断言不得出现任何判据措辞**；**段 10 守 `POLICY_TEMPLATE` 不夹带本机个人偏好**（模板不含「大肥鱼」、不含任何默认收尾语行 —— 用户私人收尾语曾被同步进模板） |
 | `selfcheck-emotion-guard` | 19 | 情绪录入的形态闸门（不误吞提示词） |
 | `selfcheck-emotion-lexicon` | 27 | **情绪词典复合词闸门**：麻烦≠烦 / 积累≠累 / 无语义≠无语，且不误伤「好烦」「累死了」 |
+| **`selfcheck-emotion-limiter`** | **10** | **后置限定词降权**（「成功了一半」不得判 strong）。不复刻逻辑 —— 从源码抽出 `analyzeEmotion` 函数体 + 注入闭包依赖，用 `new Function` **直接执行真实代码** |
 | `selfcheck-entry-by-id` | 13 | **按 id 取单条全文**（`/entry?id=&table=`）：正文一致、缺参数 400、未知表 400、不存在 404；旧 `/entry/<id>` 仍 401 |
+| **`selfcheck-log-alive`** | **23** | **流水通道存活检查**（需 `DSH_BASE`）：① 最近 30 分钟有没有成功写入过流水（抓「模型压根没写」这类解析层测试看不见的失效）；② 源码级断言**标记通道**整条链路（`MEM_MARKER_RE` → `appendLog` → `mem-写流水` diag）；③ **段 5 守 HTTP 写入通道**（路由注册、复用三套 `sanitize*`、置位 `wroteLog`、拒绝非 POST、`cwd` 不存在时拒绝）。`KNOWN_BAD_IDS` 精确豁免历史空 topic 条目。**断言按「通道切片」做，不在全文件里搜** —— 两个通道有同名 diag，全文件搜会互相顶替（2026-11-16 变异测试抓到过一个真实盲区） |
 | **`selfcheck-archive`** | **49（存储 36 + HTTP 13）** | **v4 原文归档**：存储层（写入/过滤/FTS 中文/分页/统计口径/不污染 `/search`）+ HTTP（`/archive` 200 形状、`role=x` 400、limit）。加 `--no-http` 可只跑存储层 |
-| **`selfcheck-breakdown`** | **18（存储）+ 5（HTTP）** | **v5 库体积分层**：`dbstat` 不列空闲页所以 `core+archive+system+free` 必须**精确等于** `page_count×page_size`；索引归属（`idx_archive_*`→archive、`idx_logs_*`→core）；缓存与失效；**反向断言 `stats()` 里没有 dbstat**。加 `--no-http` 只跑存储层 |
+| **`selfcheck-breakdown`** | **24（存储 18 + HTTP 6）** | **v5 库体积分层**：`dbstat` 不列空闲页所以 `core+archive+system+free` 必须**精确等于** `page_count×page_size`；索引归属（`idx_archive_*`→archive、`idx_logs_*`→core）；缓存与失效；**反向断言 `stats()` 里没有 dbstat**。加 `--no-http` 只跑存储层 |
 | **`selfcheck-scope-rename`** | **84** | **工作区改名 + 迁前/迁后数据量比对**（自建临时库）。①`snapshotScope` 口径（all/active/minId/maxId、archive 无 status 列）②正常改名三表九项校验全过 ③异常路径（目标占用/`__global__`/同名/空名/空工作区）④**事务回滚**：用触发器模拟第二张表失败，断言 rules 仍在旧 scope（没事务的话它会被改走）⑤`countScope` 的 `activeOnly` ⑥**`listScopesWithData` 必须包含「全是停用条目」的工作区**（`byScope` 会漏的那种），且默认排除 `__global__` ⑦**合并**：目标已有数据时默认拒绝并提示可勾选合并，`allowMerge:true` 后条数 = 源+目标、行集合取并集（独立临时库，20 项）⑧源码级：`resolveProjectKey` 返回 `scope`、写入用 scope 不用 key、死代码已删 |
-| `selfcheck-dir-name` | 10 | 目录名可移植（四种安装场景） |
+| `selfcheck-dir-name` | 11 | 目录名可移植（四种安装场景）。**2026-11-16 修恒真断言**：改为按 `/state` 的真实 `rootReason` 判断走了哪一级（`configured` / `pointer` / `discovered-on-X` / `first-install-X`），未知值判失败 |
 | **`selfcheck-search-tier`** | **12** | **检索按表分层**（自建种子）：段序固定 profile→rules→logs、小 limit 时三表各露一条、组内仍按 bm25、`lastLogTs()` 按 id 取最新；另 3 条源码级断言守着「整理提醒不再只看 `lastConsolidate`」 |
 | `verify-no-self-trigger` | — | 注入文本不会被自己匹配 |
 | `verify-final` | — | 数据总览 |
-| `verify-doc-links` | 40 处 | 文档路径引用无断链（防开源后失效） |
+| `verify-doc-links` | 51 处 | 文档路径引用无断链（防开源后失效） |
 | `verify-v3-schema` | 55 | **三层记忆 v3 + 原文归档 v4 + v5 收尾**：现有库迁移 / 空库全建 / 存储层读写检索 / `archive` 写入与回溯（用 `_dbbackup` 副本，不碰真实库） |
+| `test-marker-forms` | 30 | 标记七种写法自检（**改标记正则必须跑**：须保持 5 个捕获组，kind 组丢失会让所有带标记回复静默丢弃） |
 
-> **哪些不需要 DSH**（2026-11-15 实测：清空 `DSH_BASE` / `DSH_WEB_URL` 后全跑 33 个，
+> **哪些不需要 DSH**（2026-11-15 实测：清空 `DSH_BASE` / `DSH_WEB_URL` 后全跑，
 > 只有 3 个失败）：**硬依赖只有 `selfcheck-e2e-memory` / `selfcheck-entry-by-id` /
-> `selfcheck-paging` 这 3 个**。另外 3 个会读环境变量但缺省时自动跳过 HTTP 段、以 0 退出：
+> `selfcheck-paging` 这 3 个**。另外 4 个会读环境变量但缺省时自动跳过 HTTP 段、以 0 退出：
 > `selfcheck-archive`（存储层 36 项照跑，加 `--no-http` 效果相同）、
-> `selfcheck-breakdown`（存储层 18 项）、`verify-injection-consistency`（纯源码文本断言）。
+> `selfcheck-breakdown`（存储层 18 项）、`verify-injection-consistency`（纯源码文本断言）、
+> `selfcheck-log-alive`（2026-11-16 实测：打印「跳过：没有 DSH_BASE」并 exit 0）。
 > 其余全是纯静态或自建临时库，插件没跑也能验证。
+> ⚠️ `selfcheck-log-alive` 跳过后**等于没查流水** —— 它守的就是「通道还活着」，
+> 所以流水相关的排查必须在 `DSH_BASE` 有值的前提下跑，别把跳过当通过。
 >
 > **改注入文案后**额外跑 `show-injection.mjs`：它打印分段字节账 + token 估算
-> （2026-11-15 实测：4820 字节 / 约 1069 token；改文案前后各跑一次对比）。
+> （2026-11-16 实测：5470 字节 / 约 1209 token；改文案前后各跑一次对比）。
 
 ## 0.05 测试能力自检：这些测试真的管用吗？
 
@@ -148,14 +155,26 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 |---|---|
 ① **启动查 `.mutbak` 残留** | 有残留就**拒绝运行**并提示手动恢复 —— 残留说明生产文件可能还是被改坏的状态，此时跑会把坏文件当成「原文」备份，把问题固化 |
 ② **恢复后校验 sha256** | 恢复完重新读文件、与原文 hash 比对，不一致就**抛错并打印 `git checkout -- <文件>`** 。（此前注释声称「验证 hash 一致」，代码里却没有校验 —— 一句没兑现的承诺） |
-③ **`--dry-run`** | 只列出每个变异会改哪个文件、哪个片段、是否匹配，**不改任何文件**，exit 0 |
+③ **`--dry-run`** | 只列出每个变异会改哪个文件、哪个片段、是否匹配，**不改任何文件**；**全匹配 exit 0，有任何一个未匹配 exit 1**（2026-11-16 改：原来无条件 exit 0，于是锚点失配在自动检查里完全看不见） |
 
 **仍然要求：`git status` 干净时才真跑。** 当前工作区若有大量未提交改动，
 中断后改坏的内容会和未提交改动混在一起分不清（⑩ §三.⑦ 的教训）。
 `--dry-run` 可以随时跑，不受这条限制。
 
-**当前基线（2026-11-15）：11 个变异，KILLED 11 / SURVIVED 0**；
-`--dry-run` 显示 11/11 变异点已匹配。
+**当前基线（2026-11-16）：34 个变异，KILLED 34 / SURVIVED 0 / SKIP 0 / ERROR 0**，
+杀伤率 100%；`--dry-run` 显示 **34/34 变异点已匹配**。
+
+> 2026-11-16 新增第 34 条 `policy-template-private-closing`：往 `POLICY_TEMPLATE`
+> 里塞回一条默认收尾语，守 `verify-injection-consistency` 段 10 的两条断言
+> （模板不含「大肥鱼」/ 模板不含任何默认收尾语行）。
+> 全量真跑已验（34/34 KILLED），生产文件 sha256 与跑前备份逐字节一致。
+
+> ⚠️ **`--dry-run` 必须 N/N 全匹配，有任何一个 ⚠️ 就等于那条防线是空的。**
+> 锚点失配时真跑是 **SKIP**，而 SKIP 不计入 KILLED —— 表面上「没红」，
+> 实际是那个变异根本没注入进去。2026-11-16 实际踩过：`log-alive-write-broken`
+> 的锚点还写着 `appendLog(projectKey, cleaned, ...)`，而「空正文降级写入」
+> 那次改动已把实参改名为 `finalText` → 该变异静默失配，流水写入链路无人守。
+> **判据**：改过 `index.js` 之后先跑 `--dry-run`，数字必须与变异总数一致。
 
 首轮跑出过一个真盲区：`scrubber-guard` 存活。原因是断言写成
 `/isSafeToCollapse\s*\(\s*el\s*\)/`，而函数定义 `function isSafeToCollapse(el)`
@@ -176,7 +195,7 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 `NAMED` | **只在按名字定位的断言里出现 → 等于没测** |
 `NONE` | 完全没出现 |
 
-**当前基线：153 个函数，CALLED 52（34%）/ NAMED 46（30%）/ NONE 55（36%）。**
+**当前基线（2026-11-16）：154 个函数，CALLED 58（38%）/ NAMED 48（31%）/ NONE 48（31%）。**
 
 `NAMED` 这一列最有价值：它暴露的是「看起来有测试、实际没有」的假覆盖。
 
@@ -467,7 +486,7 @@ case "html": return r.omitHtml ? null : e.value;   // omitHtml 默认 false
 # 本机 node 不在 PATH，用 DSH 自带运行时（路径按你的安装位置替换）
 $node = "<DSH 安装目录>\dsh\node_modules\@deepseek-ai\dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
 & $node _dbpreview\selfcheck-dom-strip.mjs        # 17 项
-& $node _dbpreview\selfcheck-scrubber-loop.mjs    # 13 项
+& $node _dbpreview\selfcheck-scrubber-loop.mjs    # 23 项
 ```
 
 两条都要 **0 失败**。它们覆盖了实测踩过的两个坑，改正则前先看这两条：

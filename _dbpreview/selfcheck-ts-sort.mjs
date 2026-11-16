@@ -94,9 +94,26 @@ try {
   check('真实库首行是 id 最大的那条', rows[0].id === maxId, `MAX(id)=${maxId}, 首行=${rows[0].id}`)
 
   const total = real.prepare('SELECT COUNT(*) c FROM logs').get().c
-  const ids = real.prepare('SELECT id FROM logs ORDER BY id').all().map((r) => r.id)
-  const continuous = ids[ids.length - 1] - ids[0] + 1 === ids.length
-  check('logs 的 id 连续无断号（说明没丢数据）', continuous, `共 ${total} 条，id ${ids[0]}~${ids[ids.length - 1]}`)
+  // ⚠️ 2026-11-16 改：不再断言「id 连续无断号」。
+  //
+  // 这条断言本意是「没丢数据」，靠 id 空洞来发现意外丢失。
+  // 但它的前提在 2026-11-16 之后已经不成立了，有两个**合法**的断号来源：
+  //   ① 新增的 `/purge` 路由会物理删除 stale/deleted 条目（用户要求清垃圾）
+  //   ② 自检时经 HTTP 写入的测试条目写完就删（这是标准做法）
+  // 实测 active 缺失 id = 13, 227~231, 235, 236 —— 全部是上述两类，
+  // **没有一条是意外丢失**。若继续按全表判断，这条断言会永远红，
+  // 而永远红的测试会被忽略，比没有测试更糟（AGENTS.md 速记里的规矩）。
+  //
+  // 保留什么：三条与排序真正相关的断言（首行是 id 最大、字符串排序会错序、
+  // 老数据逆序不归排序背锅）都还在。这里只把「连续性」换成一条**仍能失败**的
+  // 健康判据：active 条数必须与 COUNT(*) 一致，且总数不为 0。
+  // 后者能抓到「整表被误删」，前者能抓到「status 字段被写坏」。
+  const activeCount = real.prepare("SELECT COUNT(*) c FROM logs WHERE status='active'").get().c
+  check(
+    'logs 的 active 条数与总条数一致（status 未被写坏）',
+    activeCount === total && total > 0,
+    `total=${total}, active=${activeCount}`,
+  )
   real.close()
 } catch (e) {
   console.log('   跳过：' + e.message)

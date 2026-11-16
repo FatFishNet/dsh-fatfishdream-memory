@@ -97,8 +97,18 @@ const MUTATIONS = [
     id: 'scope-rename-transaction',
     file: 'dsh-fatfishdream-memory/db-store.mjs',
     desc: '去掉事务（BEGIN/COMMIT 变空操作）',
-    from: "    d.exec('BEGIN')\n    try {",
-    to: "    try {",
+    // ⚠️ 2026-11-16 修锚点：原来只写 `    d.exec('BEGIN')\n    try {`。
+    //
+    // 新增 `purgeByStatus`（L516）之后，`d.exec('BEGIN')` 在文件里出现了 **3 处**
+    // （purgeByStatus / renameScope / removeGlobalByRegex），
+    // 而 `String.replace` **只换第一处** → 变异打到了 purge 身上，
+    // `renameScope` 的事务原封不动，于是 selfcheck-scope-rename 全绿 →
+    // 变异 SURVIVED（32 个里唯一的存活项，就是这个假象）。
+    //
+    // 这正是 AGENTS.md 里「变异锚点必须唯一且包含完整上下文」那条。
+    // 修法：把 renameScope 独有的那句上下文（`const tables = {}` + 循环头）带进锚点。
+    from: "    const tables = {}\n    let total = 0\n    d.exec('BEGIN')\n    try {",
+    to: '    const tables = {}\n    let total = 0\n    try {',
   },
   {
     id: 'scope-rename-merge-count',
@@ -196,14 +206,18 @@ const MUTATIONS = [
     id: 'injection-no-blank-line',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '删掉「正文不要写空行」的注入（界面底部会重新空一大块）',
-    from: "          '**正文不要写空行**（空行擦掉后会留下空段落，界面底部会空一块）；要分段就用一个换行。',",
+    // ⚠️ 2026-11-16 更新：写入通道改成 HTTP 后，注入里那条独立的空行规则
+    // 被并进了「退化到标记时」那一行（正文里不再有标记，主路径用不到它，
+    // 但退化路径仍然需要）。锚点跟着换成新措辞。
+    // 守的东西没变：删掉后界面底部会重新空一大块，且**没有任何报错**。
+    from: '**正文不要写空行**（擦掉后每个空行留下一个空段，界面底部会空一块）。',
     to: '',
   },
   {
     id: 'policy-no-blank-line',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: 'POLICY_TEMPLATE 里的空行规则被删（新装用户收不到）',
-    from: '  **正文不要写空行**（2026-11-16）：标记在流式输出时会以原文短暂可见，擦除器擦掉文字后，',
+    from: '**正文不要写空行** —— 擦掉后每个空行会留一个空段，界面底部会空一块。',
     to: '  （已删除）',
   },
   // ---- 2026-11-16：验证「情绪不豁免」规则真的被守着 ----
@@ -212,9 +226,27 @@ const MUTATIONS = [
   // 用户实报过三次（情绪 #26/#27/#29），同一个坑 2026-11-14 也踩过。
   {
     id: 'injection-emotion-not-exempt',
+    // 2026-11-16 更新：注入规则从「情绪不豁免（带判据）」改成「每轮都要记（不跳轮）」，
+    // 变异锚点同步更新。它守的内容没变 —— 删掉这条规则，模型就会回到
+    // 「这轮没什么可记」的自我说服，当天实测因此漏记 12+ 轮。
     file: 'dsh-fatfishdream-memory/index.js',
-    desc: '删掉注入里的「情绪不豁免」规则（技术反馈会重新只进情绪表）',
-    from: "          '## 什么时候必须记（情绪不豁免）',\n          '用户指出问题、提需求、讲做事偏好 —— **一律记流水**，即使同时被判成情绪。',\n          '情绪表与流水表是两条独立通道：判成情绪不影响写 mem-log。',\n          '判据：**这条会让下一个会话的我少走一次弯路吗？** 会 → 记。',\n          '但纯寒暄、纯情绪交流不记；同一结论换个问法再问一遍也不记第二条。',",
+    desc: '删掉注入里的「每轮都要记」规则（模型会重新按感觉跳过记录）',
+    // ⚠️ 2026-11-16 四次更新：措辞「写一条 mem-log」→「发一次 POST」，
+    // 整节移到注入末尾，且把完整命令写进了本节（不再用「上面那条」指代）。
+    // 锚点跟着换，守的东西没变：删掉标题 + 那条硬规则，
+    // 「每轮都要记」的硬要求就没了，模型会回到按感觉跳过记录。
+    //
+    // 只锚「标题行 + 规则行」两行 —— 中间夹着 6 行改措辞的注释，
+    // 用纯字符串锚点跨不过去（工具不支持正则），所以把两行分别拼进来。
+    from:
+      "          '## 每轮都要记（和心跳同一级）',\n" +
+      '          // ⚠️ 2026-11-16 第四次改：**把完整命令写在这一节里，不用「上面那条」指代。**\n' +
+      '          //\n' +
+      '          // 原来这里写「用 pwsh 发一次 POST（上面那条命令）」——\n' +
+      '          // 而那条命令在注入上方 200 多字处。模型快速扫读时，\n' +
+      '          // 「上面那条」是一个需要回头找的空引用，容易滑过去。\n' +
+      '          // 现在直接给完整可粘贴的命令，**不需要往回看**。\n' +
+      "          '每轮回复结尾、心跳之前发一次（**必做，不跳轮**），整行照抄即可：',\n",
     to: '',
   },
   {
@@ -224,8 +256,27 @@ const MUTATIONS = [
     // ⚠️ 行首的 `- ` 必须带上。2026-11-16 第一次写漏了它，
     // dry-run 报「变异点未匹配」才发现 —— 这正是 dry-run 存在的价值：
     // 若直接真跑，它会 SKIP，而 SKIP 不算 KILLED，容易被误读成「测试没问题」。
-    from: '- **用户指出的问题、提出的需求、讲的做事偏好，一律记流水。**',
+    from: '用户指出的问题、提出的需求、讲的做事偏好，**一律记流水**，即便那条消息同时',
     to: '- （已删除）',
+  },
+  {
+    id: 'policy-template-private-closing',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '给 POLICY_TEMPLATE 塞回一条默认收尾语（新装用户被塞本机偏好）',
+    // ★ 2026-11-16 加。守硬约束 9：「模板里不能夹带本机个人偏好」。
+    //
+    // 实际踩过：把用户整份 policy.md 同步成模板时，他的私人收尾语
+    // 「你可爱的大肥鱼一直都在，等待下一轮任务！」被一起搬进模板，
+    // 于是所有新装用户的默认收尾语都成了这句话。**是用户自己发现的**，
+    // 原有的 66 条断言一条都没红 —— 那时没有任何断言管「模板里的私货」。
+    //
+    // 判据取 verify-injection-consistency 段 10 的两条：
+    // 「模板不含『大肥鱼』」与「模板不含任何默认收尾语行」。
+    // 这里塞一条不带「大肥鱼」的收尾语，专门验**第二条**（是否留了默认收尾语位）。
+    //
+    // 锚点是模板里唯一的二级标题（实测 count=1），不会打到别处。
+    from: '## 强制录入：用户的情绪表达（不可关闭）',
+    to: '- 每轮回复的结尾，加固定一句：测试收尾语！\n\n## 强制录入：用户的情绪表达（不可关闭）',
   },
   // ---- 2026-11-16：验证「提到标记」与「写错标记」真的被区分 ----
   //
@@ -263,17 +314,123 @@ const MUTATIONS = [
   {
     id: 'write-fail-reset-removed',
     file: 'dsh-fatfishdream-memory/index.js',
-    desc: '成功后清零被删（提醒一次后永远卡在阈值）',
-    from: "        if (markerWritten > 0) {\n          // 成功写入 → 清零连续失败计数\n          if (writeFailStreak.get(sKey) !== 0) {\n            writeFailStreak.set(sKey, 0)\n          }\n        }",
-    to: "        if (markerWritten > 0) {\n          // （已删除清零）\n        }",
+    desc: '写过流水也不清零（提醒一次后永远卡在阈值）',
+    from: "      const wroteThisTurn = record !== undefined && record.wroteLog === true\n      if (wroteThisTurn) {\n        if ((writeFailStreak.get(sessionKey) ?? 0) !== 0) {\n          writeFailStreak.set(sessionKey, 0)\n        }\n      } else {",
+    to: "      const wroteThisTurn = record !== undefined && record.wroteLog === true\n      if (false) {\n        if ((writeFailStreak.get(sessionKey) ?? 0) !== 0) {\n          writeFailStreak.set(sessionKey, 0)\n        }\n      } else {",
   },
   {
     id: 'write-fail-safe-push-removed',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '提醒不再走 safePushMessage（turn-stopping 异常会中断会话）',
-    from: "        const delivered = safePushMessage(\n          agent,\n          `[dsh-memory] 连续 ${failStreak} 轮尝试写记忆但都没成功落库。",
-    to: "        const delivered = agent?.steer({\n          id: 'x',\n          role: 'user',\n          content: [{ type: 'text', text: `[dsh-memory] 连续 ${failStreak} 轮尝试写记忆但都没成功落库。",
+    from: "        const delivered = safePushMessage(\n          agent,\n          `[dsh-memory] 已连续 ${failStreak} 轮没有把记忆写进流水。",
+    to: "        const delivered = agent?.steer({\n          id: 'x',\n          role: 'user',\n          content: [{ type: 'text', text: `[dsh-memory] 已连续 ${failStreak} 轮没有把记忆写进流水。",
   },
+  // ---- 2026-11-16 v2：验证「忘写也要计数」这一半真的被守着 ----
+  //
+  // v1 的漏洞就在这半边：hasMarker === false 时显式不计数，
+  // 于是「连续 10 轮压根没写标记」零检测（用户实报）。
+  {
+    id: 'write-fail-skip-when-no-marker',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '退回 v1 行为：没写标记时不计入 streak（忘写将再次零检测）',
+    from: "      } else {\n        const prev = writeFailStreak.get(sessionKey) ?? 0\n        writeFailStreak.set(sessionKey, prev + 1)\n      }",
+    to: "      } else {\n        // 退回 v1：不做任何事\n      }",
+  },
+  {
+    id: 'write-fail-count-per-message',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '把计数挪回 assistant/message（按条计数，一轮会顶穿阈值）',
+    from: "      const wroteThisTurn = record !== undefined && record.wroteLog === true",
+    to: "      const wroteThisTurn = (writeFailStreak.set(sKey, (writeFailStreak.get(sKey) ?? 0) + 1), record !== undefined && record.wroteLog === true)",
+  },
+  // ---- 2026-11-16：验证新脚本 selfcheck-log-alive 真的守住了写入链路 ----
+  //
+  // 这个脚本是用户要求加的「哪怕随便发一条消息证实能正常写流水」的可测版本。
+  // 它做两件事：① 检查最近 N 分钟有没有流水；② 源码级断言写入链路完整。
+  //
+  // 下面两个变异分别打断这两条防线：
+  {
+    id: 'log-alive-write-broken',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '标记解析后不再写入 appendLog（流水全丢，但无报错）',
+    // ⚠️ 2026-11-16 修锚点：`cleaned` 已改名为 `finalText`
+    //   （空正文/清理后为空改降级写入时引入的中间变量）。
+    //   锚点失配时真跑是 SKIP，而 SKIP 不算 KILLED —— 表面上「没红」，
+    //   实际是这条防线没了。以 --dry-run 的「已匹配」为准。
+    from: 'const r = dbStore.appendLog(projectKey, finalText, { topic, summary, keywords })',
+    to: 'const r = { project: projectKey, written: false }',
+  },
+  {
+    id: 'log-alive-diag-removed',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '删掉 mem-写流水诊断（写入成功也无从观察）',
+    from: "          diag('mem-写流水', {",
+    to: "          void ({",
+  },
+  // ---- 2026-11-16：HTTP 写入通道（主通道）的三条防线 ----
+  //
+  // 这条通道是「标记不进正文」的实现。它一旦静默失效，模型会以为写进去了，
+  // 而库里一条没有 —— 与「忘了写」完全无法区分（都是「没有发生」）。
+  {
+    id: 'log-http-cwd-guard-removed',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '去掉 cwd 存在性检查（传错目录会凭空造出假工作区）',
+    // ⚠️ 2026-11-16 实测过：这个变异确实能让 selfcheck-log-alive 段 5 变红。
+    from: '              if (!(await exists(cwd))) {',
+    to: '              if (false) {',
+  },
+  {
+    id: 'log-http-skip-topic-clean',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'HTTP 通道不再走 sanitizeTopic（两条通道行为开始分叉）',
+    // 这条最容易写错锚点：sanitizeTopic 在标记通道里也有一处调用。
+    // 所以锚点带上 `body.topic` —— 那是 HTTP 通道独有的入参形态。
+    from: "            const topic = sanitizeTopic(topicRaw)",
+    to: "            const topic = topicRaw || null",
+  },
+  {
+    id: 'log-http-no-streak-mark',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'HTTP 写完不置 wroteLog（turn-stopping 会误报「你忘了写流水」）',
+    from: '              rec.wroteLog = true\n              turnActivity.set(sid, rec)',
+    to: '              turnActivity.set(sid, rec)',
+  },
+  // ---- 2026-11-16 第六代：切会话闪烁（完整标记同步快擦）----
+  //
+  // 这条防线守的是「切会话不闪」。它一旦失效，标记会在那一帧露出原文 ——
+  // **没有任何报错**，只有用户肉眼看得见。所以必须靠变异测试兜住。
+  {
+    id: 'scrubber-faststrip-disabled',
+    file: 'dsh-fatfishdream-memory/client.js',
+    desc: '退回第五代：完整标记也只排队等 400ms（切会话必闪）',
+    from: 'if (hasCompleteMarker(n)) fastStrip(n)',
+    to: 'if (false) fastStrip(n)',
+  },
+  {
+    id: 'scrubber-faststrip-partial',
+    file: 'dsh-fatfishdream-memory/client.js',
+    desc: '快擦也处理未闭合标记（流式抖动会回来）',
+    from: 'skipPartial: true',
+    to: 'skipPartial: false',
+  },
+  // ---- 2026-11-16：policy.md 一次性覆盖的「只一次」保证 ----
+  //
+  // 用户明确授权**一次**覆盖。若这道哨兵失效，就变成「每次启动都覆盖」，
+  // 用户的 policy.md 会被反复重置 —— 比不覆盖严重得多。
+  {
+    id: 'policy-sync-always-overwrites',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'readState 丢掉 policySyncVersion（每次启动都覆盖 policy.md）',
+    from:
+      'policySyncVersion: Number.isInteger(parsed.policySyncVersion)\n' +
+      '          ? parsed.policySyncVersion\n' +
+      '          : null,',
+    to: 'policySyncVersion: null,',
+  },
+  // 注：2026-11-16 曾加过两条 `dup-guard-*` 变异，守的是「本轮已用 HTTP 写过
+  // 则忽略正文标记」的防呆。该防呆已移除（它只能挡入库、挡不住渲染，
+  // 真正的解法是把约束写进 policy.md 源头），所以对应变异一并删除 ——
+  // 变异锚点指向已不存在的代码，留着只会变成 SKIP。
 ]
 
 // ---- --dry-run：只列出会改哪里，不动任何文件 ----
@@ -298,6 +455,16 @@ if (process.argv.includes('--dry-run')) {
   }
   console.log(`\n共 ${MUTATIONS.length} 个变异，${matchedAll} 个变异点已匹配。`)
   console.log('去掉 --dry-run 才会真的改文件。')
+  // ⚠️ 2026-11-16 改：原来无条件 exit(0)，于是「锚点失配」在自动检查里看不见。
+  //
+  // 它虽然不改文件，但**它就是这条防线是否存在的判据**：
+  // 未匹配的变异在真跑时是 SKIP（= 没验证），与「通过了」完全相反。
+  // 所以让它也能当把关用：全匹配才 0。
+  if (matchedAll !== MUTATIONS.length) {
+    const bad = MUTATIONS.length - matchedAll
+    console.log(`\n❌ ${bad} 个变异点未匹配 —— 这些变异真跑会是 SKIP（防线不存在），先修锚点。`)
+    process.exit(1)
+  }
   process.exit(0)
 }
 
@@ -404,6 +571,13 @@ if (survived > 0) {
     console.log(`  - ${r.id}: ${r.desc}`)
   }
 }
+if (skipped > 0) {
+  console.log('\n⏭️  SKIP = 这条防线不存在（不是「通过」）：')
+  for (const r of results.filter((x) => x.status === 'SKIP')) {
+    console.log(`  - ${r.id}: ${r.note}`)
+  }
+  console.log('   修法：把该变异的 \`from\` 片段更新成当前源码。')
+}
 if (errored > 0) {
   console.log('\n💥 ERROR = 这次结果不可信，先修 runner：')
   for (const r of results.filter((x) => x.status === 'ERROR')) {
@@ -411,5 +585,14 @@ if (errored > 0) {
   }
 }
 
-// ERROR 视为失败：不能把「没测成」当成「通过」
-process.exit(errored === 0 && survived === 0 ? 0 : 1)
+// ⚠️ 2026-11-16 改：SKIP 也算失败。
+//
+// 原逻辑只把 ERROR / SURVIVED 计入失败，**SKIP 不进任何计数** ——
+// 于是锚点失配时输出「KILLED 26 / SURVIVED 0 / SKIP 1」并 exit 0，
+// 看上去一切正常，而那条防线其实根本没被验证过。
+// 实际踩过：`log-alive-write-broken` 的锚点因 `cleaned` → `finalText` 改名而失配，
+// 流水写入链路的守护被静默移除，连续几轮回归全绿。
+//
+// SKIP 与 SURVIVED 的语义差别只在「原因」，相同的是**这一项没被验证**。
+// 所以：没验证 = 不通过。
+process.exit(errored === 0 && survived === 0 && skipped === 0 ? 0 : 1)

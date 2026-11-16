@@ -73,7 +73,7 @@
 | `profile` | `id` | `topic, text, status, review, updated` | 用户（GUI） | ✅ 每轮 | ✅ |
 | `rules` | `id` | `scope, kind, topic, text, status, review` | 用户（GUI） | ✅ 按项目 | ✅ |
 | `emotion` | `id` | `cls, quote, evidence, confidence, score, text` | 插件自动 | ❌ | ❌ |
-| `logs` | `id` | `scope, topic, summary, keywords, text` | 模型（标记） | ❌ | ✅ |
+| `logs` | `id` | `scope, topic, summary, keywords, text` | 模型（HTTP 接口，兜底为标记） | ❌ | ✅ |
 | `archive` | `id` | `ts, scope, role, text, session_id, turn, step` | 插件自动 | ❌ | 仅 `/archive` |
 
 共同的约定：

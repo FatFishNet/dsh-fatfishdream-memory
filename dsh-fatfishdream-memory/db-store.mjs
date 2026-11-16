@@ -15,6 +15,7 @@ import {
   openMemoryDb,
   syncFts,
   removeFts,
+  FTS_TABLE,
   buildMatchQuery,
   SCHEMA_VERSION,
 } from './db-schema.mjs'
@@ -485,6 +486,82 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
 
   function softDelete(table, id) {
     return setStatus(table, id, 'deleted')
+  }
+
+  /**
+   * 物理删除某表里指定状态的条目（2026-11-16 新增）。
+   *
+   * ## 为什么要它
+   *
+   * 软删除（`status='deleted'`）只是让条目不再注入、不再检索，**行还在库里**。
+   * 实测 `rules` 攒了 125 条 deleted + 5 条 stale，占该表 136 条里的 130 条 ——
+   * 库体积一直背着这些死数据。用户要求彻底清掉。
+   *
+   * ## 为什么不能直接 `DELETE FROM rules WHERE status='deleted'`
+   *
+   * 这张表挂了 FTS5 外部内容索引（`rules_fts`）。**只删主表不同步 FTS** 会留下
+   * 孤立索引行：搜「已删内容」仍能命中，点进去 404 —— 而且是静默的。
+   * `removeFts()` 的第三个参数必须是**完整的那一行**：FTS5 的 'delete' 指令
+   * 要靠原值反查索引项，传空对象会删不掉（这就是它默认 row=null 的坑）。
+   * 所以这里先取出整行，再逐条 removeFts + DELETE。
+   *
+   * ## 为什么整体包在事务里
+   *
+   * 逐条删 130 行，中途失败会留下「主表删了、FTS 没删」的半状态。
+   *
+   * @param {string} table - 'rules' | 'logs'（只有这两张有 status 列）
+   * @param {string[]} statuses - 要物理删除的状态，如 ['deleted','stale']
+   * @param {{dryRun?: boolean}} opts - dryRun 只报数不动库
+   */
+  function purgeByStatus(table, statuses, opts = {}) {
+    if (table !== 'rules' && table !== 'logs') {
+      throw new Error(`只支持 rules / logs（有 status 列的表），收到：${table}`)
+    }
+    const list = Array.isArray(statuses) ? statuses.filter((s) => typeof s === 'string') : []
+    if (list.length === 0) throw new Error('statuses 不能为空')
+    const allowed = new Set(['active', 'stale', 'deleted'])
+    for (const s of list) {
+      if (!allowed.has(s)) throw new Error(`不支持的状态：${s}`)
+    }
+    // 硬护栏：绝不接受 active —— 那是「所有能用的记忆」，一次手滑就清空全部。
+    // 这个函数的存在意义就是清垃圾，不是清数据。
+    if (list.includes('active')) {
+      throw new Error('拒绝删除 active 条目：本函数只用于清理 stale / deleted 垃圾')
+    }
+
+    const d = open()
+    const ph = list.map(() => '?').join(',')
+    const rows = d.prepare(`SELECT * FROM ${table} WHERE status IN (${ph})`).all(...list)
+    if (opts.dryRun) {
+      const byStatus = {}
+      for (const r of rows) byStatus[r.status] = (byStatus[r.status] ?? 0) + 1
+      return { ok: true, dryRun: true, table, wouldDelete: rows.length, byStatus }
+    }
+    if (rows.length === 0) return { ok: true, table, deleted: 0, byStatus: {} }
+
+    const ftsTable = FTS_TABLE[table]
+    let deleted = 0
+    d.exec('BEGIN')
+    try {
+      for (const row of rows) {
+        if (ftsTable) removeFts(d, table, row.id, row)
+        d.prepare(`DELETE FROM ${table} WHERE id=?`).run(row.id)
+        deleted += 1
+      }
+      d.exec('COMMIT')
+    } catch (error) {
+      try {
+        d.exec('ROLLBACK')
+      } catch {
+        /* 回滚失败就让它抛出去，别掩盖原始错误 */
+      }
+      throw error
+    }
+    const byStatus = {}
+    for (const r of rows) byStatus[r.status] = (byStatus[r.status] ?? 0) + 1
+    // 主表删完立刻让缓存失效，否则 stats-breakdown 还会返回旧数字
+    invalidateBreakdown()
+    return { ok: true, table, deleted, byStatus }
   }
 
   /**
@@ -1183,6 +1260,46 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     breakdownCache = { at: 0, value: null }
   }
 
+  /**
+   * VACUUM：把空闲页真正还给磁盘（2026-11-16 新增）。
+   *
+   * ## 为什么删了行体积不变
+   *
+   * SQLite 的 DELETE 只把页标记为空闲，文件不会缩小 —— 空闲页留在
+   * `freelist_count` 里等下次复用。实测 purge 130 条后 `page_count` 反而
+   * 从 1709 涨到 1712、freelist 从 1 涨到 8，**`db.size` 一点没变**。
+   * 只有 VACUUM 才真回收（与 v5 删 entries 表时同一个教训，见本文件
+   * `statsBreakdown` 里 `free` 那段的注释）。
+   *
+   * ## 风险与约束
+   *
+   * - VACUUM 会**重写整个库**，运行期间需要约 2 倍磁盘空间做临时副本
+   * - 不能在事务里执行（SQLite 限制），所以这里不包 BEGIN
+   * - 期间不能有其他写操作；`busy_timeout=5000` 已经设了，会短暂等待
+   * - 完成后必须清缓存，否则 breakdown 仍返回旧的 free 数字
+   */
+  function vacuum() {
+    const d = open()
+    const before = {
+      pageCount: d.prepare('PRAGMA page_count').get().page_count,
+      freelist: d.prepare('PRAGMA freelist_count').get().freelist_count,
+      bytes: statSync(dbPath).size,
+    }
+    d.exec('VACUUM')
+    const after = {
+      pageCount: d.prepare('PRAGMA page_count').get().page_count,
+      freelist: d.prepare('PRAGMA freelist_count').get().freelist_count,
+      bytes: statSync(dbPath).size,
+    }
+    invalidateBreakdown()
+    return {
+      ok: true,
+      before,
+      after,
+      reclaimedBytes: before.bytes - after.bytes,
+    }
+  }
+
   /** GUI 用：各表统计 */
   function stats() {
     const d = open()
@@ -1361,6 +1478,10 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     appendLog, appendFact, appendProjectNote, recordEmotion, createEntry, appendArchive,
     // 维护
     setReview, softDelete, setStatus, updateText, upgradeToGlobal, removeGlobalByRegex, setTopic,
+    // 物理清理（2026-11-16）：软删除只是标记，这个才真删行 + 同步 FTS + 事务保护
+    purgeByStatus,
+    // 删完必须 VACUUM 才真省空间（DELETE 只把页标为空闲）
+    vacuum,
     // 工作区改名（scope 迁移，2026-11-15）：snapshotScope 是迁前/迁后共用的数据量采样
     renameScope, countScope, snapshotScope, listScopesWithData, SCOPE_TABLES,
     // 检索

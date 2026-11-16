@@ -634,37 +634,15 @@ const POLICY_TEMPLATE = `# 记忆规则
 
 每轮遵守的行为约定。这一节会被注入所有项目的每一轮上下文。
 
-- （可选）收尾语：想让每轮回复以固定的一句结尾，就在这里加一条。例如：
-  每轮回复的结尾固定加一句「<你想要的话>」，放在最后一行，不解释、不变形。
-  作用是用一句话确认本轮执行完整。不需要就删掉这条。
-
-- 写记忆只能用 \`mem-log\` 标记（写在回复正文里）；不要用 write / edit / pwsh 碰 \`memory.db\`。
-  记忆根目录在工作区之外，直写会被文件沙箱拒绝或要求提权；而碰 memory.db 会**损坏数据库**。
-  项目规则与用户画像由用户在 GUI 手工维护，模型不要写（那两段每轮注入、有预算）。
-  **没有开闭配对**：一条标记只写一次收尾符，且必须单独起一行。
-  读：注入里只有索引（主题 + 条数），没有正文。查法、必查场景、scope 与端口规则
-  见每轮注入的「记忆使用说明」（代码内置，改本文件不会影响它）。
-  不要用 grep / read / pwsh 直连 \`memory.db\`：它是 SQLite 二进制，读出来是乱码。
-
-- **流水必须带 topic 和 summary**（2026-11-13 / 2026-11-14）：
-  标记行写成 \`<!--mem-log topic=<分类> summary=<≤35 字> keywords=<词A｜词B>\`，再换行写正文。
-  **参数顺序固定** topic → summary → keywords，不能分行、不能换顺序（正则按此顺序解析）。
-  **正文不要写空行**（2026-11-16）：标记在流式输出时会以原文短暂可见，擦除器擦掉文字后，
-  每个空行会留下一个空段落、仍占行高 —— 表现为「回复底部空出一大块」。要分段就用一个换行。
-  - topic：13 个分类之一（下方清单）。不带 topic 的流水不会进「记忆索引」，等于对以后的自己隐形。
-  - summary：一句话说清这条讲了什么，≤35 字。不写摘要的流水，检索时只能靠正文前 80 字截断兜底，常截在句子中间。
-  - keywords：检索用的技术名词，用全角竖线 \`｜\` 分隔（**不要用逗号**，逗号会和正文混淆）；
-    抽不出名词就写 \`无\`，不要硬凑（硬凑只会污染检索）。
-  分类清单：开发日志 / 技术讨论 / 构建/编译 / 注入/预算 / 插件/装载 /
-  路径/沙箱 / 格式/编码 / 文档/行号 / 情绪判据 / 用户画像 / 数据清理 / GUI/界面 / Git。
-  开发日志 = 做了某事、有过程与验证；技术讨论 = 还在权衡、没落成改动。
-
-- **模型只写流水，不写规则与画像。**
-  项目规则（rules 表）与用户画像（profile 表）一律由用户在 GUI 手工维护 ——
-  这两段每轮注入、有字节预算，之前让模型自动写，很快就把预算顶满，
-  把真正的约束挤掉（2026-11-13 实测：项目段用到 92.6%）。
-  所以模型这边只剩一条通道：用 mem-log 写**流水**（logs 表，不注入、按需检索）。
-  有值得固化成规则的想法时，在回复正文里说明，由用户决定要不要记。
+- **写记忆只能用 HTTP 接口**：\`POST $env:DSH_WEB_URL/api/dsh-memory/log\`
+  （参数见本文件末尾「流水必须带 topic 和 summary」）。
+  **不要往回复正文里写任何标记** —— 标记一进正文，界面就会闪一下。
+  绝不要用 \`write\` / \`edit\` / pwsh 去碰 \`memory.db\` ——
+  那不是被拒绝，而是**损坏数据库**。
+  **项目规则与用户画像由用户在 GUI 手工维护，模型不要写**（标记已移除）。
+- **查记忆**：用 pwsh 请求本机接口，\`scope\` 必带（不传会返回 400）；
+  先加 \`&summary=1\` 看摘要，确认相关再取全文（按 id 取单条：\`entry?id=<id>&table=<table>\`，table 用摘要里的字段）。
+  完整查法（必查场景、端口、跨项目、不去重）见本文件末尾「怎么查记忆」。
 
 ## 强制录入：用户的情绪表达（不可关闭）
 - 用户在对话里表达情绪时，插件自动把原话写入 emotion 表，不依赖模型判断。
@@ -677,50 +655,209 @@ const POLICY_TEMPLATE = `# 记忆规则
   它是「个人兴趣记录」，不是可检索的知识；模型搜不到情绪不等于没记过。
 - 自动推断可能出错，不应用作对用户性格的判断依据。
 
-## 存到哪
-四张业务表 + 一张原文归档，都在 memory.db 里：
+## 记什么
 
-- **profile**（用户画像）：跨项目通用的事实与偏好，每条都注入。
-- **rules**（规则与偏好）：\`scope\` 为项目名的只在那个项目注入；\`scope=__global__\` 的注入所有项目。
-- **logs**（流水）：做了什么、踩坑、验证结果。只追加，不注入。
-- **emotion**（情绪）：插件自动写，模型无需干预。
-- **archive**（原文层）：user / assistant 的**原文一条不落**，插件自动写。
-  不注入、不进默认检索，只能按项目/时间/关键词回溯（见「记忆使用说明」的 archive 一节）。
-  它和 logs 的分工：logs 是整理过的结论，archive 是没被整理过的原话。
+**模型能写的只有流水。** 其余三类由用户维护。
 
-**唯一的 .md 是 policy.md**（就是本文件）。它装每轮必须执行的行为规则，
-不进数据库、不参与注入预算竞争。
-
-## 记什么（模型只记第一条）
-- 流水（logs 表）：做了什么、踩坑、验证结果、提交边界。事实，不含判断。
-- **用户指出的问题、提出的需求、讲的做事偏好，一律记流水。**
-  即便那条消息同时带着情绪 —— **判成情绪不影响记流水，两者是独立的通道**。
-  典型漏记（2026-11-16 用户实报）：
-  「你缺少实用的技能包」「你有可用的能力只是用得少」「走正规流程想想你刚才回复的是什么」。
-  这些句子都命中了情绪词典（宝贝 / 喜欢 / 漂亮），于是只写了 emotion，
-  技术内容一个字没留 —— 下一个会话完全不知道用户提过这些。
-- 判断标准：**这条会让下一个会话的我少走一次弯路吗？** 会 → 记；不会 → 不记。
-- 项目规则（rules 表，scope=项目名）：由**用户**在 GUI 维护，本项目独有的约定、决策、架构、坑。
-- 用户画像（profile 表）：由**用户**在 GUI 维护，跨项目通用的事实与偏好，以及用户的处境。
+- 流水（logs 表）：做了什么、踩坑、验证结果。事实，不含判断。← **模型写这个**
+- 项目规则（rules 表，scope=项目名）：本项目独有的约定、决策、架构、坑。一条一行。← 用户维护
+- 用户画像（profile 表）：跨项目通用的事实与偏好，以及用户的处境。← 用户维护
+- 情绪表达由插件自动录入 emotion 表，模型无需干预。
 
 ## 不记什么
-- 密钥值（记"去哪找"，不记值）。
-- 会腐烂的当前状态：版本号、tip commit、测试数量。
-- 代码和 git 已经记录的内容。
-- **闲聊、寒暄、纯情绪交流**：不记。但注意上一条 ——
-  「带着情绪的实质反馈」要记，只有**纯**寒暄才不记。
-- **同一结论的复述**：用户换个问法再问一遍，不记第二条。
 
-## 怎么写
+**这一节只约束「进 rules / 画像的条目」，不约束流水。** 流水照常每轮写。
+
+- 密钥值（记"去哪找"，不记值）。
+- 会腐烂的当前状态：版本号、tip commit、测试数量 —— **不要写进 rules / 画像**
+  （它们会被长期注入，写死的数字很快就会说谎）。
+  > 流水里可以写「本轮 34/34 全绿」，因为流水是**带时间戳的过程记录**，
+  > 它不注入、也不会被当成长期事实引用。这是两者的关键区别。
+- 代码和 git 已经记录的内容。
+
+## 怎么写（流水）
 - 一条 = 一个结论，一行。
+- 3~5 行，一行一个要点，不写解释。
 - 同一件事改写旧条，不要新增重复条。
-- 结论失效时把它标成 stale（GUI 里停用），不要直接删。
-- 只有 status=active 的条目会被注入。
 
 ## 存储位置
 - 记忆不放在系统盘。首次安装优先选择 D 盘。
 - 可用侧边栏面板随时整体迁移。
-`
+
+---
+
+## 记忆使用说明
+
+> **这一节不注入。** 需要写记忆时再来读这里。
+> 注入里只保留了「不做就会出错」的几条动作；topic 分类、写法细节在这。
+
+### 写入：本机 HTTP 接口（主通道）
+
+**唯一正常路径。** 用 pwsh 发一次 POST：
+
+\`\`\`powershell
+Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
+  -ContentType 'application/json' \`
+  -Body (@{
+    text      = '正文'
+    topic     = '开发日志'
+    summary   = '≤35 字概述'
+    keywords  = '词A｜词B'
+    sessionId = $env:DSH_SESSION_ID
+    cwd       = (Get-Location).Path
+  } | ConvertTo-Json)
+\`\`\`
+
+| 参数 | 约束 |
+|---|---|
+| \`text\` | **必填**，为空返回 400 |
+| \`topic\` | 13 个分类之一（下方清单）。不带或写错会被拒收置空，该条不进「记忆索引」 |
+| \`summary\` | 一句话说清这条讲了什么，**≤35 字**；超出会截断 |
+| \`keywords\` | 检索用技术名词，全角竖线 \`｜\` 分隔（**不要用逗号**）；抽不出就写 \`无\` |
+| \`scope\` | 可省。省略时按 \`cwd\` 解析成项目名 |
+| \`cwd\` | **目录必须真实存在**，否则 400（防止写错路径凭空造出假工作区） |
+| \`sessionId\` | 建议传。不传则「本轮已写流水」不计入，连续未写提醒会误报 |
+
+只接受 \`POST\`（写流水有副作用，GET 可能被浏览器预取重复触发）。
+
+**为什么不用正文标记**：标记必须出现在回复正文里，而正文会在界面上被渲染 ——
+不擦就永久占屏，擦就先显示后消失（闪）。换成 HTTP 后正文干净，两个问题一起消失，
+而且标记不再留在会话上下文里（一条长标记约 300~600 token，按 10 轮算是几千 token 的纯开销）。
+
+### 流水必须带 topic 和 summary
+
+- **topic**：13 个分类之一（下方清单）。不带 topic 的流水不会进「记忆索引」，等于对以后的自己隐形。
+- **summary**（2026-11-14 起）：一句话说清这条讲了什么，≤35 字。
+  不写摘要的流水，检索时只能靠正文前 80 字截断兜底，经常截在句子中间、丢掉技术名词。
+- **keywords**（2026-11-14 起）：检索用的技术名词，用全角竖线 \`｜\` 分隔（**不要用逗号**，
+  逗号是中文正文的常用标点）。抽不出名词就写 \`无\`，不要硬凑 —— 硬凑只会污染检索。
+
+**分类只用这 13 个**（别自创，否则索引会碎）：
+
+\`\`\`
+开发日志 / 技术讨论 / 构建/编译 / 注入/预算 / 插件/装载 / 路径/沙箱 /
+格式/编码 / 文档/行号 / 情绪判据 / 用户画像 / 数据清理 / GUI/界面 / Git
+\`\`\`
+
+**开发日志 vs 技术讨论**（最容易混）：
+- 开发日志 = 做了某事、有过程与验证（改了代码、跑了测试、踩了坑并解决）
+- 技术讨论 = 还在权衡、没落成改动（用户提问、方案比较、认知澄清）
+
+### 兜底通道：正文标记
+
+**只在 HTTP 接口不可用时才用**（端口异常、接口报错）。
+
+它直接写在**回复正文**里，所以会在界面上闪一下 —— 这是它的固有代价，不是 bug。
+能走 HTTP 就不要用它。
+
+\`\`\`
+<!--mem-log topic=开发日志 summary=概述 keywords=词A｜词B
+正文写在这里
+-->
+\`\`\`
+
+写法：标记从**行首**开始，参数与 topic **同一行、顺序固定**
+（\`topic\` → \`summary\` → \`keywords\`），之后换行写正文，用一个 \`-->\` 收尾。
+**顺序写反**时后面的参数会被前一个整段吞掉（summary 会丢、keywords 被污染），别试。
+**不要**写闭合标签（不存在 \`<!--/mem-log-->\` 这种东西）——写了它会变成正文的一部分，永久留在库里。
+**正文不要写空行** —— 擦掉后每个空行会留一个空段，界面底部会空一块。
+
+\`mem-note\` / \`mem-fact\` / \`mem-fix\` **已于 2026-11-13 移除**：
+它们会往注入里自动写规则，而项目段预算只有 4096 字节、很快被顶满。
+现在规则与画像一律由用户在 GUI 手工维护。
+
+### 流水要短
+
+**正文 ≤ 150 字，最多 5 行，一行一个要点，不写解释。**
+
+为什么给死上限而不是「尽量短」：2026-11-16 实测，写成「3~5 行」时我连续十几轮
+写到 400~900 字（一趟流水比正文还长）。**含糊的规则等于没有规则**，
+所以这里给可执行的数字。
+
+超了怎么办：把细节留在对话里 —— 用户已经看过一遍了。流水只记
+「做了什么 / 发现什么 / 踩了什么坑」，不记推导过程。
+
+流水是索引不是报告。写成大段说明会让用户每轮滚屏。
+
+### 什么时候记
+
+**每轮都记，不跳轮。** 不加判断条件 —— 任何判据都会变成省略的理由
+（实测三种判据都导致漏记：只记技术价值 → 闲聊永远不满足，当天漏 12+ 轮）。
+
+写什么：本轮聊了什么就写什么，工作和闲聊都算数，不需要技术结论。
+
+**判成情绪不影响记流水 —— 两者是独立的通道。**
+用户指出的问题、提出的需求、讲的做事偏好，**一律记流水**，即便那条消息同时
+被判成情绪（emotion 表由插件自动写，与 logs 完全独立，互不排斥）。
+典型漏记（2026-11-16 实报）：「你缺少实用的技能包」「你有可爱的手手只是用得少」
+「走正规流程想想你刚才回复的是什么」—— 这些句子命中了情绪词典（宝贝 / 漂亮 / 想你），
+于是只写了 emotion，技术内容一个字没留，下一个会话完全不知道用户提过这些。
+
+卡住时：同一处试 2~3 次仍不对，停下来说「找不到规律，需要指方向」，
+记一条流水说明当时无可靠依据 —— 这比记十条「我又错了」有用。
+
+> **下面的「不要自己写进记忆」不是「这一轮可以不记」的例外** ——
+> 它只约束**写到哪里**（别写进 rules/画像），流水照常要写。
+> 记流水时把「用户确立了某条约定」这件事本身写进流水即可。
+
+**确立了约定或发现用户的新偏好时，不要自己写进记忆** ——
+告诉用户「这条适合记进项目规则 / 全局规则吗」，由他在 GUI 里决定。
+
+### 人称
+
+指用户写「用户」，指 AI 写「AI」，不要用「我」「你」。
+（记忆的写者和读者都是 AI，但 GUI 里看它的是用户 —— 「我」会让人读错视角。）
+
+### 预算
+
+画像 8000 / 规则 8000 / 项目 4096 字节，均由用户在 GUI 维护。
+看到「已截断」不要补写：内容仍在库里，只是本轮没注入。
+流水不受此限制：它不注入，写多少都不会占预算。
+
+### 怎么查记忆（2026-11-14 从「给模型的规则」移到这里）
+
+> 这一节不进注入；注入里的版本见每轮上下文末尾的「记忆使用说明」。
+> 放在这里是为了人查阅时能看到完整流程，同时不让同一段指引每轮付两遍 token。
+
+- 只读本身没有风险，但注入里只有「有哪些主题、各多少条」，没有流水正文。
+- **要查具体内容，用 pwsh 请求本机接口：**
+  \`$env:DSH_WEB_URL/api/dsh-memory/search?q=<关键词>&scope=<当前项目名>\`（返回正文命中，可直接读）。
+- **scope 必须带**，注入段里已给出本项目的真实名字，照抄即可；不传会返回 400。
+- **用户点名其他项目时**（例：上次在「干杂活」做的），用 \`scope=<该项目名>\` 精确查，
+  不要用 \`all=1\` 翻全库；项目名含中文或中英混编时，用 fetch 直接传原字（自动编码），
+  用 curl 需先 URL 编码。项目名不确定就先问用户，不要猜。
+- **必须先查、禁止凭上下文猜历史的情况：**
+  - 工具调用报错且一次内无法定位原因
+  - 连续两轮尝试没解决同一个问题
+  - 用户提到「之前」「上次」「按我们的规范」
+  - 需要确认项目约定、历史决策、踩过的坑
+- 查法：先加 \`&summary=1\` 只看摘要（3 条约 100 token），确认相关再按 id 取全文：
+  \`entry?id=<id>&table=<table>\`（\`table\` 用摘要里的字段；四张表 id 各自编号，只给 id 会取错表）。
+  **命中多条相似时不要去重**：靠时间戳判断是「同一件事记两遍」还是「两个阶段」。
+- **原文归档（2026-11-14 起）**：流水（logs）只存整理过的结论，没被整理的对话在
+  \`archive\` 表里。要回溯「当时原话怎么说的」，用：
+  \`$env:DSH_WEB_URL/api/dsh-memory/archive?scope=<当前项目名>&q=<关键词>\`，
+  可选 \`role=user|assistant\`、\`from=\`/\`to=\`（YYYY-MM-DD）、\`limit\`/\`offset\`（默认 50，上限 500）。
+  原文层**不进默认 \`/search\`**，所以用 search 查不到时不要断言「没有」——先想到 archive。
+- **⚠️ 读原文层必须看 \`role\`，别把「我自己说的」当成「我们讨论过」**（2026-11-15 实盘踩过）：
+  \`rows\` 每行都带 \`role\` 字段，\`user\` 是用户说的、\`assistant\` 是**你自己**说的。
+  用户问「我们之前讨论过 X 吗」时，如果 archive 里只有 \`role=assistant\` 的大段回答、
+  没有 \`role=user\` 的对应提问，**那不能答「我们讨论过」** —— 那是你单方面说过。
+  要确认用户真的说过什么，**只认 \`role=user\` 的行**。
+  同理，\`/search\` 命中的 \`logs\` 也是**你自己整理的结论**，
+  拿它证明「讨论过 X」等于用自己写的话证明自己的结论 —— 那是自证，不是证据。
+- **三个入口的返回字段名不一样**（2026-11-14 踩过，读错会得到 \`undefined\`，看着像"搜不到"）：
+
+  | 入口 | 结果字段 | 备注 |
+  |---|---|---|
+  | \`/search\` | \`hits\` | 只搜结论层（流水/规则/画像） |
+  | \`/archive\` | \`rows\` | 只搜原文层，分页 \`limit\`/\`offset\` |
+  | \`/entries\` | \`entries\` | GUI 翻页用；**\`table\` 必填**，四张表 id 各自编号 |
+  | \`/entry\` | \`entry\` | 按 id 取单条，必须带 \`table\` |
+- 端口每次启动都变，**必须读 \`$env:DSH_WEB_URL\`，不要写死**。
+- 不要用 grep / read / pwsh 直连 \`memory.db\`：它是 SQLite 二进制，
+  grep 只会得到乱码，直连又容易误写成写操作。
+- **真查过还是一无所获，才说「这段我没记住」**；不要没查就说，也不要猜、不要编。`
 
 // ---------------------------------------------------------------- 情绪分析
 
@@ -1345,10 +1482,74 @@ function createStore(config) {
    * 判据传参而不是自己读全局状态：createStore 在 apply 里比 dbStore 先创建，
    * 这里拿不到 dbStoreExists()，只能由调用方按当前模式告知。
    */
+  /**
+   * **一次性**把 policy.md 覆盖为当前模板（2026-11-16，用户明确授权）。
+   *
+   * ## 为什么允许这一次（硬约束 9 的唯一例外）
+   *
+   * 硬约束 9 说「policy.md 是用户数据，不要改」。2026-11-16 用户明确指示：
+   * **「新安装的用户和老用户 本次更新直接覆盖 policy.md」** ——
+   * 因为写入通道从「正文标记」换成 HTTP 接口，旧 policy.md 里写着完全相反的
+   * 指令（「写记忆只能用回复正文里的 mem-log 标记」），那条会每轮注入、
+   * 把模型拽回旧行为。只改模板对新装用户生效，老用户永远读不到。
+   *
+   * 所以这是**用户授权的一次性迁移**，不是「以后可以随便改」。
+   *
+   * ## 怎么保证「只一次」
+   *
+   * 用两个哨兵，任一命中就跳过：
+   *   ① `state.policySyncVersion === POLICY_SYNC_VERSION` —— 已经同步过
+   *   ② policy.md 里已含 `POLICY_SYNC_MARK` —— 文件本身已是最新
+   *
+   * 为什么需要 ②：用户可能删 state.json（或换机器复制了 policy.md 但没带 state）。
+   * 只看 state 会「以为没同步过」→ 把用户又改过的文件覆盖掉。
+   * 有 ② 才能保证「这个文件已经是新版」就绝不碰。
+   */
+  const POLICY_SYNC_VERSION = 1
+  const POLICY_SYNC_MARK = '<!-- policy-sync:1 -->'
+
+  async function syncPolicyOnce(state) {
+    if (state?.policySyncVersion === POLICY_SYNC_VERSION) return { skipped: 'state' }
+    const current = await readIfExists(paths.policy)
+    if (current !== undefined && current.includes(POLICY_SYNC_MARK)) {
+      // 文件已是最新，只是 state 丢了 —— 补记 state，不再动文件
+      return { skipped: 'marked' }
+    }
+    const beforeBytes = current === undefined ? 0 : Buffer.byteLength(current, 'utf8')
+    // 标记放在**末尾**：不影响「给模型的规则」小节的解析（那一节从文件开头取）
+    await atomicWrite(paths.policy, `${POLICY_TEMPLATE}\n${POLICY_SYNC_MARK}\n`)
+    // ⚠️ 这里不能调 diag/logger —— createStore 的作用域里没有它们
+    // （它们定义在 apply 内部）。只把结果 return 出去，由调用方记录。
+    return { written: true, from: beforeBytes, to: Buffer.byteLength(POLICY_TEMPLATE, 'utf8') }
+  }
+
+  /**
+   * 记忆根目录就绪：建目录 + 预建 policy.md + **一次性同步 policy.md**。
+   *
+   * 返回值里的 `policySync` 供 apply 记日志 —— createStore 拿不到 logger，
+   * 由调用方决定怎么打。这是既有的分层约定（store 只做纯数据操作）。
+   */
   async function ensureLayout() {
     await mkdir(root, { recursive: true })
     // 唯一需要预建的文件：policy.md（行为规则，不进数据库）
     if (!(await exists(paths.policy))) await atomicWrite(paths.policy, POLICY_TEMPLATE)
+    // ⚠️ 2026-11-16：一次性覆盖（用户明确授权，见 syncPolicyOnce 的注释）。
+    // 只在这里做一次，且由 state.policySyncVersion / 文件内标记双重把关。
+    let policySync = null
+    try {
+      const st = await readState()
+      const r = await syncPolicyOnce(st)
+      if (r.written) {
+        await writeState({ ...st, policySyncVersion: POLICY_SYNC_VERSION })
+        policySync = r
+      } else if (r.skipped === 'marked') {
+        await writeState({ ...st, policySyncVersion: POLICY_SYNC_VERSION })
+      }
+    } catch (e) {
+      // 同步失败不应阻断插件启动：policy.md 只是行为规则，旧版仍可用
+      policySync = { error: String(e?.message ?? e) }
+    }
+    return policySync
   }
 
   async function readState() {
@@ -1363,6 +1564,13 @@ function createStore(config) {
         lastConsolidate: parsed.lastConsolidate ?? null,
         projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
         ambiguous: Array.isArray(parsed.ambiguous) ? parsed.ambiguous : [],
+        // ⚠️ 2026-11-16：policy.md 一次性同步的版本号（见 syncPolicyOnce）。
+        // **必须在这里透传**，否则每次 readState 都把它丢掉 →
+        // 每次启动都以为「没同步过」→ **每次启动都覆盖 policy.md**，
+        // 那就正好违反了用户「仅此一次」的要求。
+        policySyncVersion: Number.isInteger(parsed.policySyncVersion)
+          ? parsed.policySyncVersion
+          : null,
       }
     } catch {
       return fallback
@@ -2159,10 +2367,29 @@ export function apply(ctx, rawConfig = {}) {
   diag('root-resolved', { root: resolvedRoot.root, reason: resolvedRoot.reason, logDir })
 
   // 预建目录与 policy.md（memory.db 由数据库层自己创建）
-  store.ensureLayout().catch((error) => {
-    logger.warn?.(`[dsh-memory] 初始化失败：${error?.message ?? error}`)
-    diag('layout-FAILED', { message: String(error?.message ?? error) })
-  })
+  store
+    .ensureLayout()
+    .then((policySync) => {
+      // ⚠️ 2026-11-16：policy.md 的一次性覆盖结果在这里记日志。
+      // 为什么不在 store 里记：createStore 作用域内没有 logger/diag
+      //（它们定义在 apply 内），store 只做纯数据操作，由调用方决定怎么打。
+      if (policySync?.written) {
+        diag('policy-synced-once', {
+          fromBytes: policySync.from,
+          toBytes: policySync.to,
+        })
+        logger.info?.(
+          `[dsh-memory] policy.md 已按本版规则覆盖一次（${policySync.from} → ${policySync.to} 字节）`,
+        )
+      } else if (policySync?.error) {
+        diag('policy-sync-failed', { message: policySync.error })
+        logger.warn?.(`[dsh-memory] policy.md 同步失败（不影响启动）：${policySync.error}`)
+      }
+    })
+    .catch((error) => {
+      logger.warn?.(`[dsh-memory] 初始化失败：${error?.message ?? error}`)
+      diag('layout-FAILED', { message: String(error?.message ?? error) })
+    })
 
   // ---- 启动自检：记忆目录是否真的可写 ----
   //
@@ -2383,43 +2610,50 @@ export function apply(ctx, rawConfig = {}) {
           //     - summary=1 两段式、不去重、查不到就说没记住
           //   自检：_dbpreview/verify-injection-consistency.mjs 与
           //         _dbpreview/selfcheck-injection-wording.mjs 断言了上面这些词。
-          '## 写记忆：只能用回复正文里的标记',
-          '`<!--mem-log topic=13 类之一 summary=≤35字 keywords=词A｜词B` 换行写正文，`-->` 单独收尾；',
+          '## 写记忆：用 HTTP 接口，不要写进正文（2026-11-16 起）',
+          // ★ 2026-11-16 大改：写入通道从「正文标记」换成「pwsh POST」。
+          //
+          // 用户定调：「占屏和闪，是同一件事的两种状态」。
+          // 标记只要进了正文，界面上就只剩两种结局 —— 不擦（永久占屏，
+          // 挡住正文）或擦（先流式显示再消失 = 闪）。擦除器写得再好也治不了根。
+          // 所以让标记**根本不进正文**。
+          //
+          // 附带的收益：标记不再留在会话上下文里（一条 400 字标记约 300 token），
+          // 谈 10 轮就是 3000 token 的纯开销，现在这笔开销归零。
+          //
+          // ⚠️ 标记通道**没有删**，是兜底：HTTP 不通（端口变、接口挂）时仍可以
+          // 退回写标记，插件照样解析入库。两条通一条就够。
+          `1. 每轮写一条流水（**必做**，和心跳同一级）：` +
+            `pwsh 里 \`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='正文';topic='13类之一';summary='≤35字';keywords='词A｜词B';sessionId=$env:DSH_SESSION_ID;cwd=(Get-Location).Path} | ConvertTo-Json)\`。`,
+          // ⚠️ 2026-11-16 修：原来这里写 `sessionId='<会话id>'`，
+          // 而模型**并不知道自己的会话 id** —— 只能猜或干脆不传。
+          // 不传的后果是 `streakCleared` 永远为 false，连续 4 轮后会误报
+          // 「你忘了写流水」。实测确认 `$env:DSH_SESSION_ID` 就在环境中
+          // （如 `session-20d208a0-...`），所以直接用它，不要写占位符。
+          // `cwd` 同理用 `(Get-Location).Path`，比手写路径更不容易错。
+          '**不要在回复正文里写标记了** —— 那正是占屏和闪烁的来源。标记通道仍在，但只在 HTTP 真的不可用时才用。',
+          // 退化路径仍要保留「空行」这条约束，而且**必须保留原因** ——
+          // 只写「不要写空行」没人会照做；写了「会留空段」才知道违反的后果。
+          '退化到标记时：`<!--mem-log topic=… summary=… keywords=…` 换行写正文、`-->` 单独收尾；参数顺序固定，写反会静默丢摘要；**正文不要写空行**（擦掉后每个空行留下一个空段，界面底部会空一块）。',
           // ★ 2026-11-16 加：正文别写空行（用户实报「最下面空出一大块」的成因）。
           //
           // 机制：标记在流式输出时以原文短暂可见，擦除器要等「静止 400ms」才擦。
           // 擦完文字后，标记里的**每个空行都会变成一个空段落**，仍占行高与段间距。
           // 实测最近 8 条流水：每条 1~5 个空行、合计约 120~320px —— 就是那块留白。
           //
-          // 正文连写成一段（用句号/分号衔接，不靠空行分隔）后空段落归零，
-          // 留白降到 ~50px。**不需要动 client.js 的隐藏判据**，
-          // 因此完全不会重演 2026-11-15 那次「全局 skills 滚动条失效」。
+          // 注意：走 HTTP 通道后这条对主路径不再适用（正文里没有标记了），
+          // 但它仍是**退化路径**的约束，所以保留在上一行里，不再单占一行。
+          'topic 必须是 13 类之一（写错会被拒收置空）；summary、topic 必带。只写流水 —— 规则与画像由用户在 GUI 维护，**不要写**。',
+          '**绝不能** write / edit / pwsh 碰 memory.db —— 会损坏数据库（走上面的接口）。',
+          // ★ 2026-11-16 用户纠正：「用户不是非要在做工作的时候才来找你说话，
+          // 有时候就仅仅是想要闲聊」。
           //
-          // 为什么改这里而不是 POLICY_TEMPLATE：模板只在**首次安装**时生成
-          // policy.md，之后那是运行时数据；改模板对已有用户无效。
-          // usageLines 是每轮注入的，改它才对所有人生效。
-          '**正文不要写空行**（空行擦掉后会留下空段落，界面底部会空一块）；要分段就用一个换行。',
-          'topic、summary 必带，参数同一行、顺序固定（写反会静默丢摘要）。',
-          '只认 mem-log；规则与画像由用户在 GUI 维护，不要写。**绝不能** write / edit / pwsh 碰 memory.db —— 会损坏数据库。',
-          'summary 帮以后的你一眼判断；keywords 用 `｜` 分隔，抽不出名词写 `无`；拿不准记什么 → policy.md。',
-          // ★ 2026-11-16 用户实报：情绪记录 #26/#27/#29 都是「带着情绪的实质反馈」，
-          // 全都只进了 emotion 表，技术内容一个字没留。
+          // 旧判据只问「下一个会话的我少走一次弯路吗」—— 那是**技术价值**，
+          // 闲聊永远不满足，于是永远不记。实测当天漏 12+ 轮，两次触发
+          // write-fail-reminder 都在「讨论规则」这种看起来没产出的轮次。
           //
-          // 机制上两条通道是**独立**的：analyzeEmotion 只负责写 emotion 表，
-          // 它不拦 mem-log。是我自己误以为「这是情感交流，不算技术结论」而放弃写流水。
-          // 同一个坑 2026-11-14 踩过一次（用户自述性格与做插件的原因，没记），
-          // 所以这次把判据直接写进每轮注入，而不是指望我下次自己想明白。
-          //
-          // 实例（用户原话）：
-          //   「你缺少实用的技能包」            → 命中「宝贝」被判爱意
-          //   「你有可爱的手手，漂亮的眼睛。只是你用的少」 → 命中「漂亮」被判夸赞
-          //   「走正规流程想想你刚才回复的是什么」   → 命中「想你」被判爱意
-          // 这三条的真实内容是技术反馈，下一个会话完全不知道用户提过。
-          '## 什么时候必须记（情绪不豁免）',
-          '用户指出问题、提需求、讲做事偏好 —— **一律记流水**，即使同时被判成情绪。',
-          '情绪表与流水表是两条独立通道：判成情绪不影响写 mem-log。',
-          '判据：**这条会让下一个会话的我少走一次弯路吗？** 会 → 记。',
-          '但纯寒暄、纯情绪交流不记；同一结论换个问法再问一遍也不记第二条。',
+          // 2026-11-16 用户最终定调：「不再加判断什么时候要记录」。
+          // 任何判据都会变成省略的理由，所以整条去掉 —— 只留「每轮都记」。
           '## 查记忆：用 pwsh 请求本机接口（注入里没有正文）',
           `\`$env:DSH_WEB_URL/api/dsh-memory/search?q=<关键词>&scope=${scopeHint}\`；` +
             'scope 必带（否则 400），端口每次启动都变，必须读环境变量。',
@@ -2472,6 +2706,34 @@ export function apply(ctx, rawConfig = {}) {
           projectName
             ? '用户点名其他项目时用 scope=<该项目名> 精确查，不许用 all=1；项目名含中文用 fetch 传原字，curl 需先 URL 编码。'
             : '**本会话未登记项目**：查记忆前先向用户确认项目名，再用 scope=<该项目名> 查；不要猜、不要用 all=1。',
+          // ============================================================
+          // ⚠️ 2026-11-16 第三次调整：**这一节必须是整段注入的最后一条行为指令。**
+          //
+          // 起因（隔壁会话实测）：「读记忆的瞬间忘记写记忆」—— 那一轮发了
+          // 3 次 search + 1 次 archive，log **一次都没发**。
+          //
+          // 根因是顺序，不是记性：旧版把这一节放在「查记忆」**之前**，
+          // 而「查记忆」那节占 2100 字节且在末尾。模型查完记忆后，
+          // 上下文里最靠近输出位置的是「怎么查询」，于是写流水被挤掉。
+          // **查得越深，越容易忘。**
+          //
+          // 现在放到最后：读完整段注入，最后看到的就是「记流水」。
+          // 这是唯一一个靠**位置**而不是靠**措辞**起作用的改动 ——
+          // 前面几次改措辞（mem-log → POST）都没解决，因为问题不在说什么。
+          '## 每轮都要记（和心跳同一级）',
+          // ⚠️ 2026-11-16 第四次改：**把完整命令写在这一节里，不用「上面那条」指代。**
+          //
+          // 原来这里写「用 pwsh 发一次 POST（上面那条命令）」——
+          // 而那条命令在注入上方 200 多字处。模型快速扫读时，
+          // 「上面那条」是一个需要回头找的空引用，容易滑过去。
+          // 现在直接给完整可粘贴的命令，**不需要往回看**。
+          '每轮回复结尾、心跳之前发一次（**必做，不跳轮**），整行照抄即可：',
+          `\`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='正文';topic='13类之一';summary='≤35字';keywords='词A｜词B';sessionId=$env:DSH_SESSION_ID;cwd=(Get-Location).Path} | ConvertTo-Json)\``,
+          '**正文里不要出现任何标记** —— 发了 POST 就够了，再写标记等于多做一次还会闪。',
+          // 流水长度给死数字：含糊的「3~5 行」实测被违反十几次（写到 400~900 字）。
+          '正文 **≤150 字**（最多 5 行，一行一个要点）。超了就把细节留在对话里。',
+          '写什么：本轮聊了什么就写什么（工作或闲聊都行）。判成情绪不影响写流水。',
+          '**查完记忆之后，尤其别忘了写流水** —— 查和写是两条独立动作。',
         ]
       : [
           `记忆根目录：${store.root}`,
@@ -2483,7 +2745,7 @@ export function apply(ctx, rawConfig = {}) {
 
     const header = `# 记忆（${name}）`
     const hint = dbMode
-      ? '<!-- 本段由插件注入。记忆存于 SQLite；模型只能写 mem-log 流水。 -->'
+      ? '<!-- 本段由插件注入。记忆存于 SQLite；模型用 HTTP 接口写流水，不要写进正文。 -->'
       : '<!-- 本段由插件注入。读写记忆请用 write / read / grep / edit 直接操作上面的路径，' +
         '不要期望有 memory_* 工具。 -->'
     return `${header}\n\n${hint}\n\n${parts.join('\n\n')}\n`
@@ -2734,6 +2996,14 @@ export function apply(ctx, rawConfig = {}) {
       let markerWritten = 0
       const markerDropped = []
 
+      // 注：2026-11-16 曾在此加过一道「本轮已用 HTTP 写过则忽略正文标记」的防呆，
+      // 现已移除。原因：它只能挡住**入库**，挡不住**渲染** —— 标记一旦进了正文，
+      // 擦除器照样要擦、照样会闪。真正的解法是把「不要往正文写标记」写进
+      // policy.md 的源头（用户 2026-11-16 已改），从行为上不再产生标记，
+      // 而不是在后端补一道看不见的闸。
+      // 保留记录：那条闸曾实测正确触发两次（marker-ignored-after-http），
+      // 但两次用户都仍然看到闪烁 —— 这就是它无用的证据。
+
       for (const match of text.matchAll(MEM_MARKER_RE)) {
         markerMatched += 1
         const kind = match[1]
@@ -2755,11 +3025,29 @@ export function apply(ctx, rawConfig = {}) {
           diag('summary-truncated', { raw: String(match[3]).slice(0, 60), kept: summary })
         }
         const body = String(match[5] ?? '').trim()
-        // 空正文以前是裸 continue —— 静默丢。最常见的原因是 topic 与正文同行
-        // （正文被 [^\n]*? 吃进 topic），所以把 topic 原始值也记下来。
+        // ⚠️ 2026-11-16 改：**不再因为「正文为空」丢弃**。
+        //
+        // 用户定调：「没记流水等于你忘了我，这件事的优先级高于有没有记错流水」。
+        //
+        // 旧逻辑：body === '' → continue（静默丢弃，只记一条 empty-body 诊断）。
+        // 那意味着「模型写了标记、但内容格式不完美」时，这一轮就当没发生过 ——
+        // 而丢弃之后，下一个会话的我完全不知道这段时间聊过什么。
+        //
+        // 新逻辑：正文空也**降级写入**，把能拿到的信息都留下
+        // （topic 原始值 + summary + 明确标注这是降级条目）。
+        // 宁可库里多一条难看但真实的记录，也不要留下一段空白。
+        let effectiveBody = body
+        let degraded = null
         if (body === '') {
-          markerDropped.push({ reason: 'empty-body', topicRaw: String(topicRaw ?? '').slice(0, 60) })
-          continue
+          // 最常见成因：topic 与正文挤在同一行，正文被 [^\n]*? 吃进 topic。
+          degraded = 'empty-body'
+          const parts = []
+          if (topicRaw !== undefined && String(topicRaw).trim() !== '') {
+            parts.push(`topic原始值「${String(topicRaw).trim().slice(0, 80)}」`)
+          }
+          if (summary !== null) parts.push(`summary「${summary}」`)
+          effectiveBody = `（降级记录·正文为空）${parts.join(' ')}`.trim()
+          diag('mem-降级写入', { reason: 'empty-body', topicRaw: String(topicRaw ?? '').slice(0, 80) })
         }
         // 设计决议 #4：不写 summary 的流水，检索时只能靠正文截断兜底。
         // 记一条诊断，跑一段时间统计比例；>20% 说明注入里的约束不够强。
@@ -2774,23 +3062,38 @@ export function apply(ctx, rawConfig = {}) {
             continue
           }
           // 唯一保留的标记是 mem-log。规则与画像由用户在 GUI 手工维护。
-          const cleaned = body
+          const cleaned = effectiveBody
             .split('\n')
             .filter((line) => !/^##\s/.test(line.trim()))
             .join('\n')
             .trim()
+          // ⚠️ 2026-11-16 改：清完为空也**降级写入**，不丢弃。
+          //
+          // 触发场景：正文只有 `## 标题` 行，被上面的 filter 全过滤掉。
+          // 旧逻辑 continue → 这一轮等于没记。
+          //
+          // 与 empty-body 同理（用户定调：「没记流水等于你忘了我」）：
+          // 拒绝一条不完美的记录，代价是整段时间空白，比留一条难看的记录糟得多。
+          let finalText = cleaned
           if (cleaned === '') {
-            markerDropped.push({ reason: 'empty-after-clean' })
-            continue
+            degraded = degraded ?? 'empty-after-clean'
+            const tail = effectiveBody.replace(/\s+/g, ' ').trim().slice(0, 80)
+            finalText = `（降级记录·清理后为空）${tail}`
+            diag('mem-降级写入', { reason: 'empty-after-clean', raw: tail })
           }
           // topic / summary / keywords 都来自标记参数；没写就是 NULL。
           // 传进去之后这条流水才会出现在注入的「记忆索引」里。
-          const r = dbStore.appendLog(projectKey, cleaned, { topic, summary, keywords })
+          const r = dbStore.appendLog(projectKey, finalText, { topic, summary, keywords })
           markerWritten += 1
           diag('mem-写流水', {
-            project: r.project, topic, summary: summary ?? null, keywords: keywords ?? null, db: true,
+            project: r.project,
+            topic,
+            summary: summary ?? null,
+            keywords: keywords ?? null,
+            db: true,
+            degraded: degraded ?? undefined,
           })
-          logger.info?.(`[dsh-memory] 已写入 ${r.project} 的流水（db${topic ? ' · ' + topic : ''}）`)
+          logger.info?.(`[dsh-memory] 已写入 ${r.project} 的流水（db${topic ? ' · ' + topic : ''}${degraded ? ' · 降级：' + degraded : ''}）`)
         } catch (error) {
           logger.warn?.(`[dsh-memory] 写入 ${kind} 失败：${error?.message ?? error}`)
           diag('mem-写入失败', { kind, message: String(error?.message ?? error) })
@@ -2836,28 +3139,24 @@ export function apply(ctx, rawConfig = {}) {
 
       // ---- 连续写入失败计数（2026-11-16，用户要求兜底）----
       //
-      // 只在这一处更新：这里已经算清了「本轮到底成功没成功」。
-      // 三种结局：
-      //   成功（markerWritten > 0）        → 清零，说明通道恢复了
-      //   失败（有标记但 0 落库）          → 连续失败 +1
-      //   没写标记（hasMarker 为 false）    → 不影响计数（那是「忘写」，另一个问题）
+      // 只在这一处更新：这里已经算清了「本轮这条消息到底写成功没成功」。
       //
-      // 为什么在这里而非 turn-stopping：markerWritten 是**本闭包的局部变量**，
-      // 出了这个 safeOn 回调就没了；而 writeFailStreak 是 apply 闭包级 Map，
-      // 跨轮、跨事件存活，正好承接「本轮结果」→「下轮检查」的接力。
+      // ⚠️ 2026-11-16 改：粒度从「每条消息」改成「按轮」。
+      //
+      // 起因（用户实报）：「闲聊为什么没进流水」—— 查出来是我连续 10 轮
+      // 压根没写标记，而旧逻辑对 hasMarker=false 明说不计数，于是零检测。
+      //
+      // 但**不能**在这里直接 +1：一次回复会触发多条 assistant/message
+      // （每个工具调用步都算一条，实测一轮 4~5 条）。按条计数会让阈值
+      // 在一轮内就被顶穿，等于退回「每轮提醒」的老路（217 次太吵）。
+      //
+      // 正确做法：这里只记「本轮曾经成功写过」，由 turn-stopping 按轮结算。
+      // 注意「曾经」：一轮里前面步骤写成功过，后面步骤没写，也算本轮写过了。
       const sKey = session?.id === undefined ? undefined : String(session.id)
-      if (sKey !== undefined) {
-        if (markerWritten > 0) {
-          // 成功写入 → 清零连续失败计数
-          if (writeFailStreak.get(sKey) !== 0) {
-            writeFailStreak.set(sKey, 0)
-          }
-        } else if (hasMarker) {
-          // 有写入意图但 0 落库 → 连续失败 +1
-          const prev = writeFailStreak.get(sKey) ?? 0
-          writeFailStreak.set(sKey, prev + 1)
-        }
-        // hasMarker 为 false：不碰计数（忘写是注入规则负责的另一层）
+      if (sKey !== undefined && markerWritten > 0) {
+        const rec = turnActivity.get(sKey) ?? { writes: 0, wroteMemory: false, wroteLog: false }
+        rec.wroteLog = true
+        turnActivity.set(sKey, rec)
       }
     } catch (error) {
       logger.warn?.(`[dsh-memory] 解析记忆标记失败：${error?.message ?? error}`)
@@ -3282,7 +3581,7 @@ export function apply(ctx, rawConfig = {}) {
         }
       }
 
-      const record = turnActivity.get(sessionKey) ?? { writes: 0, wroteMemory: false }
+      const record = turnActivity.get(sessionKey) ?? { writes: 0, wroteMemory: false, wroteLog: false }
       record.writes += 1
 
       // 记录「本轮是否已经写过记忆目录」。
@@ -3348,26 +3647,67 @@ export function apply(ctx, rawConfig = {}) {
         diag('turn-未记流水', { writes: record.writes, note: '有写操作但未写记忆（仅记录，不打扰）' })
       }
 
-      // ---- 连续写入失败提醒（2026-11-16，用户要求兜底）----
+      // ---- 连续未写流水提醒（2026-11-16 v2，用户要求兜底）----
       //
-      // 与上面「turn-未记流水」的区别：上面只看「改没改文件」，判断的是
-      // 「有写操作但没写记忆」；这里看的是「**写了标记却 0 条落库**」的
-      // 连续次数 —— 是「通道坏了」而非「模型忘了写」。
+      // ## 为什么改版
       //
-      // 阈值 4：连续 4 轮「想写却没写进去」才提醒一次，然后清零。
-      // 历史教训（DECISIONS）：每轮提醒两天触发 217 次，太吵，
-      // 所以必须设阈值，且走 safePushMessage（失败不打断会话）。
+      // v1 只在「有标记但 0 落库」时计数，对 `hasMarker === false` 显式不计数。
+      // 用户 2026-11-16 实报「闲聊为什么没进流水」—— 查出来是我**连续 10 轮
+      // 压根没写标记**，而 v1 对这种恰好零检测。
+      //
+      // v2 的判据换成：**本轮到底有没有成功写进一条流水**。
+      //   - 写过（record.wroteLog）    → 清零
+      //   - 没写过（含从未尝试）        → 连续计数 +1
+      //
+      // ## 为什么按轮而不按条
+      //
+      // 一次回复会触发多条 assistant/message（每个工具调用步一条，实测 4~5 条）。
+      // 若按条计数，阈值会在一轮内被顶穿，等于退回「每轮提醒」的老路
+      // （DECISIONS：两天 217 次，用户反馈太吵）。turn-stopping 每轮只跑一次，
+      // 粒度才对。
+      //
+      // ## 阈值 4（用户 2026-11-16 定）
+      //
+      // 连续 4 轮没写流水才提醒一次，提醒后清零。纯对话轮次也会计数 ——
+      // 这是有意的：用户明确说过「闲聊也要能兜住」，宁可多提醒一次，
+      // 也不要再出现「10 轮全漏、没人知道」。
+      const wroteThisTurn = record !== undefined && record.wroteLog === true
+      if (wroteThisTurn) {
+        if ((writeFailStreak.get(sessionKey) ?? 0) !== 0) {
+          writeFailStreak.set(sessionKey, 0)
+        }
+      } else {
+        const prev = writeFailStreak.get(sessionKey) ?? 0
+        writeFailStreak.set(sessionKey, prev + 1)
+      }
+
       const failStreak = writeFailStreak.get(sessionKey) ?? 0
+      // ⚠️ 2026-11-16 加固：无条件记录本轮结算结果。
+      //
+      // 起因：用户实报「流水依然失效」，而日志里查不到 write-fail-reminder ——
+      // 因为原代码只在 **delivered === true** 时才 diag。若 safePushMessage
+      // 返回 false（agent.steer 不存在 / 抛异常被吞），连「触发过」都看不见。
+      //
+      // 这条 diag 必须无条件写：它是判断「turn-stopping 有没有在跑」
+      // 与「计数有没有涨」的唯一现场。
+      diag('write-streak-check', {
+        streak: failStreak,
+        wroteThisTurn,
+        hasRecord: record !== undefined,
+        limit: WRITE_FAIL_STREAK_LIMIT,
+      })
       if (failStreak >= WRITE_FAIL_STREAK_LIMIT) {
         const delivered = safePushMessage(
           agent,
-          `[dsh-memory] 连续 ${failStreak} 轮尝试写记忆但都没成功落库。\n` +
-            `可能是标记格式问题（topic 不在 13 类、summary 超长、或标记被代码块吞掉）。\n` +
-            `请检查你最近回复里的 mem-log 写法。`,
+          `[dsh-memory] 已连续 ${failStreak} 轮没有把记忆写进流水。\n` +
+            `这会让你下次开会话时不知道这段时间发生过什么。\n` +
+            `请用 pwsh POST 到 $env:DSH_WEB_URL/api/dsh-memory/log 补一条（text/topic/summary/keywords）。\n` +
+            `topic 必须是 13 类之一。**不要**改回在正文里写标记 —— 那正是占屏与闪烁的来源。`,
           'steer',
         )
+        // 投递成功与否都要记 —— 失败时更需要这条证据。
+        diag('write-fail-reminder', { streak: failStreak, delivered })
         if (delivered) {
-          diag('write-fail-reminder', { streak: failStreak })
           writeFailStreak.set(sessionKey, 0)
         }
       }
@@ -3991,6 +4331,204 @@ export function apply(ctx, rawConfig = {}) {
             const r = dbStore.createEntry({ scope, kind, text, table })
             diag('entry-created', { id: r.id, table: r.table, scope, kind, duplicate: r.duplicate })
             json(res, 200, { ok: true, ...r, entry: dbStore.getById(r.table, r.id) })
+          } catch (error) {
+            json(res, 400, { ok: false, error: String(error?.message ?? error) })
+          }
+        },
+      },
+      {
+        // ---- 流水写入（数据通道版，2026-11-16 新增）----
+        //
+        // ## 为什么要有这条路由
+        //
+        // 标记通道有一个无法回避的副作用：**标记本身必须出现在回复正文里**。
+        // 于是界面上只有两种状态，二选一：
+        //   不擦 → 永远占屏（用户原话：「流水占了大半屏幕，看不到正文」）
+        //   擦   → 先流式显示、400ms 后消失 = 闪（用户原话：「现在开始闪了」）
+        // 用户 2026-11-16 定调：占屏和闪是同一件事的两种状态，
+        // **根因是「标记写进了正文」**，不是擦除器写得不好。
+        //
+        // 所以这条路由让模型**不进正文**也能写流水：用 pwsh POST 一次。
+        // 附带的好处是标记不再留在会话上下文里（一条 400 字标记约 300 token）。
+        //
+        // ## 为什么不是注册工具
+        //
+        // 硬约束 1：注册工具会让 100% 的请求被反代拒绝（2026-11-11 中断两次）。
+        // pwsh 本来就在工具列表里，走它不需要动 tools 数组。
+        //
+        // ## 双通道并存
+        //
+        // 标记通道**不删**。这条路由是「更好的一条路」，不是「唯一的路」：
+        // 任一通道通都能写进库，两条都写会去重（见 duplicate 判定）。
+        kind: 'exact',
+        path: '/api/dsh-memory/log',
+        handler: async (req, res) => {
+          try {
+            if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（写流水有副作用，别用 GET）' })
+            }
+            const body = await readBody(req)
+            const text = typeof body.text === 'string' ? body.text.trim() : ''
+            if (text === '') return json(res, 400, { ok: false, error: '正文不能为空' })
+
+            // topic 走与标记通道**同一个**白名单清洗函数。
+            // 两条通道必须共用一套校验 —— 否则同一份内容走不同通道会得到不同结果，
+            // 那是最难查的一类不一致（2026-11-16 教训：模型把 topic 写成
+            // 「测试/验证」被拒收置空，而如果 HTTP 通道另写一套就会放过它）。
+            const topicRaw = typeof body.topic === 'string' ? body.topic : ''
+            const topic = sanitizeTopic(topicRaw)
+            if (topicRaw.trim() !== '' && topic === null) {
+              diag('topic-rejected', { raw: topicRaw.slice(0, 40), via: 'http' })
+            }
+            const summary = sanitizeSummary(body.summary)
+            const keywords = sanitizeKeywords(body.keywords)
+            if (summary === null) diag('summary-missing', { topic, via: 'http' })
+
+            // scope 解析：默认取请求方所在会话的项目名（与标记通道同源，
+            // 都用 resolveProjectKey 的 scope，而不是目录名 key）。
+            // 允许显式传 scope，用于「人不在项目里但要补一条」的场景。
+            //
+            // ⚠️ 2026-11-16 自测发现并修：`resolveProjectKey` 对任何路径都会
+            // 算出一个 basename（它不知道目录存不存在）。于是模型随手传一个
+            // 写错的 cwd，就会凭空建出一个**永远不会有第二次写入的假工作区**
+            // （实测传 D:\不存在的目录xyz → scope 被写成「不存在的目录xyz」）。
+            // 假 scope 会污染 /state 的 byScope、GUI 的工作区下拉框、
+            // 以及注入里的「记忆索引」—— 比报错难查得多。
+            //
+            // 所以这里先要求目录**真的存在**，不存在就明确报错，
+            // 让调用方改传 scope 或改对 cwd，而不是默默写坏数据。
+            let scope = typeof body.scope === 'string' ? body.scope.trim() : ''
+            let scopeFrom = 'body'
+            if (scope === '') {
+              scopeFrom = 'cwd'
+              const cwd = typeof body.cwd === 'string' ? body.cwd : process.cwd()
+              if (!(await exists(cwd))) {
+                return json(res, 400, {
+                  ok: false,
+                  error: `cwd 不存在：${cwd}。请传正确的 cwd，或直接传 scope。`,
+                  scopeFrom,
+                })
+              }
+              scope = store.resolveProjectKey(cwd, readStateSync(store))?.scope ?? ''
+            }
+            if (scope === '') {
+              return json(res, 400, {
+                ok: false,
+                error: '无法确定项目：传 scope，或确认 cwd 已在插件里登记',
+              })
+            }
+
+            const r = dbStore.appendLog(scope, text, { topic, summary, keywords })
+            diag('mem-写流水', {
+              project: r.project,
+              topic,
+              summary: summary ?? null,
+              keywords: keywords ?? null,
+              db: true,
+              via: 'http',
+              scopeFrom,
+            })
+            // ⚠️ 关键：把「本轮写过流水」记到 turnActivity。
+            //
+            // 不记的话，turn-stopping 里按轮结算的 writeFailStreak 会认为
+            // 这一轮没写 → 连续 4 轮后误报「你忘了写流水」。
+            // 那会把「换成新通道」变成「被自己的兜底机制反复指责」，
+            // 比不改还糟。sessionId 由查询参数带，拿不到就不记（宁可漏计数）。
+            const sid = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+            if (sid !== '') {
+              const rec = turnActivity.get(sid) ?? { writes: 0, wroteMemory: false, wroteLog: false }
+              rec.wroteLog = true
+              turnActivity.set(sid, rec)
+            }
+            json(res, 200, {
+              ok: true,
+              id: r.id,
+              scope: r.project,
+              bytes: r.bytes,
+              summary: r.summary,
+              topic,
+              scopeFrom,
+              streakCleared: sid !== '',
+            })
+          } catch (error) {
+            json(res, 400, { ok: false, error: String(error?.message ?? error) })
+          }
+        },
+      },
+      {
+        // ---- 物理清理软删条目（2026-11-16 新增）----
+        //
+        // 用户原话：「怎么现在才发现 删了吧」。
+        // 实测 rules 攒了 125 条 deleted + 5 条 stale，占该表 136 条里的 130 条。
+        //
+        // **为什么需要一条独立路由**：现有 `/entry/delete` 只是把 status 改成
+        // 'deleted'（软删），行还在库里、还占体积。要真瘦身必须 DELETE 行，
+        // 而这属于「改记忆数据」—— 硬约束 5 禁止 write / pwsh 直写 memory.db，
+        // 所以只能走 HTTP。
+        //
+        // **安全设计**（这是个不可逆操作，宁可多设几道闸）：
+        //   - 只接受 POST
+        //   - 必须显式传 `statuses` 数组，且**拒绝 active**（见 purgeByStatus）
+        //   - 必须显式传 `confirm: true` —— 防手滑/自动化误调
+        //   - 支持 `dryRun: true` 先报数
+        kind: 'exact',
+        path: '/api/dsh-memory/purge',
+        handler: async (req, res) => {
+          try {
+            if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（物理删除不可逆）' })
+            }
+            const body = await readBody(req)
+            const table = typeof body.table === 'string' ? body.table : ''
+            const statuses = Array.isArray(body.statuses) ? body.statuses : []
+            const dryRun = body.dryRun === true
+            if (!dryRun && body.confirm !== true) {
+              return json(res, 400, {
+                ok: false,
+                error: '需要 confirm:true 才会真删；先用 dryRun:true 看会删多少',
+              })
+            }
+            const r = dbStore.purgeByStatus(table, statuses, { dryRun })
+            diag('purge-by-status', { table, statuses, dryRun, deleted: r.deleted ?? 0, byStatus: r.byStatus })
+            logger.info?.(
+              `[dsh-memory] ${dryRun ? '预演' : '已物理删除'} ${table} 的 ${statuses.join('/')}：` +
+                `${dryRun ? r.wouldDelete : r.deleted} 条`,
+            )
+            json(res, 200, { ...r, fileMode: false })
+          } catch (error) {
+            json(res, 400, { ok: false, error: String(error?.message ?? error) })
+          }
+        },
+      },
+      {
+        // ---- VACUUM：把空闲页还给磁盘（2026-11-16 新增）----
+        //
+        // 配套 `/purge`：DELETE 只把页标记为空闲，`db.size` 不会变小。
+        // 实测删 130 条后 page_count 1709→1712、freelist 1→8，**体积一分没省**。
+        // 这与 v5 删 entries 表时踩的是同一个坑（见 db-store 的 statsBreakdown 注释）。
+        //
+        // 只接受 POST（会重写整个库，不能 GET），且要求 confirm:true。
+        kind: 'exact',
+        path: '/api/dsh-memory/vacuum',
+        handler: async (req, res) => {
+          try {
+            if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（VACUUM 会重写整个库）' })
+            }
+            const body = await readBody(req)
+            if (body.confirm !== true) {
+              return json(res, 400, { ok: false, error: '需要 confirm:true' })
+            }
+            const r = dbStore.vacuum()
+            diag('vacuum', r.after)
+            logger.info?.(
+              `[dsh-memory] VACUUM 完成：${(r.before.bytes / 1024).toFixed(0)} KB → ` +
+                `${(r.after.bytes / 1024).toFixed(0)} KB（回收 ${(r.reclaimedBytes / 1024).toFixed(0)} KB）`,
+            )
+            json(res, 200, r)
           } catch (error) {
             json(res, 400, { ok: false, error: String(error?.message ?? error) })
           }

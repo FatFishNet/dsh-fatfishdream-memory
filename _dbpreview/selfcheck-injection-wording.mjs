@@ -94,8 +94,34 @@ for (const s of pushToUser) {
 
 console.log('\n=== 5. POLICY_TEMPLATE 同步（硬约束 13）===\n')
 const tmplStart = IDX.indexOf('const POLICY_TEMPLATE = `')
-const tmplEnd = IDX.indexOf('`\n', tmplStart)
-const TMPL = IDX.slice(tmplStart, tmplEnd)
+/**
+ * ⚠️ 2026-11-16 修：原来用 `IDX.indexOf('`\n', tmplStart)` 找结束位置。
+ *
+ * 那个写法假设「模板结尾是反引号紧跟换行」。模板换成新版（与 policy.md 一致）后，
+ * 里面出现了**大量转义反引号 `\``**（代码块、行内代码），
+ * 于是 `indexOf('`\n')` 会命中模板内部第一个「反引号+换行」→ TMPL 被截得很短，
+ * 后面所有「模板里有没有 X」的断言全部误判成缺内容。
+ *
+ * 现在改成**逐字符扫描**：跳过 `\`` 转义，找到真正的结束反引号。
+ * 这是唯一能正确处理转义的方式 —— 纯 indexOf 做不到。
+ */
+function sliceTemplate(src, from) {
+  let i = from + 'const POLICY_TEMPLATE = `'.length
+  let out = ''
+  while (i < src.length) {
+    const ch = src[i]
+    if (ch === '\\' && src[i + 1] === '`') {
+      out += '`' // 反转义，让断言看到运行时真正的内容
+      i += 2
+      continue
+    }
+    if (ch === '`') break // 真正的结束
+    out += ch
+    i += 1
+  }
+  return out
+}
+const TMPL = sliceTemplate(IDX, tmplStart)
 check('模板不再写「grep 查」', !TMPL.includes('grep 查'))
 check('模板不再写「用 grep 搜记忆根目录」', !TMPL.includes('用 grep 搜记忆根目录'))
 check('模板不含 /memory search', !TMPL.includes('/memory search'),

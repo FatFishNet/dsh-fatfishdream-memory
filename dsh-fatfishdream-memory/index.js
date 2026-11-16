@@ -835,6 +835,7 @@ const POLICY_TEMPLATE = `# 记忆规则
 
 ## 给模型的规则
 
+
 每轮遵守的行为约定。这一节会被注入所有项目的每一轮上下文。
 
 - **写记忆只能用 HTTP 接口**：\`POST $env:DSH_WEB_URL/api/dsh-memory/log\`
@@ -846,6 +847,7 @@ const POLICY_TEMPLATE = `# 记忆规则
 - **查记忆**：用 pwsh 请求本机接口，\`scope\` 必带（不传会返回 400）；
   先加 \`&summary=1\` 看摘要，确认相关再取全文（按 id 取单条：\`entry?id=<id>&table=<table>\`，table 用摘要里的字段）。
   完整查法（必查场景、端口、跨项目、不去重）见本文件末尾「怎么查记忆」。
+
 
 ## 强制录入：用户的情绪表达（不可关闭）
 - 用户在对话里表达情绪时，插件自动把原话写入 emotion 表，不依赖模型判断。
@@ -884,7 +886,8 @@ const POLICY_TEMPLATE = `# 记忆规则
 - 同一件事改写旧条，不要新增重复条。
 
 ## 存储位置
-- 记忆不放在系统盘。首次安装优先选择 D 盘。
+- 记忆优先放在**非系统盘**（Windows 上 D 盘优先，其余按剩余空间选）；
+  只有系统盘时落用户文档目录。macOS 建议用 \`~/.dsh\` 或自定义路径。
 - 可用侧边栏面板随时整体迁移。
 
 ---
@@ -987,7 +990,7 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
 **每轮都记，不跳轮。** 不加判断条件 —— 任何判据都会变成省略的理由
 （实测三种判据都导致漏记：只记技术价值 → 闲聊永远不满足，当天漏 12+ 轮）。
 
-写什么：本轮聊了什么就写什么，工作和闲聊都算数，不需要技术结论。
+写什么：**对话本身就是有意义的事情，必须记录**。
 
 **判成情绪不影响记流水 —— 两者是独立的通道。**
 用户指出的问题、提出的需求、讲的做事偏好，**一律记流水**，即便那条消息同时
@@ -1060,7 +1063,8 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
 - 端口每次启动都变，**必须读 \`$env:DSH_WEB_URL\`，不要写死**。
 - 不要用 grep / read / pwsh 直连 \`memory.db\`：它是 SQLite 二进制，
   grep 只会得到乱码，直连又容易误写成写操作。
-- **真查过还是一无所获，才说「这段我没记住」**；不要没查就说，也不要猜、不要编。`
+- **真查过还是一无所获，才说「这段我没记住」**；不要没查就说，也不要猜、不要编。
+`
 
 // ---------------------------------------------------------------- 情绪分析
 
@@ -1709,9 +1713,20 @@ export function createStore(config) {
    * 为什么需要 ②：用户可能删 state.json（或换机器复制了 policy.md 但没带 state）。
    * 只看 state 会「以为没同步过」→ 把用户又改过的文件覆盖掉。
    * 有 ② 才能保证「这个文件已经是新版」就绝不碰。
+   *
+   * ## v2（2026-11-17）：模板换成用户自己维护的那份完整规则
+   *
+   * 用户指示：**「把我们目前的记忆目录中的 policy.md 作为通用模板写入新用户预设，
+   * 仅覆盖一次即可」**。所以 v2 的模板 = 用户 policy.md 的全文（233 行），
+   * 不再是那份精简版。好处是新用户开箱就有一份完整、经实战打磨的规则。
+   *
+   * ⚠️ 两个常量必须同时改：只改 VERSION 不改 MARK 的话，哨兵②会用**旧标记**
+   * 命中用户的旧文件 → 判定「已是最新」→ 覆盖永不发生（静默失效）。
+   * ⚠️ 用户说过：**这个版本推送后会让把覆盖命令注释掉**。到那时改这里即可，
+   * 不要顺手删掉备份与收尾语恢复逻辑 —— 它们仍是数据安全网。
    */
-  const POLICY_SYNC_VERSION = 1
-  const POLICY_SYNC_MARK = '<!-- policy-sync:1 -->'
+  const POLICY_SYNC_VERSION = 2
+  const POLICY_SYNC_MARK = '<!-- policy-sync:2 -->'
 
   async function syncPolicyOnce(state) {
     if (state?.policySyncVersion === POLICY_SYNC_VERSION) return { skipped: 'state' }

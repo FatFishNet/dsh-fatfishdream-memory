@@ -111,7 +111,10 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
   check('场景3：返回 skipped/marked 或 null', r3 === null || r3?.skipped, JSON.stringify(r3))
   check('场景3：未再覆盖', fs.statSync(path.join(root, 'policy.md')).size === sizeBefore)
   // state.json 应被补记（marked 分支会回写 state）
-  check('场景3：state 已补记', JSON.parse(fs.readFileSync(path.join(root, 'state.json'), 'utf8')).policySyncVersion === 1)
+  // ⚠️ 2026-11-17：版本从 1 升到 2（方案 D），补记的值随之变为 2。
+  // 这条断言**故意写死版本号** —— 改版本时必须显式改这里，
+  // 否则「版本号悄悄变了、补记的还是旧值」这种错会被漏掉。
+  check('场景3：state 已补记', JSON.parse(fs.readFileSync(path.join(root, 'state.json'), 'utf8')).policySyncVersion === 2)
   fs.rmSync(root, { recursive: true, force: true })
 }
 

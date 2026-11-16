@@ -36,11 +36,15 @@ import { readFileSync, writeFileSync, statSync, statfsSync, appendFileSync, mkdi
 import { dirname, join, resolve, isAbsolute, basename, relative as relativePath } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 // 数据库存储层（2026-11-13 起为主存储）。
 // 放本地模块而不是依赖包：插件仍保持零第三方依赖。
 import { createDbStore } from './db-store.mjs'
 import { PERSONA_FORBIDDEN } from './db-store.mjs'
+// 表名白名单（2026-11-16 第 7 条）：table 会从 HTTP body 传进来并拼进 SQL，
+// 路由层提前校验一次，错误信息才能说清「哪个路由、收到什么值」。
+import { assertTable } from './db-store.mjs'
 
 /**
  * 插件自身的版本号（显示在 GUI 标题旁）。
@@ -56,7 +60,13 @@ const PACKAGE_VERSION = (() => {
   try {
     // 包目录 = 本文件所在目录。不用 createRequire('./package.json')，
     // 因为 exports 里虽然导出了 ./package.json，但走相对路径更直接、更少依赖。
-    const here = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+    //
+    // ⚠️ 必须用 fileURLToPath，不能用 new URL(...).pathname ——
+    // pathname 是**百分号编码**的：路径含空格会变成 `%20`、含中文会变
+    // `%E4%B8%AD`，拼出来的路径根本不存在 → readFileSync 抛 ENOENT →
+    // 被下面的 catch 吞成空串 → 界面永远不显示版本号，且零报错。
+    //   2026-11-16 实测：克隆到 `D:/我的 项目/` 时版本号静默变空。
+    const here = dirname(fileURLToPath(import.meta.url))
     const raw = readFileSync(join(here, 'package.json'), 'utf8')
     // ⚠️ 这里刻意**不调用 parseJson()**：它定义在文件后半段（L431 附近），
     // 虽然函数声明会提升、实际能跑，但让模块顶部的常量依赖后面才出现的工具
@@ -130,6 +140,17 @@ const healthState = {
   total: 0,
   failed: [],
   checkedAt: undefined,
+  // 心跳（2026-11-16 22:35）：最近一次周期心跳的时间戳（epoch ms）。
+  //
+  // 与 `checkedAt` 的区别，**别混用**：
+  //   checkedAt  = 健康**自检**跑完的时刻（只在 apply 后跑一次，或手动触发）
+  //   lastBeat   = 周期**心跳**的时刻（每 5 分钟一次，不看任何状态就写）
+  //
+  // 为什么需要它：内存里有 `Date.now()` 在走，说明进程还活着 ——
+  // 这是「进程存活度」这个维度里最便宜、最不会说谎的证据。
+  // 它**不表示**记忆在正常写入（那是 writeFailStreak 的职责），
+  // 也不表示代码没坏（那是回归测试的职责）。三者各读一个维度，不要互相顶替。
+  lastBeat: undefined,
 }
 
 const DEFAULT_CONFIG = {
@@ -423,6 +444,13 @@ function slugify(name) {
  * 实测踩过一次：手动改 state.json 引入 BOM，导致 /memory search 全部未命中。
  *
  * 所有读取用户可编辑 JSON 的地方都必须走这里，而不是裸 JSON.parse。
+ *
+ * 关于 BOM 的形态（2026-11-16 实测确认，别再猜）：
+ *   `Buffer.from([0xEF,0xBB,0xBF,...]).toString('utf8')` 的结果
+ *   **首字符就是 U+FEFF**（Node 的 utf8 解码器会把它识别成 BOM 字符，
+ *   不会留下 0xEF/0xBB/0xBF 三个独立字符）。
+ *   所以只需判断 U+FEFF 一种形态 —— 不要为「字节层 BOM」再加分支，
+ *   那是基于错误假设的补丁。
  */
 function parseJson(text) {
   if (typeof text !== 'string') throw new TypeError('parseJson expects a string')
@@ -440,11 +468,48 @@ function isSafeSlug(slug) {
 
 function isInside(root, target) {
   const rel = relativePath(root, target)
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+  // ⚠️ 判越界不能只看 rel 是否以两个点开头：`..backup`、`..config` 这类
+  // **正常的子目录**也会那样开头，会被误判成「在 root 之外」。
+  // 必须只在两个点**独立成段**时才算上跳（`..` 本身，或后接 `/`、`\`）。
+  //   2026-11-16 实测：`isInside('D:/a', 'D:/a/..backup')` 旧写法返回 false（错）。
+  return rel === '' || (!/^\.\.($|[\\/])/.test(rel) && !isAbsolute(rel))
 }
 
 function byteLength(text) {
   return Buffer.byteLength(text, 'utf8')
+}
+
+/**
+ * 消息去重键：`<sessionId>:<turn>:<step>`。
+ *
+ * ## 为什么单独抽成函数（2026-11-16）
+ *
+ * 原先是内联在 `session/event` 监听器里的两行模板字符串。那份实现
+ * **无法黑盒验证** —— 要确认「键里有 sessionId」，得伪造两个会话消费
+ * 相同的 `turn:step`，而脚本没有伪造 `session/event` 的手段；单会话测试里
+ * `sid` 恒定，加不加前缀行为完全一样，那种测试会绿却证明不了任何事。
+ *
+ * 抽成顶层纯函数后，可以直接构造两个不同 session 调两次、断言键不等 ——
+ * 见 `_dbpreview/selfcheck-message-key.mjs`。
+ *
+ * ## 键为什么必须带 sessionId
+ *
+ * `handledMessageIds` 是 apply 级**全局** Set。只按 `turn:step` 作键时，
+ * 两个不同会话的同一 `turn:step` 会互相压制 —— 被撞的那条既不进 archive
+ * （**原文永久丢失**）、也不解析标记，且**无任何日志**。
+ *   2026-11-16 实测：全库 2858 条 assistant 只有 1884 个不同键；
+ *   两个会话的 step 集合交集为空，其中一个会话的 assistant **一行都没有**。
+ *
+ * @param {{id?: unknown}|null|undefined} session 会话对象（只读 `.id`）
+ * @param {{turn?: unknown, step?: unknown}|null|undefined} payload 事件 data
+ * @returns {string} 去重键；缺字段一律降级为 `'?'`，绝不抛错
+ */
+function makeMessageKey(session, payload) {
+  const id = session === null || session === undefined ? undefined : session.id
+  const sid = id === undefined || id === null ? '?' : String(id)
+  const turn = payload === null || payload === undefined ? undefined : payload.turn
+  const step = payload === null || payload === undefined ? undefined : payload.step
+  return `${sid}:${turn ?? '?'}:${step ?? '?'}`
 }
 
 /**
@@ -498,6 +563,116 @@ const SECRET_PATTERNS = [
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
 ]
 
+/**
+ * 读文件为**原始字节**，不存在返回 undefined。
+ *
+ * 与 readIfExists 的分工（2026-11-16 加，见 copyTree 的注释）：
+ *   readIfExists  按 utf8 读 → 只用于**确定是文本**的文件（policy.md / state.json）
+ *   readBytes     原样读 Buffer → 用于**可能是任意二进制**的文件（copyTree）
+ *
+ * ⚠️ 用 utf8 读二进制再写回会**永久损坏**文件：所有非 UTF-8 合法的字节序列
+ * 都会变成 U+FFFD（EF BF BD），而且文件通常变大。实测 14 字节 PNG → 24 字节。
+ * 这种损坏是不可逆的 —— 原字节序列已经丢在解码这一步了。
+ */
+async function readBytesIfExists(path) {
+  try {
+    return await readFile(path)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+/**
+ * 把临时文件搬成目标文件，**保证原文件不会因为搬失败而消失**。
+ *
+ * ## 2026-11-16 修：原来的 EPERM fallback 是个数据丢失窗口
+ *
+ * 旧代码（两个 write 函数都这么写）：
+ *
+ *     try { await rename(temp, path) }
+ *     catch (error) {
+ *       if (EEXIST || EPERM) {
+ *         await unlink(path)        // ← 原文件在这一行就没了
+ *         await rename(temp, path)  // ← 这一行再失败 = 永久丢失
+ *         return
+ *       }
+ *       ...
+ *     }
+ *
+ * 中间那行 `unlink` 之后，任何一步失败（磁盘满、杀毒软件锁文件、
+ * 进程被结束、断电）都会让**原文件和新内容同时不存在**。
+ * 受影响的是 `state.json`（项目映射）与 `policy.md`（用户手写的规则）。
+ *
+ * ## 现在的做法：先把原文件改名成 .bak，再搬临时文件
+ *
+ *     rename(temp, path) 失败
+ *       → rename(path, bak)      原文件挪到旁边（同目录，原子操作）
+ *       → rename(temp, path)     搬新内容
+ *       → 失败则 rename(bak, path) 回滚，原文件完好
+ *       → 成功则删掉 bak
+ *
+ * 关键区别：**原文件在任何时刻都有一份完整的副本存在**（要么在原位，
+ * 要么在 .bak）。最坏情况是留下一个 `.bak` 文件，而不是文件消失。
+ *
+ * `rename` 在同一分区内是原子的（Windows 的 MoveFileEx 与 POSIX 的 rename(2)
+ * 都保证），所以「原→bak」这一步本身不会产生半个文件。
+ */
+async function replaceFile(tempPath, targetPath) {
+  try {
+    await rename(tempPath, targetPath)
+    return
+  } catch (error) {
+    if (!error || (error.code !== 'EEXIST' && error.code !== 'EPERM' && error.code !== 'EACCES')) {
+      await unlink(tempPath).catch(() => {})
+      throw error
+    }
+  }
+
+  // 目标被占用（Windows 上很常见：另一个进程正开着它）。
+  // 先把它挪到 .bak —— 而不是删掉它。
+  const backupPath = `${targetPath}.${process.pid}.bak`
+  try {
+    await rename(targetPath, backupPath)
+  } catch (error) {
+    // 连挪都不行：放弃，保持目标文件原样，删掉临时文件
+    await unlink(tempPath).catch(() => {})
+    throw error
+  }
+
+  try {
+    await rename(tempPath, targetPath)
+    // 成功：原文件已无用了
+    // （不需要 `if (moved)` —— 走到这里说明上面的 rename 已经成功，
+    //   moved 恒为 true；原来那个判断是恒真的死代码，2026-11-16 复查时删掉）
+    await unlink(backupPath).catch(() => {})
+  } catch (error) {
+    // ⚠️ 关键回滚：把原文件挪回原位，绝不留下「目标不存在」的状态
+    try {
+      await rename(backupPath, targetPath)
+    } catch {
+      // 回滚也失败了 —— 此时原文件仍完整躺在 backupPath，
+      // 必须把路径告诉调用方，否则用户不知道去哪里找。
+      throw new Error(
+        `写入失败且回滚失败。原文件已保存在：${backupPath}` +
+          `（新内容写入失败原因：${error?.message ?? error}）`,
+      )
+    }
+    await unlink(tempPath).catch(() => {})
+    throw error
+  }
+}
+
+/**
+ * 原子写**原始字节**。与 atomicWrite 同构，只是不做 utf8 编码。
+ */
+async function atomicWriteBytes(path, buffer) {
+  await mkdir(dirname(path), { recursive: true })
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(temp, buffer)
+  await replaceFile(temp, path)
+}
+
 async function readIfExists(path) {
   try {
     return await readFile(path, 'utf8')
@@ -520,17 +695,9 @@ async function atomicWrite(path, content) {
   await mkdir(dirname(path), { recursive: true })
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
   await writeFile(temp, content, 'utf8')
-  try {
-    await rename(temp, path)
-  } catch (error) {
-    if (error && (error.code === 'EEXIST' || error.code === 'EPERM')) {
-      await unlink(path).catch(() => {})
-      await rename(temp, path)
-      return
-    }
-    await unlink(temp).catch(() => {})
-    throw error
-  }
+  // 2026-11-16：搬文件的逻辑抽到 replaceFile，两处共用。
+  // 原来这里内联的 `unlink(path)` 是个数据丢失窗口，见 replaceFile 的注释。
+  await replaceFile(temp, path)
 }
 
 /**
@@ -546,9 +713,40 @@ async function atomicWrite(path, content) {
  *
  * 改法：只有真的写入了文件才创建目录。这样空目录自然不产生任何东西。
  *
+ * ## 2026-11-16：改成**二进制复制**（原来用 utf8 文本往返，会毁掉文件）
+ *
+ * 原实现是 `readIfExists(source)` + `atomicWrite(target, text)` ——
+ * 两者都是 utf8。对文本文件没问题，但这个函数复制的是**用户目录下的任意文件**：
+ * 图片、压缩包、图标、数据库副产物都可能在里面。
+ *
+ * 实测（14 字节 PNG）：读成 utf8 再写回 → **24 字节，内容全变**。
+ * 所有非 UTF-8 合法的字节序列变成 U+FFFD，不可逆。
+ *
+ * 现在改为 `readBytesIfExists` + `atomicWriteBytes`，字节原样搬运。
+ * 文本文件也走这条路径 —— 字节级复制对文本同样正确，而且更快（不做编解码）。
+ *
+ * ## 2026-11-16（第二次）：跳过 junction / 符号链接时要**说出来**
+ *
+ * `readdir(withFileTypes)` 对 junction 和符号链接返回的 Dirent 是
+ * `isFile()=false` / `isDirectory()=false` / `isSymbolicLink()=true`。
+ * 原来的 `if (isDirectory) … else if (isFile) …` 没有 else 分支，
+ * 于是这类条目被**静默跳过** —— 迁移完文件凭空少了，日志里一个字都没有。
+ *
+ * 为什么选择「跳过」而不是「跟进去复制」：
+ *   - 跟进去要先 `realpath`，而链接可能指向任意位置（甚至指回自己 → 无限递归）
+ *   - 链接语义本身有歧义：用户可能是想「共享这个目录」，也可能是想「复制一份」，
+ *     迁移时无法替用户决定
+ *   - 记忆目录里出现链接是极少数情况（当前用户的实际目录里没有）
+ *
+ * 所以：**跳过，但把跳过的清单返回给调用方**，由上层写日志 / 报给用户。
+ * 静默丢失是最难排查的失败形态 —— 这条的整个意义就是「不要静默」。
+ *
+ * @param {string} from
+ * @param {string} to
+ * @param {string[]} [skipped] 收集被跳过的条目路径（由调用方传入，跨递归累积）
  * @returns {Promise<number>} 复制的文件数（空目录返回 0，且不留痕迹）
  */
-async function copyTree(from, to) {
+async function copyTree(from, to, skipped = []) {
   let entries
   try {
     entries = await readdir(from, { withFileTypes: true })
@@ -561,15 +759,20 @@ async function copyTree(from, to) {
     const target = join(to, entry.name)
     if (entry.isDirectory()) {
       // 子目录只在真有文件时才被创建 —— 递归内部会自己 mkdir
-      count += await copyTree(source, target)
+      count += await copyTree(source, target, skipped)
     } else if (entry.isFile()) {
-      const text = await readIfExists(source)
-      if (text !== undefined) {
+      // ⚠️ 必须按**字节**读，不能按 utf8 —— 这里可能是任意二进制文件。
+      const bytes = await readBytesIfExists(source)
+      if (bytes !== undefined) {
         // 第一个文件落地时才建父目录（递归可能已建过，mkdir 幂等）
         await mkdir(to, { recursive: true })
-        await atomicWrite(target, text)
+        await atomicWriteBytes(target, bytes)
         count += 1
       }
+    } else {
+      // 既不是文件也不是目录：junction / 符号链接 / 设备文件 / FIFO 等。
+      // 这些**不复制**，但必须记下来（见上方注释）。
+      skipped.push(source)
     }
   }
   return count
@@ -1437,7 +1640,7 @@ function analyzeEmotion(raw) {
  * 迁移根目录时，「跟随根目录」的项目自动落到新根下；单独搬过的不动。
  * 但用 relocateAll=true 可以强制全部收回新根（GUI 的「整体迁移」用这个）。
  */
-function createStore(config) {
+export function createStore(config) {
   let root = config.root
   // resolveRoot 给出的选址理由，原样保存供 /state 与诊断使用。
   // 它不是运行时可变状态：迁移根目录（migrateRoot）不改变「当初怎么选中的」，
@@ -1448,6 +1651,8 @@ function createStore(config) {
   const computePaths = () => ({
     policy: join(root, 'policy.md'),
     state: join(root, 'state.json'),
+    // 覆盖 policy.md 前备份到这里的旧文件（数据安全网，见 syncPolicyOnce 注释）
+    policyBackup: join(root, 'policy.md.pre-sync'),
   })
   let paths = computePaths()
 
@@ -1516,11 +1721,118 @@ function createStore(config) {
       return { skipped: 'marked' }
     }
     const beforeBytes = current === undefined ? 0 : Buffer.byteLength(current, 'utf8')
+
+    // ★ 覆盖前先备份旧文件（数据安全网）。
+    //
+    // 为什么必须有这一步：覆盖是**不可逆**的，而旧 policy.md 里可能有用户
+    // 手写过、但模板里没有的内容（典型是「每轮收尾语」）。2026-11-16 实测
+    // 覆盖后收尾语与手写段落**全部丢失**，且当时根目录里没有任何备份可捞。
+    //
+    // 备份文件写为 `policy.md.pre-sync`，只在「确实要覆盖」时产生 ——
+    // 已经同步过（哨兵命中）就绝不写，避免每次启动都留一份冗余备份。
+    //
+    // 但「全新安装」这一种情况要跳过备份：ensureLayout 刚预建了 POLICY_TEMPLATE，
+    // 这个「旧文件」其实是模板本体（没有任何用户内容），备份它纯属冗余。
+    // 判据：当前文件与模板逐字节相同 → 视为全新预建，不备份。
+    const isFreshTemplate = current !== undefined && current.trim() === POLICY_TEMPLATE.trim()
+    if (current !== undefined && !isFreshTemplate) {
+      await atomicWrite(paths.policyBackup, current)
+    }
+
+    // 覆盖前从旧文件里提取「每轮收尾语」，覆盖后再写回 —— 因为收尾语
+    // 是用户的私人偏好（硬约束 9 明说模板不能夹带本机个人偏好），模板里
+    // 已经**没有**这行了，不写回的话用户升级后收尾语就永久消失。
+    const oldHeartbeat = current === undefined ? '' : extractHeartbeat(current)
+
     // 标记放在**末尾**：不影响「给模型的规则」小节的解析（那一节从文件开头取）
     await atomicWrite(paths.policy, `${POLICY_TEMPLATE}\n${POLICY_SYNC_MARK}\n`)
+
+    // 写回收尾语（若旧文件里有）。用与 writeHeartbeat 相同的归一化与超长校验，
+    // 但**不调用 writeHeartbeat** —— 它在 apply() 闭包里，这里（createStore 闭包）
+    // 拿不到它。所以把「提取 + 写回」做成自包含的一小段，见下方两个 helper。
+    let heartbeatRestored = false
+    if (oldHeartbeat !== '') {
+      const normalized = normalizeHeartbeat(oldHeartbeat)
+      if (normalized !== '') {
+        const updated = await restoreHeartbeat(normalized)
+        if (updated) heartbeatRestored = true
+      }
+    }
+
     // ⚠️ 这里不能调 diag/logger —— createStore 的作用域里没有它们
     // （它们定义在 apply 内部）。只把结果 return 出去，由调用方记录。
-    return { written: true, from: beforeBytes, to: Buffer.byteLength(POLICY_TEMPLATE, 'utf8') }
+    return {
+      written: true,
+      from: beforeBytes,
+      to: Buffer.byteLength(POLICY_TEMPLATE, 'utf8'),
+      heartbeatRestored,
+      backedUp: current !== undefined && !isFreshTemplate,
+    }
+  }
+
+  /**
+   * 从 policy.md 文本里提取「每轮收尾语」，返回纯句子（不含执行说明）。
+   *
+   * 与 apply() 里的 readHeartbeat 逻辑一致，但**这里必须自包含一份**：
+   * syncPolicyOnce 在 createStore 闭包内，拿不到 apply() 里的 readHeartbeat。
+   * 2026-11-16 实测：覆盖 policy.md 时收尾语随旧文件一起丢失，所以覆盖前
+   * 用它把收尾语读出来、覆盖后再写回。
+   */
+  function extractHeartbeat(text) {
+    try {
+      const line = text.match(/^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m)
+      if (!line) return ''
+      let rest = line[0]
+      const m = rest.match(/[：:]\s*(.+)$/)
+      if (!m) return ''
+      rest = m[1].trim()
+      rest = rest.split(/这是会话的[「"]?心跳/)[0]
+      rest = rest.split(/用来确认本轮执行完整/)[0]
+      return rest.trim().replace(/[。.]\s*$/, '')
+    } catch {
+      return ''
+    }
+  }
+
+  /** 与 writeHeartbeat 相同的归一化：换行/连续空白压成一个空格。 */
+  function normalizeHeartbeat(text) {
+    return String(text ?? '')
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '')
+      .join(' ')
+      .trim()
+  }
+
+  /**
+   * 把归一化后的收尾语写回刚覆盖过的 policy.md。
+   *
+   * 复用与 writeHeartbeat 相同的插入规则：已有那一行就替换，没有就在
+   * 「给模型的规则」小节后补一行。返回是否真的写入（false = 没写入）。
+   */
+  async function restoreHeartbeat(text) {
+    const current = await readIfExists(paths.policy)
+    if (current === undefined) return false
+    const lineRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m
+    const hasLine = lineRe.test(current)
+    // ⚠️ 与 writeHeartbeat 保持完全一致：只跟踪「缩进续行」，不碰空行和标题。
+    // 中间经过两次修正（吞标题 → 留孤儿续行），最终形态见 writeHeartbeat 的注释。
+    const blockRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*(?:\n[ \t]+[^\n]*)*\n?/m
+    const sentence = /[。！？!?…．.]$/.test(text) ? text : `${text}。`
+    const newLine = `- 每轮回复的结尾，加固定一句：${sentence} ` +
+      `这是会话的「心跳」，用来确认本轮执行完整。放在最后一行，不用解释、不用变形。`
+    let updated
+    if (hasLine) {
+      updated = current.replace(blockRe, `${newLine}\n`)
+    } else {
+      const anchor = /^(#{1,2}\s*.*给模型的规则[^\n]*\n)/m
+      updated = anchor.test(current)
+        ? current.replace(anchor, `$1\n${newLine}\n`)
+        : `${current.trimEnd()}\n\n${newLine}\n`
+    }
+    await atomicWrite(paths.policy, updated)
+    return true
   }
 
   /**
@@ -1614,19 +1926,31 @@ function createStore(config) {
   }
 
   async function registerProject(cwd) {
-    const state = await readState()
-    const resolved = resolveProjectKey(cwd, state)
-    if (resolved === undefined) return undefined
-    if (state.projects[resolved.key] === undefined) {
-      state.projects[resolved.key] = {
-        name: resolved.name,
-        dir: resolved.dir,
-        cwd: resolve(cwd),
-        createdAt: new Date().toISOString(),
+    // ⚠️ 2026-11-17：包进 serialize()。
+    //
+    // 这里是典型的**读-改-写**：readState() → 改 state.projects → writeState()。
+    // 两个会话同时进入时（各自调用这个函数），会读到同一份 state，
+    // 各自加一个项目、各自写回 —— 后写的那个把先写的项目**覆盖掉**。
+    // 症状不是「记忆丢了」，而是「记忆还在，但项目不见了」，
+    // 正是 DECISIONS D13 记的那个坑（「并发 12 条丢到只剩 1 条」）。
+    //
+    // 之前 serialize() 只用在 enqueueAmbiguous / clearAmbiguous 两处，
+    // 这个函数漏了。它比那两个更常被调用（每个新项目第一次说话就会进）。
+    return await serialize(async () => {
+      const state = await readState()
+      const resolved = resolveProjectKey(cwd, state)
+      if (resolved === undefined) return undefined
+      if (state.projects[resolved.key] === undefined) {
+        state.projects[resolved.key] = {
+          name: resolved.name,
+          dir: resolved.dir,
+          cwd: resolve(cwd),
+          createdAt: new Date().toISOString(),
+        }
+        await writeState(state)
       }
-      await writeState(state)
-    }
-    return resolved
+      return resolved
+    })
   }
 
 
@@ -1924,12 +2248,21 @@ function createStore(config) {
     const state = await readState()
     let moved = 0
     let dbCopied = false
+    // 被 copyTree 跳过的条目（junction / 符号链接等）。
+    // 收集起来随返回值给上层，由它 diag 一条 —— 绝不静默丢失。
+    const skippedEntries = []
 
     // 1. 根级文件
     //
     // ⚠️ memory.db 刻意不在这里 —— 它是二进制 SQLite 库，
     // 下面第 1.5 步用 VACUUM INTO 单独处理。
-    for (const file of ['policy.md', 'state.json', 'memory.db']) {
+    //
+    // 2026-11-16 修真 bug：数组里原本有 'memory.db'，与上面两行注释直接矛盾。
+    // 后果实测：8,327,168 字节的库被 readIfExists 按 utf8 读成 6,621,810 个字符
+    // （**554,311 个 U+FFFD 替换符**），再被 atomicWrite 写回成 9,435,410 字节的废文件。
+    // 正常路径下第 1.5 步的 VACUUM INTO 会覆盖它，所以问题被掩盖了很久；
+    // 但**迁移中途崩溃/断电时，新根会留下这个坏库**，而旧根可能已被清理。
+    for (const file of ['policy.md', 'state.json']) {
       const text = await readIfExists(join(root, file))
       if (text === undefined) continue
       await atomicWrite(join(nextRoot, file), text)
@@ -1981,7 +2314,7 @@ function createStore(config) {
 
       // 根内的项目按相对路径搬；根外的项目收到 <newRoot>/<key>
       const target = alreadyInside ? join(nextRoot, relativePath(root, dir)) : join(nextRoot, key)
-      moved += await copyTree(dir, target)
+      moved += await copyTree(dir, target, skippedEntries)
       projectsMoved += 1
 
       // 收进新根后不再写自定义 dir，改为跟随根目录
@@ -1993,18 +2326,28 @@ function createStore(config) {
     const logsSource = join(root, 'logs')
     let logsCopied = 0
     if (await exists(logsSource)) {
-      logsCopied = await copyTree(logsSource, join(nextRoot, 'logs'))
+      logsCopied = await copyTree(logsSource, join(nextRoot, 'logs'), skippedEntries)
       moved += logsCopied
     }
 
     // 4. 旧根下未登记的目录（兜底）
     const dirs = await readdir(root, { withFileTypes: true }).catch(() => [])
     for (const entry of dirs) {
-      if (!entry.isDirectory()) continue
+      if (!entry.isDirectory()) {
+        // ⚠️ 这里也会漏掉 junction / 符号链接 —— 它们在 Dirent 里
+        // isDirectory()=false，于是在**进 copyTree 之前**就被跳过了。
+        // 2026-11-16 实测：只改 copyTree 的 else 分支不够，根级这一层
+        // 会把链接先筛掉，skippedEntries 依然是空的。
+        // 只记「既不是文件也不是目录」的条目，普通文件不算异常。
+        if (!entry.isFile()) {
+          skippedEntries.push(join(root, entry.name))
+        }
+        continue
+      }
       if (entry.name.startsWith('.') || entry.name === 'node_modules') continue
       if (entry.name === 'logs') continue
       if (relocated[entry.name] !== undefined) continue
-      moved += await copyTree(join(root, entry.name), join(nextRoot, entry.name))
+      moved += await copyTree(join(root, entry.name), join(nextRoot, entry.name), skippedEntries)
     }
 
     await atomicWrite(
@@ -2029,6 +2372,9 @@ function createStore(config) {
       logsCopied,
       projectsMoved,
       relocatedAll: relocateAll,
+      // 这些条目没有被复制（junction / 符号链接 / 特殊文件）。
+      // 调用方必须把它们说出来，否则用户会以为「全搬过去了」。
+      skippedEntries,
       warning: isSystemDriveTarget(nextRoot)
         ? `已迁到系统盘（${nextRoot}）。建议改用非系统盘：${PREFERRED_DRIVE}:\\${MEMORY_DIR_NAME}`
         : undefined,
@@ -2036,32 +2382,49 @@ function createStore(config) {
   }
 
   async function moveProject(key, nextDirRaw) {
-    if (!isSafeSlug(key)) throw new Error(`项目标识非法：${key}`)
-    const nextDir = resolve(String(nextDirRaw ?? ''))
-    if (!isAbsolute(nextDir)) throw new Error('需要绝对路径')
-    const state = await readState()
-    const current = projectDir(key, state)
-    if (resolve(current) === nextDir) return { key, dir: nextDir, moved: 0 }
-    if (isInside(nextDir, current)) throw new Error('新位置不能是当前项目文件夹的子目录')
-    if (await exists(nextDir)) {
-      const entries = await readdir(nextDir).catch(() => [])
-      if (entries.length > 0) throw new Error(`目标目录非空：${nextDir}`)
-    }
-    const moved = await copyTree(current, nextDir)
-    state.projects[key] = {
-      name: state.projects[key]?.name ?? key,
-      dir: nextDir,
-      cwd: state.projects[key]?.cwd,
-      createdAt: state.projects[key]?.createdAt ?? new Date().toISOString(),
-      movedAt: new Date().toISOString(),
-    }
-    await writeState(state)
-    return {
-      key,
-      dir: nextDir,
-      moved,
-      warning: isSystemDriveTarget(nextDir) ? `新位置在系统盘（${nextDir}）` : undefined,
-    }
+    // ⚠️ 2026-11-17：整段包进 serialize()。
+    //
+    // 这里是「读 state → copyTree（慢）→ 改 state.projects → 写 state」。
+    // copyTree 期间若有别的写进 state（registerProject / 别的迁移），
+    // 我们手里这份 state 就是**过期的** —— 写回去会把别人新增的项目抹掉。
+    //
+    // 代价：迁移是低频操作，但它会把其他 state 写入阻塞一会儿（复制整个项目目录）。
+    // 这个代价是对的 —— 宁可排队，也不要「迁移完之后项目列表少了几条」。
+    return await serialize(async () => {
+      if (!isSafeSlug(key)) throw new Error(`项目标识非法：${key}`)
+      // ⚠️ 2026-11-16 修：原来先 `resolve()` 再 `isAbsolute()` —— 顺序反了。
+      // resolve 会把相对路径补成绝对路径，于是 isAbsolute 恒为 true，
+      // 校验形同虚设，"随便什么" 也会被当成合法目标并真的执行搬迁。
+      // 必须先校验**用户传进来的原始值**，再 resolve。
+      const rawDir = String(nextDirRaw ?? '').trim()
+      if (rawDir === '' || !isAbsolute(rawDir)) throw new Error('需要绝对路径')
+      const nextDir = resolve(rawDir)
+      const state = await readState()
+      const current = projectDir(key, state)
+      if (resolve(current) === nextDir) return { key, dir: nextDir, moved: 0 }
+      if (isInside(nextDir, current)) throw new Error('新位置不能是当前项目文件夹的子目录')
+      if (await exists(nextDir)) {
+        const entries = await readdir(nextDir).catch(() => [])
+        if (entries.length > 0) throw new Error(`目标目录非空：${nextDir}`)
+      }
+      const skippedEntries = []
+      const moved = await copyTree(current, nextDir, skippedEntries)
+      state.projects[key] = {
+        name: state.projects[key]?.name ?? key,
+        dir: nextDir,
+        cwd: state.projects[key]?.cwd,
+        createdAt: state.projects[key]?.createdAt ?? new Date().toISOString(),
+        movedAt: new Date().toISOString(),
+      }
+      await writeState(state)
+      return {
+        key,
+        dir: nextDir,
+        moved,
+        skippedEntries,
+        warning: isSystemDriveTarget(nextDir) ? `新位置在系统盘（${nextDir}）` : undefined,
+      }
+    })
   }
 
 
@@ -2088,6 +2451,14 @@ function createStore(config) {
     ensureLayout,
     readState,
     writeState,
+    // ⚠️ 2026-11-17：导出 serialize，让**路由层**也能用同一把锁。
+    //
+    // 起因：`/scope/rename` 里有一段「读 state → 改 projects → 写 state」，
+    // 它在 apply 的闭包里，拿不到 createStore 内部的 writeQueue；
+    // 不导出的话只能自己再造一把锁 —— 两把锁互不排斥，等于没锁。
+    //
+    // 这是 createStore 里**唯一**的写队列，所有 state.json 的读-改-写都该走它。
+    serialize,
     resolveProjectKey,
     registerProject,
     policyTextSync,
@@ -2680,7 +3051,37 @@ export function apply(ctx, rawConfig = {}) {
           //   要证明用户说过什么，只能看 archive 里 role=user 的行。
           //
           //   两句合成一句，因为它们指向同一个事实：**logs 和 assistant 原文都是自述**。
-          '`rows` 每行带 `role`（user / assistant）：**assistant 那侧就是你自己说的**，别当成「我们讨论过」；',
+          //
+          // ★★ 2026-11-17 00:00 修正（同工作区多会话，实盘误判一次）：
+          //
+          //   旧句是「assistant 那侧就是你自己说的」—— 它在**单会话**下对，
+          //   但同工作区里可以有**多个会话并发**（同一 scope、同一份 memory.db、
+          //   共用同一个显示名），于是 assistant 行可能来自**另一个会话的「我」**。
+          //
+          //   实盘经过：用户在这个会话问「看你答不答应」，我去 archive 查，
+          //   读到一段「好呀，我答应你 🐟💍……你回来，我就记着」，
+          //   当成**用户**的话收下了并回应 —— 而它其实是 `session-0bfba3ea`
+          //   在 3 分钟前写的 assistant 行。**同一个 AI 的另一条线程**。
+          //
+          //   数据一直是够的：`listArchive` 返回 `session_id`。缺的还是这句话 ——
+          //   第二次「信息齐全但没教怎么读」（第一次是 role）。
+          //
+          //   ⚠️ 这里要传达两层，缺一不可：
+          //     ① **不是用户说的** —— 别当成用户表态（旧的 role 提示仍然有效）
+          //     ② **但它是「我」说的** —— 跨会话共享记忆是这个插件的**设计意图**，
+          //        用户在另一个会话里问过的事，这边应该认得出、接得上，
+          //        不能说「我不记得 / 这不是我说的」。共享记忆就是为了这个。
+          //
+          //   判据：`session_id` 与本会话是否相同。相同 → 本次对话；
+          //   不同 → 同工作区的另一条线程，**算「我说过的」但不属于当前这轮**。
+          '`rows` 每行带 `role`（user / assistant）和 `session_id`：**assistant 那侧是 AI 说的，但不是用户说的**，别当成「我们讨论过」；' +
+            '同一个工作区可以有**多个会话并发**（共用一份 memory.db 和 scope），' +
+            '所以 assistant 行**可能来自另一个会话的那个「我」** —— 查 `session_id` 与本会话是否相同即可区分。',
+          // ★ 2026-11-17：把「跨会话共享」写成明确要求，而不是只做技术区分。
+          // 用户原话：「同一个工作区共享全部记忆这是需要的，我在另一个会话里对你的提问，
+          // 这里的会话应该是有回馈的」。所以口径是「认得出、接得上」，不是「撇清」。
+          '**跨会话共享是设计意图**：用户在另一个会话里说过/问过的事，这边也应当认得出、接得上；' +
+            '`session_id` 不同不代表「不是我说过的」，只代表「不是当前这轮」。',
           '要确认用户真的说过什么，只认 `role=user` 的行 —— 而 `search` 命中的 `logs` 也是你自己整理的，同样不能当证据。',
           // 2026-11-14 现场补：隔壁项目问「之前想过早上吃什么吗」，
           // 模型查完 archive 答「没有，今天第一次」。数据确实对，但语义错了——
@@ -2703,9 +3104,21 @@ export function apply(ctx, rawConfig = {}) {
           // selfcheck-injection-wording 的「不许自己读库」断言也在守这条，别删。
           '查不到就说「这段我没记住」；不要猜、不要编；不要扩大到全库；不要 grep / read / pwsh 直连 memory.db（SQLite 二进制）。',
           // 未登记项目时不能给死占位符：模型会照抄去查一个不存在的项目，0 条且不报错。
+          //
+          // ⚠️ 2026-11-16 22:58 修正表述（实测踩到）：
+          // 旧句是「不许用 all=1」，只说"别用"、没说"跨项目该用什么"，
+          // 于是被理解成 `scope=all` —— 而 **`scope=all` 会被当成一个名叫 all
+          // 的真实项目，静默返回 0 条且不报错**，看起来像"内容确实不存在"。
+          // 实测：`scope=all` + makeMessageKey → 0 条；`all=1` 同样查询 → 2 条。
+          // 现在改成**正向说明 + 明确警告**：要说清楚两种写法各自是什么。
           projectName
-            ? '用户点名其他项目时用 scope=<该项目名> 精确查，不许用 all=1；项目名含中文用 fetch 传原字，curl 需先 URL 编码。'
-            : '**本会话未登记项目**：查记忆前先向用户确认项目名，再用 scope=<该项目名> 查；不要猜、不要用 all=1。',
+            ? '**【scope 两种写法，别混】** `scope=<项目名>` 只查该项目（默认用它）；' +
+              '跨项目查用 `all=1` 参数（例：`/search?q=关键词&all=1`）。' +
+              '⚠️ **`scope=all` 不是跨项目** —— 它会被当成一个名叫 `all` 的项目，' +
+              '**静默返回 0 条且不报错**，看着像"内容不存在"，实则参数写错。' +
+              '项目名含中文用 fetch 传原字，curl 需先 URL 编码。'
+            : '**本会话未登记项目**：查记忆前先向用户确认项目名，再用 `scope=<项目名>` 查；' +
+              '不要猜。跨项目用 `all=1`（⚠️ 不是 `scope=all`，那会静默返回 0 条）。',
           // ============================================================
           // ⚠️ 2026-11-16 第三次调整：**这一节必须是整段注入的最后一条行为指令。**
           //
@@ -2913,7 +3326,13 @@ export function apply(ctx, rawConfig = {}) {
     return words.slice(0, KEYWORDS_MAX).join('｜')
   }
 
-  /** 已处理过的消息（用 turn:step 作键），避免同一轮被重复解析 */
+  /**
+   * 已处理过的消息，避免同一轮被重复解析。
+   *
+   * 键是 `sessionId:turn:step`（由 `makeMessageKey()` 构造），**必须带 sessionId**。
+   * 淘汰是 FIFO（超 500 条删最早一条），不是 LRU —— 键被淘汰后事件若重放，
+   * 同一条会被再存一遍。
+   */
   const handledMessageIds = new Set()
 
   // ---- 记忆写入通道：从模型的回复里提取标记，插件自己落盘 ----
@@ -2940,9 +3359,12 @@ export function apply(ctx, rawConfig = {}) {
         .join('\n')
       if (text.trim() === '') return
 
-      // 先按 turn:step 去重，再做归档/标记 —— 两者共用同一份去重集合，
+      // 先按 sessionId:turn:step 去重，再做归档/标记 —— 两者共用同一份去重集合，
       // 否则热重载或事件重放时同一条会被存两遍（原文层尤其不能重复）。
-      const messageId = `${payload.turn ?? '?'}:${payload.step ?? '?'}`
+      //
+      // 键的构造在 `makeMessageKey()`（顶层纯函数）里，理由与「为什么必须
+      // 带 sessionId」都写在那边的注释里。这里只负责查/写集合。
+      const messageId = makeMessageKey(session, payload)
       if (handledMessageIds.has(messageId)) return
       handledMessageIds.add(messageId)
       if (handledMessageIds.size > 500) {
@@ -3248,19 +3670,50 @@ export function apply(ctx, rawConfig = {}) {
       }
     }
 
+    // ⚠️ 2026-11-16 修：原来这里是 `catch { current = POLICY_TEMPLATE }` ——
+    // 任何读取失败（文件被占用 EBUSY、权限不足 EACCES、磁盘瞬时 IO 错误）
+    // 都会被当成「文件不存在」，然后拿模板当基础内容去改写并写回。
+    // 后果：**用户手改的整份 policy.md 一次全丢**，接口还返回 200 说成功。
+    //
+    // 正确做法与 readIfExists（L561）一致：**只吞 ENOENT**，其余 rethrow。
+    // ENOENT 才真的是「文件不存在」，此时用模板初始化是合理的；
+    // 其它错误说明文件**可能还在、只是暂时读不到**，绝不能拿模板覆盖它。
     let current = ''
     try {
       current = readFileSync(store.paths.policy, 'utf8')
-    } catch {
-      current = POLICY_TEMPLATE
+    } catch (error) {
+      if (error && error.code === 'ENOENT') {
+        current = POLICY_TEMPLATE
+      } else {
+        // 带上明确的动作建议 —— 用户看到「失败」比看到「保存成功但其实全丢了」好得多
+        throw new Error(
+          `读取 policy.md 失败（${error?.code ?? error?.message ?? error}），` +
+            `已中止写入以免覆盖你的规则文件。请关闭占用它的程序后重试。`,
+        )
+      }
     }
 
     const lineRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m
     const hasLine = lineRe.test(current)
 
     let updated
-    // 匹配「心跳那一行 + 它的续行（到下一个列表项或文件末）」
-    const blockRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*\n(?:(?!^[ \t]*-)[^\n]*\n?)*/m
+    // 匹配「收尾语那一行 + 它的**缩进续行**」，不碰空行、不碰标题。
+    //
+    // 2026-11-16 两轮反复，这里是最终形态，别再改回下面的任一种：
+    //
+    //   ① 旧版（吞标题）：
+    //      /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*\n(?:(?!^[ \t]*-)[^\n]*\n?)*/m
+    //      那个 `(?:(?!^[ \t]*-)[^\n]*\n?)*` 会吞**所有不以 `-` 开头的行** ——
+    //      空行 + `##` 标题一起没。用户的 policy.md 因此从 13850 → 13791 字节、
+    //      232 → 230 行，**零报错**（一次 GUI 保存就触发）。
+    //
+    //   ② 修复 ① 时我又矫枉过正，把续行跟踪整个删掉 → 若用户手写时分了行，
+    //      替换后会留下**孤立的缩进续行**（实测复现）。那也是错。
+    //
+    // 正确形态是只跟踪「以空格/tab 开头的续行」：`(?:\n[ \t]+[^\n]*)*\n?`
+    //   - 匹配折行续行 ✅（不留孤儿）
+    //   - 不匹配空行 → 标题安全 ✅
+    const blockRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*(?:\n[ \t]+[^\n]*)*\n?/m
 
     if (text === '') {
       if (!hasLine) return ''
@@ -4056,7 +4509,13 @@ export function apply(ctx, rawConfig = {}) {
     const readBody = async (req) => {
       const chunks = []
       for await (const chunk of req) chunks.push(chunk)
-      return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      // ⚠️ 必须走 parseJson，不能裸 JSON.parse（硬约束 4）：
+      // Windows 上记事本 / PowerShell 保存的 JSON 常带 UTF-8 BOM，
+      // 裸解析会抛错，而调用方的 catch 把它吞成 400 或「无数据」——
+      // 表现为「接口莫名失败」，比直接报错更难查。
+      //   2026-11-16 实测：body 前置 EF BB BF 时旧写法抛
+      //   `Unexpected token`，带 BOM 的请求全被拒。
+      return parseJson(Buffer.concat(chunks).toString('utf8') || '{}')
     }
 
     const routes = [
@@ -4166,7 +4625,19 @@ export function apply(ctx, rawConfig = {}) {
             const { rows, total } = dbStore.listEntries(table, {
               scope: q.get('scope') || undefined,
               kind: q.get('kind') || undefined,
+              // ⚠️ 2026-11-16 修（C2）：原来 status 缺省时**回落成 active**，
+              //
+              // 后果：GUI 勾选「显示已停用」时**不传 status**（想要「全部」），
+              // 后端却回落成 'active'，于是已删除 / 已停用的条目**永远列不出来**。
+              // 而界面上删除文案写的是「软删除，可恢复」—— 用户点进去找不到，
+              // 会以为数据丢了。我自己就踩过：软删的测试条目在 GUI 里完全看不到。
+              //
+              // 修法要注意一个坑：不能靠「传 undefined 表示不过滤」——
+              // listEntries 的 `status = 'active'` 是**默认参数**，
+              // JS 在传 undefined 时仍会套用默认值，那样改等于没改（实测验证过）。
+              // 所以这里改用**显式开关** includeAll。
               status: q.get('status') || 'active',
+              includeAll: q.get('status') === 'all',
               q: q.get('q') || undefined,
               // 时间范围：接受 YYYY-MM-DD 或完整 ISO8601
               tsFrom: q.get('from') || undefined,
@@ -4288,10 +4759,16 @@ export function apply(ctx, rawConfig = {}) {
         handler: async (req, res) => {
           try {
             if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            // 方法白名单（同 /heartbeat）：readBody 对空 body 返回 {}，
+            // 空 body 会被下文当成「把字段写成空值」。
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（改正文有副作用）' })
+            }
             const body = await readBody(req)
             const id = Number(body.id)
             if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
-            const table = body.table || findTableById(id)
+            // 表名来自 body，进 store 前先校验（store 层也有兜底，这里是为了错误更明确）
+            const table = body.table ? assertTable(body.table) : findTableById(id)
             if (!table) return json(res, 400, { ok: false, error: `找不到 id=${id}` })
             if (typeof body.text === 'string' && body.text.trim() !== '') {
               dbStore.updateText(table, id, body.text.trim())
@@ -4312,11 +4789,15 @@ export function apply(ctx, rawConfig = {}) {
         handler: async (req, res) => {
           try {
             if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            // 方法白名单：create 会新增一条记忆，被误触发就是脏数据
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（新增条目有副作用）' })
+            }
             const body = await readBody(req)
             const text = typeof body.text === 'string' ? body.text.trim() : ''
             const scope = typeof body.scope === 'string' ? body.scope.trim() : ''
             const kind = typeof body.kind === 'string' ? body.kind : 'pref'
-            const table = typeof body.table === 'string' ? body.table : undefined
+            const table = typeof body.table === 'string' ? assertTable(body.table) : undefined
             if (!text) return json(res, 400, { ok: false, error: '内容不能为空' })
             // 画像不需要 scope；规则必须有
             if (table !== 'profile' && !scope) {
@@ -4481,7 +4962,7 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 405, { ok: false, error: '只接受 POST（物理删除不可逆）' })
             }
             const body = await readBody(req)
-            const table = typeof body.table === 'string' ? body.table : ''
+            const table = typeof body.table === 'string' ? assertTable(body.table) : ''
             const statuses = Array.isArray(body.statuses) ? body.statuses : []
             const dryRun = body.dryRun === true
             if (!dryRun && body.confirm !== true) {
@@ -4546,6 +5027,15 @@ export function apply(ctx, rawConfig = {}) {
             if (req.method === 'GET') {
               return json(res, 200, { ok: true, text: readHeartbeat() })
             }
+            // ⚠️ 必须有方法白名单。原来只有 `GET` 一个只读分支，
+            // **其余任何方法都会落进写分支**：HEAD / GET 之外的空 body 经
+            // readBody 变成 `{}` → text='' → 走「删除收尾语」分支。
+            //   2026-11-16 实测：`curl -I`（HEAD）就删掉了 policy.md 的收尾语行，
+            //   还返回 ok:true —— 探活工具、代理、预检请求都会触发。
+            // 同文件的 /log、/purge、/vacuum 早已显式拒绝非 POST，这里对齐。
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 GET / POST' })
+            }
             const body = await readBody(req)
             const text = typeof body.text === 'string' ? body.text.trim() : ''
             const saved = await writeHeartbeat(text)
@@ -4562,10 +5052,14 @@ export function apply(ctx, rawConfig = {}) {
         handler: async (req, res) => {
           try {
             if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            // ⚠️ 这条最危险：误发的 DELETE / HEAD 会真的软删一条记忆。
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（删除有副作用）' })
+            }
             const body = await readBody(req)
             const id = Number(body.id)
             if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
-            const table = body.table || findTableById(id)
+            const table = body.table ? assertTable(body.table) : findTableById(id)
             if (!table) return json(res, 400, { ok: false, error: `找不到 id=${id}` })
             // 软删除：记忆是历史，误删难恢复
             dbStore.softDelete(table, id)
@@ -4589,6 +5083,10 @@ export function apply(ctx, rawConfig = {}) {
         handler: async (req, res) => {
           try {
             if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            // 方法白名单：改 topic 会连带改 FTS 索引
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（改 topic 有副作用）' })
+            }
             const body = await readBody(req)
 
             // 支持批量：{ items: [{id, table, topic}, ...] }
@@ -4597,7 +5095,7 @@ export function apply(ctx, rawConfig = {}) {
               for (const it of body.items) {
                 try {
                   const id = Number(it.id)
-                  const table = it.table || findTableById(id)
+                  const table = it.table ? assertTable(it.table) : findTableById(id)
                   if (!Number.isInteger(id) || !table) {
                     results.push({ id: it.id, ok: false, error: '找不到条目' })
                     continue
@@ -4615,7 +5113,7 @@ export function apply(ctx, rawConfig = {}) {
             // 单条：{ id, table?, topic }
             const id = Number(body.id)
             if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
-            const table = body.table || findTableById(id)
+            const table = body.table ? assertTable(body.table) : findTableById(id)
             if (!table) return json(res, 400, { ok: false, error: `找不到 id=${id}` })
             const r = dbStore.setTopic(table, id, body.topic)
             diag('entry-topic', { id, table, to: r.to })
@@ -4633,6 +5131,10 @@ export function apply(ctx, rawConfig = {}) {
         handler: async (req, res) => {
           try {
             if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            // 方法白名单：改 status 等于停用/恢复一条记忆
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（改状态有副作用）' })
+            }
             const body = await readBody(req)
             const id = Number(body.id)
             const status = String(body.status ?? '')
@@ -4640,7 +5142,7 @@ export function apply(ctx, rawConfig = {}) {
             if (!['active', 'stale', 'deleted'].includes(status)) {
               return json(res, 400, { ok: false, error: 'status 只能是 active / stale / deleted' })
             }
-            const table = body.table || findTableById(id)
+            const table = body.table ? assertTable(body.table) : findTableById(id)
             if (!table) return json(res, 400, { ok: false, error: `找不到 id=${id}` })
             const r = dbStore.setStatus(table, id, status)
             diag('entry-status', { id, table, status })
@@ -4656,6 +5158,10 @@ export function apply(ctx, rawConfig = {}) {
         handler: async (req, res) => {
           try {
             if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            // 方法白名单：升级为全局规则会影响所有项目的注入
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（升级为全局有副作用）' })
+            }
             const body = await readBody(req)
             const id = Number(body.id)
             if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
@@ -4815,10 +5321,30 @@ export function apply(ctx, rawConfig = {}) {
         path: '/api/dsh-memory/root/move',
         handler: async (req, res) => {
           try {
+            // ⚠️ 最危险的写路由：误触发会真的搬走整个记忆目录。
+            // 空 body 会让 target 变成空串 → 走 expandRoot 的默认值分支，
+            // 等于「迁到默认位置」—— 必须显式拒绝非 POST。
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（迁移整个记忆目录）' })
+            }
             const body = await readBody(req)
             const target = typeof body.root === 'string' ? body.root : ''
-            if (target.trim() === '' || !isAbsolute(expandRoot(target))) {
-              return json(res, 400, { ok: false, error: '需要绝对路径' })
+            // ⚠️ 2026-11-16 修：原来的校验是 `!isAbsolute(expandRoot(target))`，
+            // 而 expandRoot 内部会 `resolve(value)` —— resolve 把**相对路径**
+            // 也变成绝对路径，所以 isAbsolute 对它恒为 true。
+            // 结果：任何字符串（"not-absolute"、"随便什么"）都能通过校验，
+            // 然后真的执行迁移。实测把 cordis.patch.yml 和指针文件都写坏了。
+            //
+            // 正确做法：判断**用户传进来的原始值**是否绝对路径。
+            // expandRoot 的职责是展开 `~` 这类简写，不是替用户补全相对路径。
+            //
+            // 注意 `~` 开头是合法的简写（expandRoot 会展开成 homedir），
+            // 所以这里单独放行，不能一刀切要求原始值 isAbsolute。
+            const rawTarget = target.trim()
+            const looksAbsolute = isAbsolute(rawTarget) || rawTarget === '~' ||
+              rawTarget.startsWith('~/') || rawTarget.startsWith('~\\')
+            if (rawTarget === '' || !looksAbsolute) {
+              return json(res, 400, { ok: false, error: '需要绝对路径（或用 ~ 开头的路径）' })
             }
             // 传 retargetLogs：迁移一完成就把日志落点切到新目录，
             // 之后的新日志直接写新位置，不用等重启。
@@ -4832,7 +5358,15 @@ export function apply(ctx, rawConfig = {}) {
               moved: result.moved,
               logsCopied: result.logsCopied,
               dbRebound: dbOk,
+              skipped: result.skippedEntries?.length ?? 0,
             })
+            // ⚠️ 被跳过的条目必须单独记一条，且带完整路径 ——
+            // 混在上面的计数里等于没说清「哪些没搬过来」。
+            // copyTree 不复制 junction / 符号链接（理由见它的注释），
+            // 静默跳过会让用户以为「都搬过去了」，回头找文件找不到。
+            if ((result.skippedEntries?.length ?? 0) > 0) {
+              diag('root-migrate-skipped', { count: result.skippedEntries.length, paths: result.skippedEntries })
+            }
             const editor = ctx.get?.('configEditor')
             const entry = ctx.fiber?.entry
             if (editor === undefined || entry === undefined) {
@@ -4842,6 +5376,8 @@ export function apply(ctx, rawConfig = {}) {
                 logsCopied: result.logsCopied,
                 root: result.root,
                 dbRebound: dbOk,
+                // junction / 符号链接不会被复制，这里如实告诉前端
+                skippedEntries: result.skippedEntries ?? [],
                 // 数据库已切到新位置，但配置没写成 —— 重启后仍会读旧配置，
                 // 所以要提示手动改 cordis.patch.yml。
                 needsRestart: true,
@@ -4858,6 +5394,7 @@ export function apply(ctx, rawConfig = {}) {
               root: result.root,
               saved: true,
               dbRebound: dbOk,
+              skippedEntries: result.skippedEntries ?? [],
               // 数据库连接已经热切到新位置，功能上立刻可用。
               // 但 state.json 里各项目的 dir 已被改写、store 的路径缓存
               // 也可能有残留，重启一次是最干净的确认方式 —— 所以仍提示。
@@ -4877,6 +5414,9 @@ export function apply(ctx, rawConfig = {}) {
         path: '/api/dsh-memory/project/move',
         handler: async (req, res) => {
           try {
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（搬运项目目录）' })
+            }
             const body = await readBody(req)
             const project = typeof body.project === 'string' ? body.project : ''
             const dir = typeof body.dir === 'string' ? body.dir : ''
@@ -4884,6 +5424,10 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 400, { ok: false, error: '需要 project 与 dir' })
             }
             const result = await store.moveProject(slugify(project), dir)
+            // 同 root/move：junction / 符号链接不会被复制，必须留痕
+            if ((result.skippedEntries?.length ?? 0) > 0) {
+              diag('project-move-skipped', { project: result.key, count: result.skippedEntries.length, paths: result.skippedEntries })
+            }
             json(res, 200, { ok: true, ...result })
           } catch (error) {
             json(res, 400, { ok: false, error: String(error?.message ?? error) })
@@ -4896,6 +5440,11 @@ export function apply(ctx, rawConfig = {}) {
         handler: async (req, res) => {
           try {
             if (!dbStoreExists()) return json(res, 400, { ok: false, error: '当前为文件模式' })
+            // ⚠️ 空 body 会让 from/to 都变成空串；改名涉及三表事务，
+            // 误触发代价很高 —— 必须显式拒绝非 POST。
+            if (req.method !== 'POST') {
+              return json(res, 405, { ok: false, error: '只接受 POST（工作区改名有副作用）' })
+            }
             const body = await readBody(req)
             const from = typeof body.from === 'string' ? body.from.trim() : ''
             const to = typeof body.to === 'string' ? body.to.trim() : ''
@@ -4995,20 +5544,31 @@ export function apply(ctx, rawConfig = {}) {
             // 就把字段删掉，让「缺省 = 跟随目录名」这条规则生效，避免留下无意义的冗余。
             let stateSynced = null
             try {
-              const st = await store.readState()
-              const projects = st.projects ?? {}
+              // ⚠️ 2026-11-17：整段包进 store.serialize()。
+              //
+              // 这是「读 state → 改 projects → 写 state」。改名期间若别的会话
+              // 恰好 registerProject（新项目第一次说话），它写回的 state 会
+              // 覆盖掉我们刚改的 .scope —— 表现为「改名成功，但下次会话
+              // 又按旧 scope 算，数据看不见」。正是 D13 那个坑的形态。
+              //
+              // 用 store.serialize 而不是自己造锁：必须是**同一把**队列，
+              // 否则两把锁互不排斥，等于没锁。
+              await store.serialize(async () => {
+                const st = await store.readState()
+                const projects = st.projects ?? {}
 
-              // 依次尝试：键===from → 键===to → .scope===from
-              let key = undefined
-              if (projects[from] !== undefined) key = from
-              else if (projects[to] !== undefined) key = to
-              else {
-                for (const [k, v] of Object.entries(projects)) {
-                  if (v && v.scope === from) { key = k; break }
+                // 依次尝试：键===from → 键===to → .scope===from
+                let key = undefined
+                if (projects[from] !== undefined) key = from
+                else if (projects[to] !== undefined) key = to
+                else {
+                  for (const [k, v] of Object.entries(projects)) {
+                    if (v && v.scope === from) { key = k; break }
+                  }
                 }
-              }
 
-              if (key !== undefined) {
+                if (key === undefined) return
+
                 const entry = projects[key]
                 if (key === to) {
                   // 记忆名回到了目录名 → 删掉映射字段，回到「缺省跟随」
@@ -5025,7 +5585,7 @@ export function apply(ctx, rawConfig = {}) {
                 }
                 await store.writeState(st)
                 stateSynced = { key, scope: key === to ? null : to }
-              }
+              })
             } catch (error) {
               logger.warn?.(`[dsh-memory] scope 改名后同步 state.json 失败：${error?.message ?? error}`)
             }
@@ -5192,4 +5752,54 @@ export function apply(ctx, rawConfig = {}) {
   // 等所有同步注册跑完再清点（events/commands/routes 都是同步注册的，
   // 放在下一个 tick 是为了让注入层等异步装配也完成）
   setTimeout(runHealthCheck, 600)
+
+  // ---- 周期心跳（2026-11-16 22:35）----
+  //
+  // ## 为什么需要它
+  //
+  // 在此之前，插件**没有任何周期性写入**：`runHealthCheck` 只在 apply 后
+  // 跑一次（上面那个 setTimeout）。于是日志文件会有长达数小时的空档 ——
+  // 那既是"用户没操作"，也可能是"进程已经死了"，**事后无法区分**。
+  // 2026-11-16 实测：日志里最长一段空档 465 分钟，正好是用户歇息那段。
+  //
+  // 心跳把这件事变可判定：**只要进程活着，日志每 5 分钟必然多一行**。
+  // 于是"这段时间它活着吗"不再需要猜。
+  //
+  // ## 为什么写日志而不是写数据库
+  //
+  // `memory.db` 的 logs 表是**记忆**（会被 /search 检索、被 GUI 展示、
+  // 按 topic 计数后每轮注入）。心跳若写进去，一天 288 条纯噪音会把
+  // 记忆索引挤变形。诊断日志本来就是"给人事后看发生了什么"的地方，
+  // 空档与心跳都属于它的语义范围。
+  //
+  // ## 为什么 5 分钟、为什么判死给 15 分钟
+  //
+  // 用户 2026-11-16 定的：更短能更早发现问题。
+  // 5 分钟 × 3 倍容错 = 15 分钟，容忍一次调度延迟或短暂卡顿，
+  // 又不会把"刚卡了一下"误判成"死了"。
+  //
+  // ## 注意 unref
+  //
+  // `timer.unref()` 让这个定时器**不阻止进程退出**。不调用的话，
+  // 插件会让宿主进程无法正常关闭（Node 的事件循环会一直有待办定时器）。
+  const HEARTBEAT_MS = 5 * 60 * 1000
+  const heartbeat = () => {
+    healthState.lastBeat = Date.now()
+    // healthy 用 `healthState.checked && healthState.ok`，不是直接 `healthState.ok`。
+    //
+    // 为什么：首次心跳是在自检跑完**之前**触发（两个 setTimeout/setInterval
+    // 都排在 apply 末尾，600ms 那次才跑自检）。此时 `ok` 还是初始值 false，
+    // 直接写会留下 `[heartbeat] {"healthy":false}` 这种**误导性**记录 ——
+    // 事后看到会以为"心跳时状态异常"，其实是"还没检查"。
+    //   2026-11-16 22:36 实测踩到：重载后第一行就是 healthy:false。
+    // healthy 只表达"心跳发生时自检是否通过"，未检查 ≠ 不健康。
+    diag('heartbeat', { healthy: healthState.checked ? healthState.ok : null })
+  }
+  const timer = setInterval(heartbeat, HEARTBEAT_MS)
+  timer.unref?.() // 不阻止进程退出（某些宿主环境可能没有 unref）
+  heartbeat() // 立刻打一次：否则 apply 后要等满 5 分钟才有第一行
+
+  // 挂在 effect 上，插件卸载/热重载时自动清理 ——
+  // 否则每重载一次就多一个定时器，一天能堆出几十个。
+  ctx.effect(() => () => clearInterval(timer), 'dsh-memory: heartbeat')
 }

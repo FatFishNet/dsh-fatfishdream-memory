@@ -23,6 +23,64 @@ import {
 const GLOBAL = '__global__'
 
 /**
+ * 合法的表名白名单。
+ *
+ * ## 为什么必须有（2026-11-16 第 7 条修复）
+ *
+ * 多个函数把 `table` 直接拼进 SQL：`SELECT * FROM ${table} WHERE id=?`。
+ * 而 `table` 来自 HTTP body —— 不校验就等于**开放 SQL 注入**。
+ * 子代理实测过：传 `sqlite_master` 能读到库结构，
+ * 传构造出来的字符串能改写 rules 全表。
+ *
+ * ## 为什么用白名单而不是转义
+ *
+ * 表名**不能**用占位符（`?`）绑定 —— SQLite 只允许参数化**值**，不允许标识符。
+ * 所以唯一安全的做法就是「只接受枚举内的值」。
+ *
+ * ## 注意：这是**四张业务表**
+ *
+ * `archive` 是原文层（v4），走自己的 `appendArchive` / `listArchive`，
+ * 不参与检索与注入，也不该被 updateText / setStatus 改写。
+ *
+ * **但按 id 读一条原文是合法的** —— `selfcheck-archive` 就在用
+ * `getById('archive', id)` 验证「2 万字原文没有被截断」。
+ * 2026-11-16 我一开始把 archive 整体排除，那条测试立刻变红 ——
+ * 说明「一律只允许四张表」这个前提是错的：白名单要按**函数的能力**分，
+ * 不能一刀切。所以另开一个更窄的口子 READABLE_EXTRA_TABLES。
+ */
+const VALID_TABLES = new Set(['profile', 'rules', 'emotion', 'logs'])
+
+/** 只读场景额外允许的表（目前只有 archive）。 */
+const READABLE_EXTRA_TABLES = new Set(['archive'])
+
+/**
+ * 校验表名，非法就抛错。
+ *
+ * 抛错而不是返回 false：这些函数的调用方（路由层）都用 try/catch 包着，
+ * 抛错会变成 400，用户能看到明确原因。静默返回 undefined 会让
+ * 「表名写错」看起来像「条目不存在」，那是最难查的一类。
+ *
+ * 导出理由：index.js 的路由层也想**提前**校验（在进 store 之前），
+ * 这样错误信息能带上「哪个路由、收到什么值」，比 store 层深处抛出来更好排查。
+ *
+ * @param {string} table
+ * @param {{ allowExtra?: boolean }} [opts]
+ *        `allowExtra: true` 时额外允许 archive —— **只给只读函数用**。
+ */
+export function assertTable(table, opts = {}) {
+  const inBase = typeof table === 'string' && VALID_TABLES.has(table)
+  const inExtra = opts.allowExtra === true && typeof table === 'string' && READABLE_EXTRA_TABLES.has(table)
+  if (!inBase && !inExtra) {
+    throw new Error(
+      `未知的表：${String(table)}（只支持 profile / rules / emotion / logs` +
+        `${opts.allowExtra === true ? ' / archive' : ''}）`,
+    )
+  }
+  return table
+}
+
+
+/**
  * 人称规范。
  *
  * 为什么要有：memory 的写者和读者是同一个模型，但 GUI 的读者是人类。
@@ -168,12 +226,46 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     return db
   }
 
+  /**
+   * 关闭数据库连接。
+   *
+   * ⚠️ 2026-11-16 修（第 12 条）：原来两个 catch 都是空的，然后**无条件**
+   * 把 `db = undefined`。后果：
+   *   ① `db.close()` 真的失败时（句柄被别处占用），错误被吞掉，
+   *      引用却已清空 —— 那个连接再也关不掉了，**句柄泄漏**；
+   *   ② 日志里一个字都没有，将来查「文件被占用」类问题没有线索。
+   *
+   * 现在的做法：
+   *   - checkpoint 失败只记不抛（它本来就是尽力而为，失败不该阻断 close）
+   *   - close 失败**保留引用**（让下一次 close 还有机会），并把错误交给 log
+   *   - 成功才清空引用
+   *
+   * 注意：`log` 是 createDbStore 的第三参（默认空函数），
+   * 不是全局 logger —— 存储层不依赖 index.js 的作用域。
+   */
   const close = () => {
-    if (!db) return
-    try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch {}
-    try { db.close() } catch {}
-    db = undefined
-    closed = true
+    if (!db) return { ok: true, alreadyClosed: true }
+
+    let checkpointError = null
+    try {
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    } catch (error) {
+      // 尽力而为：checkpoint 失败不该阻断关闭，但必须留痕
+      checkpointError = error
+      log('db-checkpoint-failed', { message: String(error?.message ?? error) })
+    }
+
+    try {
+      db.close()
+      db = undefined
+      closed = true
+      return { ok: true, checkpointError: checkpointError === null ? null : String(checkpointError?.message ?? checkpointError) }
+    } catch (error) {
+      // ⚠️ 关键：**不清空引用** —— 保留它，下一次 close 还能重试。
+      // 之前这里无条件 db = undefined，等于放弃了最后一次机会。
+      log('db-close-failed', { message: String(error?.message ?? error) })
+      return { ok: false, error: String(error?.message ?? error) }
+    }
   }
 
   /**
@@ -282,39 +374,87 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
    * 往指定表插一条。
    * ts 默认当前时间 —— 每条记忆都该知道自己什么时候进来的。
    */
-  function insertInto(table, row) {
+  /**
+   * 在事务里跑一段「主表写 + FTS 同步」，失败整体回滚。
+   *
+   * ## 为什么需要（2026-11-16 第 9 条）
+   *
+   * 原来的 `insertInto` 是「先 INSERT 主表 → 再 syncFts」两步裸跑。
+   * 第二步炸了（索引写失败、磁盘满、FTS 结构问题），**主表那行已经落库**，
+   * 于是这条记忆：
+   *   - 能按 id 查到（`getById` 走主表）
+   *   - 但**永远搜不到**（索引里没有它）
+   * 反过来在更新路径上，主表改了、索引没改 → 搜出来的是旧内容。
+   *
+   * 实测（临时库构造）：不加事务时主表多一行、索引没有；加事务后整体回滚。
+   *
+   * ## 为什么用 BEGIN IMMEDIATE
+   *
+   * 默认的 `BEGIN` 是 deferred —— 事务在**第一次写**时才真正拿写锁。
+   * 而这里一进事务就立刻要写，用 IMMEDIATE 提前拿锁，
+   * 避免「拿到锁之前别人已经写了、然后自己 busy」的多余重试。
+   *
+   * ## 嵌套保护
+   *
+   * SQLite 不支持嵌套 BEGIN。这个函数只被最外层写操作调用，
+   * 但为了将来安全，用 `inTransaction` 标记防重入 —— 已经在事务里就**不再开新的**，
+   * 由外层统一提交/回滚。
+   */
+  let inTransaction = false
+  function withFtsTransaction(fn) {
     const d = open()
-    const ts = row.ts ?? nowIso()
-    let id
-    if (table === 'profile') {
-      const r = d
-        .prepare(`INSERT INTO profile(ts,topic,text,status,writer,updated) VALUES(?,?,?,?,?,?)`)
-        .run(ts, row.topic ?? null, row.text, row.status ?? 'active', row.writer ?? 'model', nowIso())
-      id = Number(r.lastInsertRowid)
-    } else if (table === 'rules') {
-      const r = d
-        .prepare(`INSERT INTO rules(scope,kind,ts,topic,text,status,writer,updated) VALUES(?,?,?,?,?,?,?,?)`)
-        .run(row.scope ?? GLOBAL, row.kind ?? 'pref', ts, row.topic ?? null, row.text,
-             row.status ?? 'active', row.writer ?? 'model', nowIso())
-      id = Number(r.lastInsertRowid)
-    } else if (table === 'emotion') {
-      const r = d
-        .prepare(`INSERT INTO emotion(ts,cls,quote,evidence,confidence,score,text,status,writer) VALUES(?,?,?,?,?,?,?,?,?)`)
-        .run(ts, row.cls ?? null, row.quote ?? row.text, row.evidence ?? null,
-             row.confidence ?? null, row.score ?? null, row.text,
-             row.status ?? 'active', row.writer ?? 'plugin')
-      id = Number(r.lastInsertRowid)
-    } else if (table === 'logs') {
-      const r = d
-        .prepare(`INSERT INTO logs(scope,ts,topic,summary,keywords,text,status,writer) VALUES(?,?,?,?,?,?,?,?)`)
-        .run(row.scope ?? GLOBAL, ts, row.topic ?? null, row.summary ?? null,
-             row.keywords ?? null, row.text, row.status ?? 'active', row.writer ?? 'model')
-      id = Number(r.lastInsertRowid)
-    } else {
-      throw new Error(`未知的表：${table}`)
+    if (inTransaction) {
+      // 已在外层事务里：直接执行，让外层负责提交/回滚
+      return fn(d)
     }
-    syncFts(d, table, id, row)
-    return id
+    d.exec('BEGIN IMMEDIATE')
+    inTransaction = true
+    try {
+      const result = fn(d)
+      d.exec('COMMIT')
+      return result
+    } catch (error) {
+      try { d.exec('ROLLBACK') } catch { /* 回滚失败也没别的办法了 */ }
+      throw error
+    } finally {
+      inTransaction = false
+    }
+  }
+
+  function insertInto(table, row) {
+    return withFtsTransaction((d) => {
+      const ts = row.ts ?? nowIso()
+      let id
+      if (table === 'profile') {
+        const r = d
+          .prepare(`INSERT INTO profile(ts,topic,text,status,writer,updated) VALUES(?,?,?,?,?,?)`)
+          .run(ts, row.topic ?? null, row.text, row.status ?? 'active', row.writer ?? 'model', nowIso())
+        id = Number(r.lastInsertRowid)
+      } else if (table === 'rules') {
+        const r = d
+          .prepare(`INSERT INTO rules(scope,kind,ts,topic,text,status,writer,updated) VALUES(?,?,?,?,?,?,?,?)`)
+          .run(row.scope ?? GLOBAL, row.kind ?? 'pref', ts, row.topic ?? null, row.text,
+               row.status ?? 'active', row.writer ?? 'model', nowIso())
+        id = Number(r.lastInsertRowid)
+      } else if (table === 'emotion') {
+        const r = d
+          .prepare(`INSERT INTO emotion(ts,cls,quote,evidence,confidence,score,text,status,writer) VALUES(?,?,?,?,?,?,?,?,?)`)
+          .run(ts, row.cls ?? null, row.quote ?? row.text, row.evidence ?? null,
+               row.confidence ?? null, row.score ?? null, row.text,
+               row.status ?? 'active', row.writer ?? 'plugin')
+        id = Number(r.lastInsertRowid)
+      } else if (table === 'logs') {
+        const r = d
+          .prepare(`INSERT INTO logs(scope,ts,topic,summary,keywords,text,status,writer) VALUES(?,?,?,?,?,?,?,?)`)
+          .run(row.scope ?? GLOBAL, ts, row.topic ?? null, row.summary ?? null,
+               row.keywords ?? null, row.text, row.status ?? 'active', row.writer ?? 'model')
+        id = Number(r.lastInsertRowid)
+      } else {
+        throw new Error(`未知的表：${table}`)
+      }
+      syncFts(d, table, id, row)
+      return id
+    })
   }
 
   /**
@@ -423,6 +563,7 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
 
   /** 通用的「改文本」。先查在哪张表，再改，再同步 FTS。 */
   function updateText(table, id, text) {
+    assertTable(table) // 同 setStatus：table 拼进 SQL
     const d = open()
     // logs 多两列（v3）。其他表没有，硬查会抛 no such column。
     const row = table === 'logs'
@@ -463,9 +604,15 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     }
     params.push(id)
 
-    d.prepare(`UPDATE ${table} SET ${sets.join(', ')} WHERE id=?`).run(...params)
-    syncFts(d, table, id,
-      { text, topic: row.topic, summary: nextSummary, keywords: row.keywords }, row)
+    // 2026-11-16（第 9 条）：主表 UPDATE 与 FTS 同步必须同事务。
+    // 不加事务时，若 syncFts 失败 → 主表已是新内容、索引还是旧内容，
+    // 表现为「改完正文，搜出来的还是旧的那句」，且重试也修不回来
+    //（contentless FTS 用旧值 delete 时若值不匹配会**静默失败**，见 syncFts 注释）。
+    withFtsTransaction((dd) => {
+      dd.prepare(`UPDATE ${table} SET ${sets.join(', ')} WHERE id=?`).run(...params)
+      syncFts(dd, table, id,
+        { text, topic: row.topic, summary: nextSummary, keywords: row.keywords }, row)
+    })
     return { ok: true, id, persona }
   }
 
@@ -475,6 +622,7 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
    * deleted = 记错了，当它没发生
    */
   function setStatus(table, id, status) {
+    assertTable(table) // table 拼进 SQL，必须先校验（见 assertTable 注释）
     const allowed = new Set(['active', 'stale', 'deleted'])
     if (!allowed.has(status)) throw new Error(`不支持的状态：${status}`)
     const d = open()
@@ -584,18 +732,26 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     const row = d.prepare(`SELECT ${sel} FROM ${t} WHERE id=?`).get(id)
     if (!row) throw new Error('条目不存在')
     const next = typeof topic === 'string' && topic.trim() !== '' ? topic.trim() : null
-    d.prepare(`UPDATE ${t} SET topic=? WHERE id=?`).run(next, id)
-    // topic 参与 FTS 的 topic 列，必须同步，否则按 topic 搜会失配
-    try {
-      const fresh = d.prepare(`SELECT ${sel} FROM ${t} WHERE id=?`).get(id)
-      syncFts(d, t, id, fresh, row)
-    } catch {
-      /* FTS 同步失败不应阻断 topic 写入 */
-    }
+    // ⚠️ 2026-11-16（第 9 条）：原来是「UPDATE 主表 → try{ syncFts }catch{}」。
+    //
+    // 那个**空 catch** 是这条 bug 最坏的部分：FTS 同步失败被完全吞掉，
+    // topic 写进去了、索引还是旧的 → 按 topic 搜永远找不到刚改的那条，
+    // 而且日志里没有任何线索。**重试也没用** —— 旧值已经变了，
+    // contentless FTS 用不匹配的旧值 delete 是静默失败（实测确认）。
+    //
+    // 现在：同事务 + 失败向上抛。
+    // 宁可让这次改 topic 报错（用户看得见、可以重试），
+    // 也不要留下一个「看起来改成功、实际搜不到」的状态。
+    withFtsTransaction((dd) => {
+      dd.prepare(`UPDATE ${t} SET topic=? WHERE id=?`).run(next, id)
+      const fresh = dd.prepare(`SELECT ${sel} FROM ${t} WHERE id=?`).get(id)
+      syncFts(dd, t, id, fresh, row)
+    })
     return { ok: true, id, from: row.topic ?? null, to: next }
   }
 
   function setReview(table, id, review, note = null) {
+    assertTable(table) // 原来这里完全没有校验，子代理实测可改写全表
     const d = open()
     d.prepare(`UPDATE ${table} SET review=?, review_note=? WHERE id=?`).run(review, note, id)
     return { ok: true, id }
@@ -947,10 +1103,22 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
       }
     }
 
+    // ⚠️ 2026-11-16 修（第 10 条）：这 5 条 FTS 查询原来**都没有 ORDER BY**。
+    //
+    // 后果：SQLite 拿不到排序依据 → 按 FTS 内部返回顺序（近似 rowid）取前 N 条，
+    // 再让上层按 score 排 —— 但**最相关的那几条可能根本没进前 N**。
+    // 小库上不明显，库里一旦有几千条原文（archive 现在 3800+），
+    // 搜出来的就是「能搜到但搜不准」。
+    //
+    // 为什么必须写 `ORDER BY score` 而不是别的：bm25() 是**越小越相关**，
+    // 且它是唯一能利用 FTS 索引顺序的排序键。写成 DESC 会把最不相关的排前面。
+    // 注意必须用别名 score（SQLite 允许在 ORDER BY 里引用 select 别名）。
+
     // profile（无 scope 概念，永不隔离）
     push('profile', d.prepare(
       `SELECT p.id,p.ts,p.topic,p.text,bm25(profile_fts) score FROM profile_fts f
-       JOIN profile p ON p.id=f.rowid WHERE profile_fts MATCH ? AND p.status='active' LIMIT ?`
+       JOIN profile p ON p.id=f.rowid WHERE profile_fts MATCH ? AND p.status='active'
+       ORDER BY score LIMIT ?`
     ).all(q, limit), () => GLOBAL)
 
     // rules：隔离时包含本项目 + 全局规则
@@ -958,12 +1126,14 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
       push('rules', d.prepare(
         `SELECT r.id,r.ts,r.scope,r.kind,r.topic,r.text,bm25(rules_fts) score FROM rules_fts f
          JOIN rules r ON r.id=f.rowid
-         WHERE rules_fts MATCH ? AND r.status='active' AND (r.scope=? OR r.scope=?) LIMIT ?`
+         WHERE rules_fts MATCH ? AND r.status='active' AND (r.scope=? OR r.scope=?)
+         ORDER BY score LIMIT ?`
       ).all(q, projectName, GLOBAL, limit), (r) => r.scope)
     } else {
       push('rules', d.prepare(
         `SELECT r.id,r.ts,r.scope,r.kind,r.topic,r.text,bm25(rules_fts) score FROM rules_fts f
-         JOIN rules r ON r.id=f.rowid WHERE rules_fts MATCH ? AND r.status='active' LIMIT ?`
+         JOIN rules r ON r.id=f.rowid WHERE rules_fts MATCH ? AND r.status='active'
+         ORDER BY score LIMIT ?`
       ).all(q, limit), (r) => r.scope)
     }
 
@@ -999,12 +1169,14 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
       push('logs', d.prepare(
         `SELECT l.id,l.ts,l.scope,l.topic,l.summary,l.keywords,l.text,${LOGS_BM25} score FROM logs_fts f
          JOIN logs l ON l.id=f.rowid
-         WHERE logs_fts MATCH ? AND l.status='active' AND l.scope=? LIMIT ?`
+         WHERE logs_fts MATCH ? AND l.status='active' AND l.scope=?
+         ORDER BY score LIMIT ?`
       ).all(q, projectName, limit), (r) => r.scope)
     } else {
       push('logs', d.prepare(
         `SELECT l.id,l.ts,l.scope,l.topic,l.summary,l.keywords,l.text,${LOGS_BM25} score FROM logs_fts f
-         JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ? AND l.status='active' LIMIT ?`
+         JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ? AND l.status='active'
+         ORDER BY score LIMIT ?`
       ).all(q, limit), (r) => r.scope)
     }
 
@@ -1076,8 +1248,27 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
    * 否则翻页时拿不到正确总数。
    */
   function listEntries(table, {
-    scope, kind, status = 'active', q, tsFrom, tsTo, limit = 200, offset = 0, cap = 0,
+    scope, kind,
+    // status 的默认值保持 'active'（不要改！）。
+    //
+    // ⚠️ 2026-11-16 踩过的坑：我曾把默认值删掉想实现「不传就不过滤」，
+    // 但 JS 的默认参数在传 undefined 时**仍然生效**，所以那样改毫无效果；
+    // 而真正的默认值一删，所有依赖「默认只看 active」的调用点
+    //（共 20+ 处，多数在测试脚本里）行为会一起改变 —— 那是更大的风险。
+    //
+    // 正确做法：加一个**显式**的 includeAll 开关。
+    //   includeAll: true  → 完全不过滤 status（GUI 勾选「显示已停用」时用）
+    //   否则              → 按 status 过滤，默认 'active'
+    status = 'active', includeAll = false,
+    q, tsFrom, tsTo, limit = 200, offset = 0, cap = 0,
   } = {}) {
+    // ⚠️ 2026-11-16（第 7 条）：这个函数原来**没有**表名校验。
+    // 它的 cols 是三元表达式兜底到 rules，但 `FROM ${table}` 原样拼接 ——
+    // 传 `sqlite_master` 会拼出 `SELECT ... FROM sqlite_master LIMIT ?`，
+    // 因为列名对不上而报错，但**报错本身已经泄露了表是否存在**；
+    // 更糟的是配合 `q` 参数它会把表名带进子查询。
+    // 必须在这里就拦掉，而不是指望 SQL 报错。
+    assertTable(table)
     const d = open()
     const cols = table === 'logs'
       ? 'id,scope,ts,topic,summary,keywords,text,status,writer'
@@ -1090,7 +1281,9 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     const params = []
     if (scope && table !== 'profile' && table !== 'emotion') { where.push('scope=?'); params.push(scope) }
     if (kind && table === 'rules') { where.push('kind=?'); params.push(kind) }
-    if (status) { where.push('status=?'); params.push(status) }
+    // includeAll=true 时**完全不加** status 条件 —— 这样才能把
+    // 已删除 / 已停用的条目也列出来（GUI 的「显示已停用」需要）。
+    if (!includeAll && status) { where.push('status=?'); params.push(status) }
     if (tsFrom) { where.push('ts IS NOT NULL AND ts >= ?'); params.push(normalizeFrom(tsFrom)) }
     if (tsTo) { where.push('ts IS NOT NULL AND ts <= ?'); params.push(normalizeTo(tsTo)) }
     if (q) {
@@ -1145,6 +1338,11 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
   }
 
   function getById(table, id) {
+    // allowExtra: 只读，且 archive 有 id 列 —— 读一条原文是合法的
+    // （selfcheck-archive 用它验证超长原文没被截断）。
+    // 注意别的函数**不**传这个开关：updateText / setStatus 等会改写数据，
+    // 对 archive 的列假设不成立，必须继续只认四张业务表。
+    assertTable(table, { allowExtra: true })
     const d = open()
     return d.prepare(`SELECT * FROM ${table} WHERE id=?`).get(id)
   }

@@ -18,11 +18,19 @@
  * **不能**：判断「本轮该不该写」。那需要模型行为，脚本测不了。
  *      所以它守的是**下限**：一段时间内至少有一条，而不是每轮都有。
  *
- * ## 判据（与用户 2026-11-16 定的规则对齐）
+ * ## 判据（2026-11-16 21:55 改写，**不再用「距今多久」判活**）
  *
- * 用户明确要求「每轮都要记，不跳轮」。但脚本无法知道「本轮」边界，
- * 所以退一步守可测的部分：**最近 30 分钟内必须有过至少一条成功写入**。
- * 时间窗可调（`E2E_WINDOW_MIN`，默认 30）。
+ * 用户明确要求「每轮都要记，不跳轮」。脚本无法知道「本轮」边界，
+ * 但可以看**最近一条 user 消息之后有没有产生流水** —— 那是因果的，与现在几点无关：
+ *
+ *   上一轮已结束（user 之后有 assistant 回复）→ 那一轮之后必须有流水
+ *
+ * 旧判据是「最近一条流水距今 ≤ WINDOW_MIN 分钟」。它有个致命毛病：
+ * **用户歇几个小时回来，它必然红，而通道完全正常**（2026-11-16 实测 466 分钟）。
+ * 会随空闲时长自然变红的断言等于没有断言 —— 人会开始忽略它。
+ *
+ * `E2E_WINDOW_MIN` 仍保留，但**只用于第 3 段的字段完整性窗口**
+ * （「最近 N 分钟内新增的流水，字段必须齐全」），不再参与「通道活着」的判定。
  *
  * ## 不需要 DSH 在跑时会怎样
  *
@@ -36,6 +44,15 @@ import { fileURLToPath } from 'node:url'
 const BASE = (process.env.DSH_BASE || process.env.DSH_WEB_URL || '').replace(/\/+$/, '')
 const SCOPE = process.env.E2E_SCOPE || 'dsh-fatfishdream-memory'
 const WINDOW_MIN = Number(process.env.E2E_WINDOW_MIN ?? 30)
+
+// 2026-11-16 22:40 删除了 `MISSED_TURNS`（历史漏记豁免名单）。
+//
+// 为什么删：它豁免的是「某个已封口轮次里没有流水」这条断言，
+// 而**那整条断言已经移出回归了**（改由运行时 writeFailStreak 兜）。
+// 留下它就是下一个"孤儿常量" —— 看起来在守什么，其实没有调用点。
+//
+// 那条被豁免的历史漏记（2026-11-16 21:54，8 条回复 0 流水）事实仍然成立，
+// 已记在 AGENTS.md 与 docs/TODO.md 里，不需要在这里再留一份。
 
 let pass = 0
 let fail = 0
@@ -73,16 +90,16 @@ check('entries 接口可用', ents.status === 200 && ents.json?.ok === true, `st
 const rows = Array.isArray(ents.json?.entries) ? ents.json.entries : []
 check('该项目有流水记录（≥1 条）', rows.length > 0, `已取回 ${rows.length} 条`)
 
-if (rows.length > 0) {
-  // ⚠️ API 返回的是 ISO 格式 `2026-11-16T03:29:13.053`（无时区后缀，本地时间）。
-  //    PowerShell 的 Invoke-RestMethod 会自动把它转成 DateTime 显示成
-  //    `11/16/2026 03:29:13` —— 别被那个显示格式骗了，正则要按 ISO 写。
-  //    （2026-11-16 实测踩过：按 `11/16/2026 3:29:13` 写正则，0/50 全部解析失败。）
-  const parseTs = (s) => {
-    const t = Date.parse(String(s ?? ''))
-    return Number.isFinite(t) ? t : NaN
-  }
+// ⚠️ API 返回的是 ISO 格式 `2026-11-16T03:29:13.053`（无时区后缀，本地时间）。
+//    PowerShell 的 Invoke-RestMethod 会自动把它转成 DateTime 显示成
+//    `11/16/2026 03:29:13` —— 别被那个显示格式骗了，正则要按 ISO 写。
+//    （2026-11-16 实测踩过：按 `11/16/2026 3:29:13` 写正则，0/50 全部解析失败。）
+const parseTs = (s) => {
+  const t = Date.parse(String(s ?? ''))
+  return Number.isFinite(t) ? t : NaN
+}
 
+if (rows.length > 0) {
   const times = rows.map((r) => parseTs(r.ts)).filter((t) => Number.isFinite(t))
   check('流水 ts 可解析', times.length === rows.length, `可解析 ${times.length}/${rows.length}`)
 
@@ -90,14 +107,136 @@ if (rows.length > 0) {
     const newest = Math.max(...times)
     const ageMin = (Date.now() - newest) / 60000
     const ageRounded = Math.round(ageMin * 10) / 10
+    // 只打印、**不断言** —— 见下面 §2b 的说明。
     console.log(`   最近一条流水：${new Date(newest).toLocaleString()}（${ageRounded} 分钟前）`)
-    check(
-      `最近一条流水在 ${WINDOW_MIN} 分钟内（通道仍然活着）`,
-      ageMin <= WINDOW_MIN,
-      `最近一条是 ${ageRounded} 分钟前，超过 ${WINDOW_MIN} 分钟窗口 —— ` +
-        `要么模型很久没写流水，要么通道坏了。两者都需要人看。`,
-    )
   }
+
+  // ---- 2b) 进程存活度：诊断日志心跳静默期 ----
+  //
+  // ## 🔴 2026-11-16 22:40 第三次改写：这段判断从「模型行为」彻底移出回归
+  //
+  // 前后写过三版，每版都在同一个坑里换个姿势：
+  //
+  //   ① 「最近一条流水距今 ≤30 分钟」
+  //      → 用户歇 7h45m 回来必红（466 分钟前），而通道完全正常。
+  //   ② 「最近一条 user 之后有没有流水」
+  //      → **我在干活时跑它必然红**（这一轮的流水还没写呢）。
+  //   ③ 「已封口区间 [倒数第二条 user, 最近一条 user) 里有没有流水」
+  //      → 不误报了，但它**仍然是"测试模型有没有在场"**。
+  //
+  // 用户 2026-11-16 22:26 一句话点破：「我中间歇了几个小时，真的需要让你
+  // 更改断言吗」。**答案是：不该改断言，该把这件事移出回归。**
+  //
+  // ## 三类东西不该混在一条断言里（这是三轮返工的根因）
+  //
+  //   | 类别       | 例子                        | 该在回归里吗 |
+  //   |-----------|----------------------------|------------|
+  //   | 代码正确性  | 路由注册了、appendLog 接上了  | ✅ 该（本文件下半段 20+ 条） |
+  //   | 模型行为    | 这轮写没写流水               | ❌ 不该 —— 结果与代码无关 |
+  //   | 使用频率    | 最近有没有人说话             | ❌ 绝对不该 |
+  //
+  // 「模型没记流水」是真实问题，但**它该由运行时兜住，不是由回归抓**：
+  // 插件里的 `writeFailStreak`（turn-stopping）已经在按轮计数，
+  // 连续 4 轮没写就提醒一次 —— 那是**正确的时机**（轮次结束的当下），
+  // 而回归只在我跑测试时才有机会看一眼，既晚又不可靠。
+  //
+  // ## 现在这段只守「进程存活度」这一个维度
+  //
+  // 判据：**诊断日志文件的最新时间戳距今 < HEARTBEAT_STALE_MIN**。
+  // 插件每 5 分钟写一行 `[heartbeat]`（index.js 的 HEARTBEAT_MS），
+  // 所以只要进程活着，日志必然有新行。这与「用户在场吗」「模型写没写记忆」
+  // 完全无关 —— 它是纯进程状态。
+  //
+  // 三个维度各读一处，互不顶替：
+  //   进程活着   → 本段（日志心跳静默期）
+  //   记忆在写入 → writeFailStreak（运行时，按轮）
+  //   代码没坏   → 本段之外的源码/行为断言
+  const HEARTBEAT_STALE_MIN = Number(process.env.E2E_HEARTBEAT_STALE_MIN ?? 15)
+
+  // ⚠️ 不能只看「今天日期」那个文件：跨零点前后跑测试时，
+  // 最新写入可能在昨天的文件里（22:59 的心跳，00:01 跑测试）。
+  // 所以按 mtime 挑最新文件，再解析它最后一行的时间戳。
+  const fsmod = await import('node:fs')
+  const pathmod = await import('node:path')
+  const LOG_DIR = process.env.E2E_LOG_DIR || pathmod.join('D:/dsh-fatfishdream-memory', 'logs')
+
+  let logFiles = []
+  try {
+    logFiles = fsmod
+      .readdirSync(LOG_DIR)
+      .filter((f) => f.endsWith('.log'))
+      .map((f) => {
+        const full = pathmod.join(LOG_DIR, f)
+        return { full, mtime: fsmod.statSync(full).mtimeMs }
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+  } catch (e) {
+    check('能读到诊断日志目录', false, `${LOG_DIR} —— ${String(e?.message ?? e)}`)
+  }
+
+  check('诊断日志目录里有 .log 文件', logFiles.length > 0, `${LOG_DIR}（${logFiles.length} 个）`)
+
+  if (logFiles.length > 0) {
+    const newest = logFiles[0]
+    // 只取最后 50 行 —— 心跳每 5 分钟一行，最后一行必然是最近的活动。
+    // 整文件读进来没必要（2026-11-16 那个文件已经 426KB / 5071 行）。
+    let tail = []
+    try {
+      const content = fsmod.readFileSync(newest.full, 'utf8')
+      tail = content.split('\n').filter((l) => l.trim() !== '').slice(-50)
+    } catch (e) {
+      check('能读最新日志文件', false, String(e?.message ?? e))
+    }
+
+    // 时间戳格式：`2026-11-16T22:35:01.123Z`（UTC，24 字符固定长）
+    const TS_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)/
+    let newestTs = NaN
+    for (let i = tail.length - 1; i >= 0; i--) {
+      const m = TS_RE.exec(tail[i])
+      if (m) {
+        const t = Date.parse(m[1])
+        if (Number.isFinite(t)) {
+          newestTs = t
+          break
+        }
+      }
+    }
+
+    check('能解析出日志最新一行的时间戳', Number.isFinite(newestTs), `读了最后 ${tail.length} 行`)
+
+    if (Number.isFinite(newestTs)) {
+      const staleMin = (Date.now() - newestTs) / 60000
+      const staleRounded = Math.round(staleMin * 10) / 10
+      console.log(
+        `   诊断日志最新一行：${new Date(newestTs).toLocaleString()}（${staleRounded} 分钟前）` +
+          `｜文件 ${pathmod.basename(newest.full)}`,
+      )
+      // 心跳 5 分钟一行，15 分钟 = 3 倍容错：容忍一次调度延迟或短暂卡顿，
+      // 又不会把「刚卡了一下」误判成「死了」。
+      check(
+        `诊断日志在 ${HEARTBEAT_STALE_MIN} 分钟内有新行（进程活着 —— 心跳 5 分钟一行）`,
+        staleMin <= HEARTBEAT_STALE_MIN,
+        `${staleRounded} 分钟没有新行，超过 ${HEARTBEAT_STALE_MIN} 分钟。` +
+          `插件每 5 分钟写一行 [heartbeat]，这么久没动静说明**进程可能已经死了**，` +
+          `或心跳定时器被移除了（查 index.js 的 HEARTBEAT_MS / setInterval）。` +
+          `⚠️ 这与"模型有没有写记忆"无关 —— 那是 writeFailStreak 的职责。`,
+      )
+
+      // 防止「日志有行但不是心跳」蒙混过关：比如只有 user-message。
+      // 那说明心跳被删了、但别的写入还在 —— 会让上面那条断言失去意义
+      // （用户在场时它也成立，于是"死了"这个状态永远测不出来）。
+      const hasBeat = tail.some((l) => l.includes('[heartbeat]'))
+      check(
+        '日志里能看到 [heartbeat] 行（心跳定时器在跑，不只是别的写入）',
+        hasBeat,
+        `最后 ${tail.length} 行里没有 [heartbeat]。` +
+          `若日志有行却没有心跳，说明 setInterval 被移除或抛错了 —— ` +
+          `这会让「日志有行」这个判据失去意义（用户在场时它也成立）。`,
+      )
+    }
+  }
+
+
 
   // ---- 3) 最近几条的字段完整性（抓「topic 被白名单拒收后置空」这类坏数据）----
   //

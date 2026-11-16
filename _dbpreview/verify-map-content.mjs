@@ -41,7 +41,7 @@ const locate = (sec, re, nth = 0) => {
 /** 锚点：只有「名字 + 定位正则 + 该行必须出现的片段」。
  *  行号由 locate 现算，**不写死** —— 写死就是下一次误报的来源。 */
 const ANCHORS = [
-  ['index', /^\s*function createStore\(/, 'createStore', 'createStore'],
+  ['index', /^\s*(export )?function createStore\(/, 'createStore', 'createStore'],
   ['index', /^\s*function resolveProjectKey\(/, 'resolveProjectKey', 'resolveProjectKey'],
   ['index', /^\s*function stripPolicyPhrases\(/, 'stripPolicyPhrases', 'stripPolicyPhrases'],
   ['index', /^\s*export function apply\(/, 'export function apply(', 'apply 定义'],

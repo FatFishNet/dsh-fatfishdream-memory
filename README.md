@@ -274,10 +274,10 @@ $env:DSH_BASE = $env:DSH_WEB_URL
 |---|---|
 | 包版本 | `1.2.0`（MIT） |
 | schema | v5 |
-| 代码规模 | `index.js` 5195 行 / `client.js` 2499 行 / `db-store.mjs` 1496 行 / `db-schema.mjs` 422 行 |
+| 代码规模 | `index.js` 5661 行 / `client.js` 2499 行 / `db-store.mjs` 1694 行 / `db-schema.mjs` 422 行 |
 | HTTP 路由 | 22 条 |
-| 回归测试 | 34 个脚本 + 34 个变异（锚点须 34/34 匹配，真跑 34/34 KILLED） |
-| 每轮注入 | 6482 字节 / 约 1461 token |
+| 回归测试 | 37 个脚本 + 40 个变异（锚点须 40/40 匹配，真跑 40/40 KILLED） |
+| 每轮注入 | 约 6.5 KB / 约 1467 token（随记忆数据量浮动，非固定值） |
 | 第三方依赖 | 零（仅 Node 内置模块） |
 | 平台 | Windows（macOS 未验证） |
 | 健康自检 | 启动后核验 9 项挂载点 |

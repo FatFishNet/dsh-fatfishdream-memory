@@ -121,7 +121,12 @@ const MUTATIONS = [
     id: 'injection-role-warning',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '删掉注入里的 role 区分警告',
-    from: "'`rows` 每行带 `role`（user / assistant）：**assistant 那侧就是你自己说的**，别当成「我们讨论过」；',",
+    // ⚠️ 2026-11-17 更新锚点：这句话在「同工作区多会话」修正时被重写过。
+    //    旧锚点（`assistant 那侧就是你自己说的`）已不存在 → 变异会 SKIP，
+    //    而 SKIP 在新规则下计入失败（所以不更新的话回归会红）。
+    //    锚点改成新文案里唯一的开头片段，`to` 用等长的替代串避免移位。
+    from:
+      "'`rows` 每行带 `role`（user / assistant）和 `session_id`：**assistant 那侧是 AI 说的，但不是用户说的**，别当成「我们讨论过」；'",
     to: "'（mutated: role warning removed）',",
   },
   {
@@ -157,7 +162,10 @@ const MUTATIONS = [
     id: 'isInside-prefix',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: 'isInside 退回字符串 startsWith（/a/bc 会被当成 /a/b 的子目录）',
-    from: "  const rel = relativePath(root, target)\n  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))",
+    // 2026-11-16 更新：isInside 已修成「只在 .. 独立成段时算上跳」，
+    // 锚点随之改成新实现。旧的 from 仍写 startsWith，永远匹配不上 → SKIP，
+    // 而 SKIP 不计入 KILLED，等于这条防线悄悄消失了（见 AGENTS.md 变异章节）。
+    from: "  return rel === '' || (!/^\\.\\.($|[\\\\/])/.test(rel) && !isAbsolute(rel))",
     to: "  return String(target).startsWith(String(root))",
   },
   {
@@ -427,10 +435,81 @@ const MUTATIONS = [
       '          : null,',
     to: 'policySyncVersion: null,',
   },
+  // ---- 2026-11-16：守「覆盖丢收尾语」的修复 ----
+  //
+  // 这次踩的坑正是「覆盖 policy.md 时收尾语随旧文件一起丢失」。
+  // 修复是在 syncPolicyOnce 里先 extractHeartbeat 提取、覆盖后 restoreHeartbeat 写回。
+  // 下面这个变异把「提取」那行删掉 → 收尾语不再写回 → selfcheck-policy-sync 必须红。
+  {
+    id: 'policy-sync-heartbeat-lost',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '覆盖 policy.md 前不再提取收尾语（升级后收尾语永久丢失）',
+    from: "    const oldHeartbeat = current === undefined ? '' : extractHeartbeat(current)",
+    to: "    const oldHeartbeat = ''",
+  },
+  // ---- 2026-11-16：守「收尾语正则」的两次修正 ----
+  //
+  // 这条线经过三个版本，两个都是错的，都不能退回去：
+  //
+  //   ① 吞标题版（原始 bug）：
+  //      吞掉所有不以 `-` 开头的行 → 空行 + `##` 标题一起没。
+  //      用户 policy.md 从 13850 → 13791 字节、232 → 230 行，**零报错**。
+  //
+  //   ② 不跟踪续行版（我修 ① 时矫枉过正）：
+  //      用户手写折行时会留下**孤立的缩进续行**。
+  //
+  //   ③ 正确形态（当前）：只跟踪「缩进续行」。
+  // 下面两条变异分别退回 ① 和 ②，场景 7 / 场景 8 各抓一个。
+  {
+    id: 'heartbeat-regex-eats-heading',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '收尾语正则退回「吞标题」版（保存一次就吞掉后面的 ## 标题）',
+    from: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*(?:\\n[ \\t]+[^\\n]*)*\\n?/m',
+    to: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*\\n(?:(?!^[ \\t]*-)[^\\n]*\\n?)*/m',
+  },
+  {
+    id: 'heartbeat-regex-orphan-continuation',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '收尾语正则退回「不跟踪续行」版（用户折行时留下孤儿续行）',
+    from: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*(?:\\n[ \\t]+[^\\n]*)*\\n?/m',
+    to: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*\\n?/m',
+  },
+  // ---- 2026-11-16：删除分支不得内联另一个正则 ----
+  //
+  // 这条守的是**测试本身的盲区**，不是产品 bug。实测发现：
+  // 行为测试测的是「blockRe 这个变量里的正则对不对」，如果调用处被改成
+  // 内联正则（不用 blockRe 了），blockRe 本身没变 → 所有正则层面的断言全绿，
+  // 而真正执行的代码已经坏了。变异实测确认那会 SURVIVED。
+  // 修法是补一条源码级断言：「删除分支必须 current.replace(blockRe, '')」。
+  {
+    id: 'heartbeat-delete-inlines-regex',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '删除分支内联另一个正则（正则层测试全部无法感知）',
+    from: "      updated = current.replace(blockRe, '')",
+    to: "      updated = current.replace(/^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*\\n?/m, '')",
+  },
   // 注：2026-11-16 曾加过两条 `dup-guard-*` 变异，守的是「本轮已用 HTTP 写过
   // 则忽略正文标记」的防呆。该防呆已移除（它只能挡入库、挡不住渲染，
   // 真正的解法是把约束写进 policy.md 源头），所以对应变异一并删除 ——
   // 变异锚点指向已不存在的代码，留着只会变成 SKIP。
+  {
+    id: 'message-key-no-session',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '去重键去掉 sessionId（跨会话撞键 → 被撞那条原文永久丢失）',
+    // ⚠️ 锚点必须带 makeMessageKey 独有的 `return `${sid}:` 前缀。
+    //    只写 `${turn ?? '?'}:${step ?? '?'}` 会匹配到别处（模板字符串形态在
+    //    index.js 里不唯一），变异会静默打到错误的行上 —— 见 AGENTS.md
+    //    「变异锚点必须唯一」。
+    from: '  return `${sid}:${turn ?? \'?\'}:${step ?? \'?\'}`',
+    to: '  return `${turn ?? \'?\'}:${step ?? \'?\'}`',
+  },
+  {
+    id: 'message-key-uses-or',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'sid 判定从 `=== undefined || === null` 改成 `||`（id=0 被当成缺失）',
+    from: "  const sid = id === undefined || id === null ? '?' : String(id)",
+    to: "  const sid = id ? String(id) : '?'",
+  },
 ]
 
 // ---- --dry-run：只列出会改哪里，不动任何文件 ----

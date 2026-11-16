@@ -51,6 +51,14 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO = path.resolve(HERE, '..')
 
 // ---- 脚本清单（唯一真相）----
+//
+// ⚠️ 这里**刻意不含** `audit-full.mjs` / `audit-rules.mjs` / `audit-baseline.mjs`。
+//
+// 它们是「完整自检」（阶段性全面体检），不是日常回归的一部分：
+//   - audit-full 自己会调用 run-all（D 段），放进来会无限递归
+//   - 它的成本远高于其它脚本，混进来会让日常回归变慢，然后大家都去跳过
+//
+// 完整自检只手动跑：`node _dbpreview/audit-full.mjs`（见 docs/TESTING.md §0.01）
 export const SCRIPTS = [
   'verify-functions',
   'verify-map',
@@ -89,6 +97,32 @@ export const SCRIPTS = [
   'test-marker-forms',
   'selfcheck-search-tier',
   'selfcheck-scope-rename',
+  // ★ 2026-11-16 新增：policy.md 一次性覆盖的真实行为回归。
+  //   这是唯一真正 import 并执行 createStore.ensureLayout 的脚本 ——
+  //   之前的测试只查「源码里有没有那几行字」，从不执行覆盖逻辑，
+  //   于是漏掉了「升级时收尾语随覆盖丢失」这个真 bug。详见脚本头部注释。
+  'selfcheck-policy-sync',
+  // ★ 2026-11-16 新增：消息去重键的真实行为回归。
+  //   守的是「不同 session 的同一 turn:step 不能撞键」—— 撞了那条原文永久丢失。
+  //   抽成顶层纯函数 makeMessageKey 之前它**无法黑盒验证**：需要伪造两个会话
+  //   消费相同 turn:step，而单会话测试里 sid 恒定，加不加前缀行为一样 →
+  //   那种测试会绿却证明不了任何事。详见脚本头部注释。
+  'selfcheck-message-key',
+  // ★ 2026-11-17 新增：并发写入完整性（多进程）。
+  //   守的是「并发写会不会丢」—— 记忆里唯一一次「丢到只剩 1 条」的实测记录
+  //   是 D13（.md 时代的读-改-写），改 SQLite 之后从未实测过。
+  //   这个脚本 fork 4 个真实进程同时写同一个临时库，断言成功次数 == 库里条数。
+  'selfcheck-concurrency',
+  'selfcheck-concurrency-multiproc',
+  // ★ 2026-11-17 新增：serialize() 串行队列的行为回归。
+  //   守的是「state.json 的读-改-写不会互相覆盖」。此前 serialize 只用在 2 处，
+  //   registerProject / moveProject / /scope/rename 三条**没走锁** ——
+  //   实测故障注入：去掉锁后并发注册 12 个项目，**12 个全丢**。
+  'selfcheck-serialize',
+  // ★ 2026-11-16 新增：§3.1 裸数字行号表的核对。
+  //   verify-map 只认带 L 前缀的引用，§3.1 那张表写的是裸数字 →
+  //   它**完全不受校验**。实测表里 15 行全部指错位置而 verify-map 报 0 处落空。
+  'verify-symbol-lines',
 ]
 
 // ---- 参数 ----
@@ -98,6 +132,19 @@ const onlyIdx = argv.indexOf('--only')
 const only = onlyIdx >= 0 && argv[onlyIdx + 1]
   ? new Set(argv[onlyIdx + 1].split(',').map((s) => s.trim()))
   : null
+
+// 防止有人把完整自检加进 SCRIPTS —— 那会造成 audit-full 调 run-all 调 audit-full 的递归。
+// ⚠️ 必须检查**用户传入的 --only 参数**，而不只是过滤后的 list ——
+// 否则 `--only audit-full` 会被过滤成空列表，检查形同虚设（2026-11-16 实测）。
+const FORBIDDEN = new Set(['audit-full', 'audit-rules', 'audit-baseline'])
+const requested = only ? [...only] : SCRIPTS
+for (const s of requested) {
+  if (FORBIDDEN.has(s)) {
+    console.error(`❌ ${s} 是完整自检的组成部分，不能放进 run-all（会递归调用自己）。`)
+    console.error('   完整自检请直接跑：node _dbpreview/audit-full.mjs')
+    process.exit(1)
+  }
+}
 
 const list = only ? SCRIPTS.filter((s) => only.has(s)) : SCRIPTS
 

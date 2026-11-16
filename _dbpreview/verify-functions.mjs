@@ -25,7 +25,7 @@ const targets = [
   ['idx', /^const STRONG_THRESHOLD/, 'STRONG_THRESHOLD'],
   ['idx', /^const LEXICON = /, 'LEXICON'],
   ['idx', /^function analyzeEmotion/, 'analyzeEmotion'],
-  ['idx', /^function createStore/, 'createStore'],
+  ['idx', /^(export )?function createStore/, 'createStore'],
   ['idx', /^function readStateSync/, 'readStateSync'],
   ['idx', /^export function apply/, 'apply'],
   ['idx', /^\s*const safeOn/, 'safeOn'],

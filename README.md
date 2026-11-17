@@ -276,7 +276,7 @@ $env:DSH_BASE = $env:DSH_WEB_URL
 | schema | v5 |
 | 代码规模 | `index.js` 5843 行 / `client.js` 2499 行 / `db-store.mjs` 1694 行 / `db-schema.mjs` 422 行 |
 | HTTP 路由 | 22 条 |
-| 回归测试 | 48 个脚本 + 40 个变异（锚点须 40/40 匹配，真跑 40/40 KILLED） |
+| 回归测试 | 50 个脚本 + 40 个变异（锚点须 40/40 匹配，真跑 40/40 KILLED） |
 | 每轮注入 | 约 6.5 KB / 约 1467 token（随记忆数据量浮动，非固定值） |
 | 第三方依赖 | 零（仅 Node 内置模块） |
 | 平台 | Windows（macOS 未验证） |

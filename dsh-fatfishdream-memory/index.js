@@ -548,6 +548,84 @@ function parseJson(text) {
   return JSON.parse(cleaned)
 }
 
+/**
+ * 把 HTTP body 里的 `id` 解析成正整数；不合法返回 `null`。
+ *
+ * ⚠️ 2026-11-17 新增（TODO 待办 P）：**不能直接 `Number(body.id)`**。
+ *
+ * 原来的写法是 `const id = Number(body.id)` 配 `Number.isInteger(id)`，
+ * 看起来在类型检查，实际漏得很彻底 —— 因为 `Number()` 的强制转换非常宽容：
+ *
+ *     Number(true)   === 1         ← 布尔被当成 id=1
+ *     Number(false)  === 0
+ *     Number([7])    === 7         ← 单元素数组被当成 id=7
+ *     Number(null)   === 0
+ *     Number('')     === 0
+ *     Number('  7 ') === 7         ← 前后空格也认
+ *     Number('7abc') === NaN       ← 这个才会被拦住
+ *
+ * 于是 `POST /entry/delete {"id": true}` 会**软删掉 id=1 的那条真实记忆**，
+ * 而 `{"id": [7]}` 会改到 #7 —— 调用方传错类型，不该命中任何条目。
+ *
+ * 判据：**只接受 number 或纯数字字符串**，其余一律 null。
+ * 这不是「更严格」，而是「不接受看起来像数字的其他类型」。
+ *
+ * @param {unknown} raw
+ * @returns {number|null}
+ */
+function parseId(raw) {
+  if (typeof raw === 'number') {
+    return Number.isSafeInteger(raw) && raw > 0 ? raw : null
+  }
+  if (typeof raw === 'string') {
+    const t = raw.trim()
+    // 只认纯十进制数字。不用 Number() 是刻意的 —— 见上面的反例。
+    if (!/^\d+$/.test(t)) return null
+    const n = Number(t)
+    return Number.isSafeInteger(n) && n > 0 ? n : null
+  }
+  // boolean / null / undefined / object / array 一律拒绝
+  return null
+}
+
+/**
+ * 把 query 参数解析成**限定范围内的整数**；不合法就返回默认值。
+ *
+ * ⚠️ 2026-11-17 新增（TODO 待办 O）：原来各处写的是
+ * `Number(url.searchParams.get('limit')) || 30` 这类表达式，有四个坑：
+ *
+ *   ① `Number('-1') || 30` → **-1**（负数是真值，`||` 兜不住）
+ *      于是 `for (let i = 0; out.length < -1; ...)` 一次都不进 → **静默返回 0 条**。
+ *      看起来像「记忆里没有这段」，实际是参数非法。
+ *
+ *   ② `Number('2.5') || 30` → **2.5** → 传给 SQLite 的 LIMIT 是小数
+ *      → `datatype mismatch` → 整个请求 500。
+ *
+ *   ③ `Number('1e21') || 30` → **1e21**（是整数，`Number.isInteger` 也通过）
+ *      → 同样 datatype mismatch。
+ *
+ *   ④ `Number('0') || 30` → **30** —— `0` 是假值被兜掉。
+ *      用户明确要 0 条（探活/调试）却拿到 30 条。这是经典 `||` vs `??` 的坑。
+ *
+ * 所以判据必须是「**先判是否合法整数，再判范围**」，不能靠 `||` 兜底。
+ *
+ * @param {string|null} raw  query 参数原值（可能为 null）
+ * @param {number} def       缺省值（参数没传时用）
+ * @param {{min?: number, max?: number}} [range]
+ * @returns {number}
+ */
+function clampInt(raw, def, range = {}) {
+  const min = range.min ?? 0
+  const max = range.max ?? Number.MAX_SAFE_INTEGER
+  if (raw === null || raw === undefined) return def
+  const t = String(raw).trim()
+  // 只认整数形态：允许前导负号，不接受小数点 / 科学计数法 / ABC
+  if (!/^-?\d+$/.test(t)) return def
+  const n = Number(t)
+  if (!Number.isSafeInteger(n)) return def
+  return Math.max(min, Math.min(max, n))
+}
+
 function shortHash(value) {
   return createHash('sha1').update(String(value)).digest('hex').slice(0, 8)
 }
@@ -865,7 +943,24 @@ async function copyTree(from, to, skipped = []) {
   let entries
   try {
     entries = await readdir(from, { withFileTypes: true })
-  } catch {
+  } catch (error) {
+    // ⚠️ 2026-11-17 修（TODO 待办 C）：**不能一律 return 0**。
+    //
+    // `return 0` 在语义上是「这个目录是空的」，但真实原因可能是：
+    // 权限不足（EACCES）、被占用（EBUSY）、路径过长（ENAMETOOLONG）、
+    // 盘离线（ENODEV）、或一个断掉的 junction。
+    //
+    // 原来把这些全当成「空目录」→ 迁移照常完成、`setRoot` 照常切根、
+    // 接口照常返回 `ok:true, moved:N` —— **用户看到「迁完了，少了一部分」，
+    // 而日志里一个字都没有**。
+    //
+    // 这条最刺眼的地方：本函数自己的注释（上方）写着「静默丢失是最难排查的
+    // 失败形态 —— 这条的整个意义就是『不要静默』」，而对 junction 做了
+    // skippedEntries 收集，**唯独漏了「连目录都读不进去」这一种**。
+    //
+    // 修法与 junction 那路保持一致：ENOENT 视为真的空（合理），其余一律记账。
+    if (error && error.code === 'ENOENT') return 0
+    skipped.push(`${from}（读取失败：${error?.code ?? error?.message ?? error}）`)
     return 0
   }
   let count = 0
@@ -4849,8 +4944,8 @@ export function apply(ctx, rawConfig = {}) {
               // 时间范围：接受 YYYY-MM-DD 或完整 ISO8601
               tsFrom: q.get('from') || undefined,
               tsTo: q.get('to') || undefined,
-              limit: Math.min(Number(q.get('limit')) || 200, 500),
-              offset: Number(q.get('offset')) || 0,
+              limit: clampInt(q.get('limit'), 200, { min: 1, max: 500 }),
+              offset: clampInt(q.get('offset'), 0, { min: 0 }),
               cap,
             })
             // scopes 跟着被查的表走：流水页要按项目筛，而 logs 与 rules 的
@@ -4919,8 +5014,8 @@ export function apply(ctx, rawConfig = {}) {
             if (role !== undefined && role !== 'user' && role !== 'assistant') {
               return json(res, 400, { ok: false, error: 'role 只能是 user | assistant' })
             }
-            const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit')) || 50, 500))
-            const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0)
+            const limit = clampInt(url.searchParams.get('limit'), 50, { min: 1, max: 500 })
+            const offset = clampInt(url.searchParams.get('offset'), 0, { min: 0 })
             const { rows, total } = dbStore.listArchive({
               scope,
               role,
@@ -4972,8 +5067,8 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 405, { ok: false, error: '只接受 POST（改正文有副作用）' })
             }
             const body = await readBody(req)
-            const id = Number(body.id)
-            if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
+            const id = parseId(body.id)
+            if (id === null) return json(res, 400, { ok: false, error: '需要 id（正整数）' })
             // 表名来自 body，进 store 前先校验（store 层也有兜底，这里是为了错误更明确）
             const table = body.table ? assertTable(body.table) : findTableById(id)
             if (!table) return json(res, 400, { ok: false, error: `找不到 id=${id}` })
@@ -5292,8 +5387,8 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 405, { ok: false, error: '只接受 POST（删除有副作用）' })
             }
             const body = await readBody(req)
-            const id = Number(body.id)
-            if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
+            const id = parseId(body.id)
+            if (id === null) return json(res, 400, { ok: false, error: '需要 id（正整数）' })
             const table = body.table ? assertTable(body.table) : findTableById(id)
             if (!table) return json(res, 400, { ok: false, error: `找不到 id=${id}` })
             // 软删除：记忆是历史，误删难恢复
@@ -5329,9 +5424,9 @@ export function apply(ctx, rawConfig = {}) {
               const results = []
               for (const it of body.items) {
                 try {
-                  const id = Number(it.id)
-                  const table = it.table ? assertTable(it.table) : findTableById(id)
-                  if (!Number.isInteger(id) || !table) {
+                  const id = parseId(it.id)
+                  const table = id === null ? null : (it.table ? assertTable(it.table) : findTableById(id))
+                  if (id === null || !table) {
                     results.push({ id: it.id, ok: false, error: '找不到条目' })
                     continue
                   }
@@ -5346,8 +5441,8 @@ export function apply(ctx, rawConfig = {}) {
             }
 
             // 单条：{ id, table?, topic }
-            const id = Number(body.id)
-            if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
+            const id = parseId(body.id)
+            if (id === null) return json(res, 400, { ok: false, error: '需要 id（正整数）' })
             const table = body.table ? assertTable(body.table) : findTableById(id)
             if (!table) return json(res, 400, { ok: false, error: `找不到 id=${id}` })
             const r = dbStore.setTopic(table, id, body.topic)
@@ -5371,9 +5466,9 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 405, { ok: false, error: '只接受 POST（改状态有副作用）' })
             }
             const body = await readBody(req)
-            const id = Number(body.id)
+            const id = parseId(body.id)
             const status = String(body.status ?? '')
-            if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
+            if (id === null) return json(res, 400, { ok: false, error: '需要 id（正整数）' })
             if (!['active', 'stale', 'deleted'].includes(status)) {
               return json(res, 400, { ok: false, error: 'status 只能是 active / stale / deleted' })
             }
@@ -5398,8 +5493,8 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 405, { ok: false, error: '只接受 POST（升级为全局有副作用）' })
             }
             const body = await readBody(req)
-            const id = Number(body.id)
-            if (!Number.isInteger(id)) return json(res, 400, { ok: false, error: '需要 id' })
+            const id = parseId(body.id)
+            if (id === null) return json(res, 400, { ok: false, error: '需要 id（正整数）' })
             // 单向操作：项目 → 全局允许，全局 → 项目不提供
             const r = dbStore.upgradeToGlobal(id)
             diag('entry-upgraded', { id, from: r.from })
@@ -5502,7 +5597,7 @@ export function apply(ctx, rawConfig = {}) {
             }
             const project = crossProject ? null : explicitProject
             const rows = dbStore.search(q, {
-              limit: Number(url.searchParams.get('limit')) || 30,
+              limit: clampInt(url.searchParams.get('limit'), 30, { min: 1, max: 200 }),
               projectName: project || null,
               crossProject,
             })

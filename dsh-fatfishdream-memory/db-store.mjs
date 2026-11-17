@@ -1152,10 +1152,27 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
     // 且它是唯一能利用 FTS 索引顺序的排序键。写成 DESC 会把最不相关的排前面。
     // 注意必须用别名 score（SQLite 允许在 ORDER BY 里引用 select 别名）。
 
+    // ⚠️ 2026-11-17 修（TODO 待办 L / M）：三条 SQL 都补上 `review` 过滤。
+    //
+    // 问题：用户在 GUI 里点「撤回」会把 `review` 置成 `'retracted'`，
+    // 语义是「这条不对，别再用了」。但 `search()` 原来**只过滤 status**，
+    // 所以模型仍能搜到并把它当有效结论 —— 用户的决定被静默忽略。
+    //
+    // 而**注入侧早就过滤了**（本文件 L326 / L343 都有 `review IS NOT 'retracted'`），
+    // 于是出现更糟的分裂：同一桌面上的两条通道对「这条还算不算数」给出相反答案。
+    //
+    // `IS NOT` 而不是 `!=`：`review` 可能是 NULL（从未复核），
+    // 而 `NULL != 'retracted'` 求值为 NULL（假），会把所有正常条目也过滤掉。
+    // `IS NOT` 是 NULL-safe 的，这是 SQLite 的正确写法。
+    //
+    // ⚠️ **`logs` 表没有 `review` 列**（见 db-schema.mjs 的建表），
+    //    所以下面 logs 那条**不能**加这个条件 —— 加了会直接报错。
+
     // profile（无 scope 概念，永不隔离）
     push('profile', d.prepare(
       `SELECT p.id,p.ts,p.topic,p.text,bm25(profile_fts) score FROM profile_fts f
-       JOIN profile p ON p.id=f.rowid WHERE profile_fts MATCH ? AND p.status='active'
+       JOIN profile p ON p.id=f.rowid
+       WHERE profile_fts MATCH ? AND p.status='active' AND p.review IS NOT 'retracted'
        ORDER BY score LIMIT ?`
     ).all(q, limit), () => GLOBAL)
 
@@ -1164,13 +1181,15 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
       push('rules', d.prepare(
         `SELECT r.id,r.ts,r.scope,r.kind,r.topic,r.text,bm25(rules_fts) score FROM rules_fts f
          JOIN rules r ON r.id=f.rowid
-         WHERE rules_fts MATCH ? AND r.status='active' AND (r.scope=? OR r.scope=?)
+         WHERE rules_fts MATCH ? AND r.status='active' AND r.review IS NOT 'retracted'
+           AND (r.scope=? OR r.scope=?)
          ORDER BY score LIMIT ?`
       ).all(q, projectName, GLOBAL, limit), (r) => r.scope)
     } else {
       push('rules', d.prepare(
         `SELECT r.id,r.ts,r.scope,r.kind,r.topic,r.text,bm25(rules_fts) score FROM rules_fts f
-         JOIN rules r ON r.id=f.rowid WHERE rules_fts MATCH ? AND r.status='active'
+         JOIN rules r ON r.id=f.rowid
+         WHERE rules_fts MATCH ? AND r.status='active' AND r.review IS NOT 'retracted'
          ORDER BY score LIMIT ?`
       ).all(q, limit), (r) => r.scope)
     }

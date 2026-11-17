@@ -167,6 +167,35 @@ export const SCRIPTS = [
   //   ⚠️ 它会临时改写 index.js / db-store.mjs（跑完 sha256 逐字节还原），
   //      跑的时候不要并行改代码。
   'faultinject-bugfix-20261117',
+  // ★ 2026-11-17 新增：第二批修复（TODO 待办 L / A / C / P / O）的回归。
+  //   L  search() 不过滤 review='retracted' —— 用户撤销的规则仍被当结论检索
+  //   A  迁移失败不 close 连接 —— Windows 上锁库，备份/再迁移全失败
+  //   C  copyTree 读目录失败静默 return 0 —— 迁移报「成功」但少文件且零日志
+  //   P  Number(body.id) 接受 true(=1) / [7](=7) —— 传错类型会误删 id=1
+  //   O  limit/offset 无校验 —— -1 静默返 0 条，2.5/1e21 直接 500
+  //   收口方式：P 抽 parseId()、O 抽 clampInt()，各把 5-6 处变 1 处。
+  'selfcheck-batch5-20261117',
+  //   配套故障注入：逐个撤掉修复，确认上面 42 条断言真的会红。
+  //   2026-11-17 实测：6 个变异全部 KILLED。
+  //   ⚠️ 同 faultinject-bugfix：临时改写 3 个源文件，跑时别动代码。
+  'faultinject-batch5-20261117',
+  // ★ 2026-11-17 新增：batch5 里两条「故障路径」修复的行为验证。
+  //   为什么需要单独两个脚本：
+  //   修复 A（迁移失败要 close）和 C（copyTree 读失败要记账）都只发生在
+  //   **故障路径**上 —— 正常跑一百次也不会走到。而构造真实故障要动真实库/真实目录，
+  //   风险太高（2026-11-16 的 /root/move 事故就是「想测失败路径结果真的执行了」）。
+  //   这两个脚本改用**临时目录 + 临时库**构造同样的故障，不碰用户数据。
+  //
+  //   verify-openmemdb-close：建一个「版本落后但结构是新的」临时库，
+  //     让 ALTER 撞 duplicate column → 迁移必然失败 →
+  //     **判据是抛错后能否立刻可写重开**（不能重开 = 连接没释放）。
+  //     实测：撤掉修复后连临时目录都删不掉（EPERM），正是它要防的场景。
+  //
+  //   verify-copytree-failure：在临时目录里用一个**文件**冒充目录，
+  //     `readdir` 抛 ENOTDIR（非 ENOENT）→ 必须记进 skipped。
+  //     实测：撤掉修复后 skipped 从 1 条变 0 条，迁移会「报成功但少文件」。
+  'verify-openmemdb-close',
+  'verify-copytree-failure',
 ]
 
 // ---- 参数 ----

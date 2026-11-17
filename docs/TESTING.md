@@ -2,7 +2,7 @@
 
 改动后按这个清单走一遍。标 ⚠️ 的是**必须重启 DSH** 才能可靠验证的项。
 
-## 0. 全量回归（48 个脚本进清单，一条命令跑完）
+## 0. 全量回归（50 个脚本进清单，一条命令跑完）
 
 改完代码先跑这个，全绿再往下走。
 
@@ -107,6 +107,10 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | **`selfcheck-archive-collision`** | **14** | **双会话撞键的逻辑链端到端验证**（2026-11-17 新增）。补 TODO 里「真实双会话同 `(turn,step)` 撞车时原文不丢」那一层。当初以为验不了（宿主 `session/event` 驱动不了），**对了一半** —— 事件源确实驱动不了，但去重的四步（取键 → Set 判重 → `appendArchive` → `listArchive` 读回）全在插件自己代码里，所以用两个**真实 store 实例**喂完全相同的 `(turn, step)` 就能复现撞车。断言：两条都在、`session_id` 不同、正文各自完整、同会话重复投递仍去重。⚠️ **不含宿主真实并发时序**，别据此宣称全验完 |
 | **`faultinject-archive-collision`** | **4** | 配套故障注入（2026-11-17）：键里去掉 `sessionId`（= 2026-11-16 修复前的写法）/ `sid` 恒为 `'?'` → 上面必须变红。实测均 exit=1。⚠️ 同样临时改写 `index.js` |
 | **`faultinject-p0-assertions`** | **6** | **P0 两处假绿断言的长期守卫**（2026-11-17 新增）。`verify-injection-consistency` 的「搜不到 ≠ 没发生过」与 `selfcheck-injection-wording` 的「不猜 / 不编」各改错过三次（`\|` 任一成立 → 同名句子替它通过 → 多段拼接被别段满足），**三次都是绿的、通读源码看不出来**。本脚本把「改坏必须变红」固化成回归。⚠️ 临时改写 `index.js` |
+| **`selfcheck-bugfix-20261117`** | **42** | **第一批 7 个 bug 的回归**（2026-11-17）。覆盖：`$` 被 `String.replace` 展开（会改写整份 `policy.md`）/ `appendArchive` 缺事务（原文在库但搜不到）/ `isInside` 参数反序 / POSIX 守卫黑名单漏 4 种形态 / `joinWithBudget` 单条超预算整条消失 / `cwd` 只判存在不判目录 / `topic`+`summary` 残缺假成功。每条都标了 `[回退验证]` |
+| **`faultinject-bugfix-20261117`** | **11** | 上面那 7 个的故障注入：逐个撤掉修复，确认断言真的变红。实测 **8 个变异全 KILLED**。⚠️ 临时改写 `index.js` / `db-store.mjs`，跑时别并行改代码 |
+| **`selfcheck-batch5-20261117`** | **42** | **第二批 5 个修复的回归**（2026-11-17）。覆盖 TODO 待办：`L` `search()` 不过滤 `review='retracted'`（用户撤销的规则仍被当结论）/ `A` 迁移失败不 `close` 连接（Windows 锁库）/ `C` `copyTree` 读目录失败静默 `return 0`（迁移报成功但少文件）/ `P` `Number(body.id)` 接受 `true`(=1) 与 `[7]`(=7) / `O` `limit`+`offset` 无校验（`-1` 静默返 0 条、`2.5` 直接 500）。`P`/`O` 用 `parseId()` / `clampInt()` 各把 5-6 处收口成 1 处 |
+| **`faultinject-batch5-20261117`** | **9** | 上面那 5 个的故障注入。实测 **6 个变异全 KILLED**。<br>⚠️ **写这条注入时踩过一次坑**：第一版把 `return 0` 插在注释之后 —— 那只是塞了一句死代码，真正的 `if (ENOENT) return 0` 和 `skipped.push` 还在，断言照样绿。要撤掉修复必须**删掉那两行实际逻辑**。⚠️ 临时改写 3 个源文件 |
 
 > **哪些不需要 DSH**（2026-11-15 实测：清空 `DSH_BASE` / `DSH_WEB_URL` 后全跑，
 > 只有 3 个失败）：**硬依赖只有 `selfcheck-e2e-memory` / `selfcheck-entry-by-id` /

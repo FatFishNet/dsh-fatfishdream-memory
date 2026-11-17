@@ -407,7 +407,31 @@ export function openMemoryDb(DatabaseSync, dbPath) {
       db.exec(`PRAGMA user_version = ${m.version}`)
       db.exec('COMMIT')
     } catch (e) {
-      db.exec('ROLLBACK')
+      // ⚠️ 2026-11-17 修（TODO 待办 A）：**必须先把连接关掉再抛**。
+      //
+      // 原来这里只 ROLLBACK 不 close，`db` 随异常一起被丢掉 ——
+      // 调用方（index.js 的 initDbStore）拿到错误就结束了，那个打开的
+      // SQLite 连接还挂在进程里，**没有任何路径能再关闭它**。
+      //
+      // 后果在 Windows 上尤其明确：泄漏的 DatabaseSync 持有
+      // memory.db / -wal / -shm，导致记忆目录**无法移动、无法删除、
+      // 无法 VACUUM INTO 备份** —— 而「备份」正是修好库的前提，
+      // 于是用户自己走不出这个循环。
+      //
+      // 同文件 L390-391 那条「版本过新」的分支本来就记得 close，
+      // 这里照抄它的顺序即可。
+      try {
+        db.exec('ROLLBACK')
+      } catch {
+        // 回滚失败就保持原样：不要用一个 ROLLBACK 的错误顶掉真正的迁移错误。
+        // 与 db-store.mjs 的 withFtsTransaction 同款处理。
+      }
+      // close 本身也可能失败（库被占用等），但**绝不能再掩盖原始错误**。
+      try {
+        db.close()
+      } catch {
+        /* 关不掉只能放弃：原始错误更重要，别再堆一层 */
+      }
       throw new Error(`schema 迁移到 v${m.version} 失败：${e.message}`)
     }
   }

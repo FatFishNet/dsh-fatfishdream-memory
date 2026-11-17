@@ -233,31 +233,34 @@ const MUTATIONS = [
   // 这条规则防的是「用户说了重要的话，下一个会话的我却不知道」。
   // 用户实报过三次（情绪 #26/#27/#29），同一个坑 2026-11-14 也踩过。
   {
-    id: 'injection-emotion-not-exempt',
-    // 2026-11-16 更新：注入规则从「情绪不豁免（带判据）」改成「每轮都要记（不跳轮）」，
-    // 变异锚点同步更新。它守的内容没变 —— 删掉这条规则，模型就会回到
-    // 「这轮没什么可记」的自我说服，当天实测因此漏记 12+ 轮。
-    file: 'dsh-fatfishdream-memory/index.js',
-    desc: '删掉注入里的「每轮都要记」规则（模型会重新按感觉跳过记录）',
-    // ⚠️ 2026-11-16 四次更新：措辞「写一条 mem-log」→「发一次 POST」，
-    // 整节移到注入末尾，且把完整命令写进了本节（不再用「上面那条」指代）。
-    // 锚点跟着换，守的东西没变：删掉标题 + 那条硬规则，
-    // 「每轮都要记」的硬要求就没了，模型会回到按感觉跳过记录。
+    id: 'injection-write-command-removed',
+    // ⚠️ 2026-11-17 17:14：**这条变异保护的对象换了 —— 因为设计换了。**
     //
-    // 只锚「标题行 + 规则行」两行 —— 中间夹着 6 行改措辞的注释，
-    // 用纯字符串锚点跨不过去（工具不支持正则），所以把两行分别拼进来。
+    // 旧版守的是「注入里必须有『每轮都要记（不跳轮）』那节」，用来证明
+    // 「模型不会回到按感觉跳过记录」。
+    //
+    // 但用户 2026-11-17 拍板「只做兜底，注入可以更加轻量化」，
+    // **那节已被主动删除**（实测 turn 70–80 主动写 0 次，它没产生行为）。
+    //
+    // 所以现在要守的是**兜底所依赖的东西**：
+    //   注入里仍然给出「写流水」的**可执行命令**。
+    //
+    // 为什么这条必须存在：兜底提醒只说「该写了」，**不教参数格式**。
+    // 如果注入里连命令都没了，模型收到提醒也不知道怎么调 ——
+    // 那就从「漏记」变成「提醒了也写不出」，比原来更糟。
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '删掉注入里的写流水命令本体（兜底提醒了也不会调）',
+    // ⚠️ 2026-11-17 17:35 第二次修：**锚点必须打在那条命令本身上。**
+    //
+    // 第一版锚的是上面那行引言 ``**写流水**（一个动作，不是纪律）：...``，
+    // 真跑结果 SURVIVED —— 查出来是**变异本身设计错了**：
+    // 命令本体在**下一行**（`pwsh 里 \`Invoke-RestMethod ...`），
+    // 只替换引言等于什么都没删，断言当然还是绿的。
+    //
+    // 这正是 AGENTS.md 里那条「发现 SURVIVED 先问『它改到的是我以为那处吗』，
+    // 别急着补测试」——这一次问对了。
     from:
-      "          '## 每轮都要记（和心跳同一级）',\n" +
-      '          // ⚠️ 2026-11-16 第四次改：**把完整命令写在这一节里，不用「上面那条」指代。**\n' +
-      '          //\n' +
-      '          // 原来这里写「用 pwsh 发一次 POST（上面那条命令）」——\n' +
-      '          // 而那条命令在注入上方 200 多字处。模型快速扫读时，\n' +
-      '          // 「上面那条」是一个需要回头找的空引用，容易滑过去。\n' +
-      '          // 现在直接给完整可粘贴的命令，**不需要往回看**。\n' +
-      '          //\n' +
-      '          // ★ 2026-11-17：命令缩到最短（topic/summary 可省，服务端补默认），\n' +
-      '          //   与上方「写流水」那一节保持**同一份命令**，避免两处写法不一致。\n' +
-      "          '每轮回复结尾、心跳之前发一次（**必做，不跳轮**），整行照抄即可：',\n",
+      '            `pwsh 里 \\`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType \'application/json\' -Body (@{text=\'本轮正文\';cwd=(Get-Location).Path;sessionId=$env:DSH_SESSION_ID} | ConvertTo-Json)\\`。` +\n',
     to: '',
   },
   {
@@ -318,12 +321,14 @@ const MUTATIONS = [
   {
     id: 'write-fail-threshold-removed',
     file: 'dsh-fatfishdream-memory/index.js',
-    desc: '连续失败阈值被改成 1（退回每轮提醒，217 次太吵）',
-    // ⚠️ 2026-11-17：阈值从 4 改为 2（用户定），锚点同步。
-    // 改阈值时**必须同时改这里** —— 否则锚点失配 → 真跑变 SKIP，
-    // 而 SKIP 现在计入失败（2026-11-16 已修），表现为「突然红了」。
-    from: 'const WRITE_FAIL_STREAK_LIMIT = 2',
-    to: 'const WRITE_FAIL_STREAK_LIMIT = 1',
+    desc: '阈值退回 2（第 1 轮必然漏，漏记率达 50% 时每两轮漏一条）',
+    // ⚠️ 2026-11-17 16:26：阈值从 2 改为 1（用户定），锚点同步。
+    // 演进：4 → 2 → 1。改阈值时**必须同时改这里** —— 否则锚点失配 →
+    // 真跑变 SKIP，而 SKIP 现在计入失败（2026-11-16 已修），表现为「突然红了」。
+    //
+    // 这条变异现在的语义是「退回阈值 2」，即把 1 改回 2。
+    from: 'const WRITE_FAIL_STREAK_LIMIT = 1',
+    to: 'const WRITE_FAIL_STREAK_LIMIT = 2',
   },
   {
     id: 'write-fail-reset-removed',
@@ -336,8 +341,29 @@ const MUTATIONS = [
     id: 'write-fail-safe-push-removed',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '提醒不再走 safePushMessage（turn-stopping 异常会中断会话）',
-    from: "        const delivered = safePushMessage(\n          agent,\n          `[dsh-memory] 已连续 ${failStreak} 轮没有把记忆写进流水。",
-    to: "        const delivered = agent?.steer({\n          id: 'x',\n          role: 'user',\n          content: [{ type: 'text', text: `[dsh-memory] 已连续 ${failStreak} 轮没有把记忆写进流水。",
+    // ⚠️ 2026-11-17 16:26：文案随阈值 1 改写（「已连续 N 轮」→「这一轮」），锚点同步。
+    from: "        const delivered = safePushMessage(\n          agent,\n          `[dsh-memory] 这一轮还没把记忆写进流水。",
+    to: "        const delivered = agent?.steer({\n          id: 'x',\n          role: 'user',\n          content: [{ type: 'text', text: `[dsh-memory] 这一轮还没把记忆写进流水。",
+  },
+  // ---- 2026-11-17 16:26：防无限循环闸门（随阈值改 1 新增）----
+  //
+  // ## 为什么这条变异必须存在
+  //
+  // DSH 契约（agent/turn-stopping）：「a listener that objects steers
+  // (agent.steer(...)) and the machine re-reads its inbox: fresh steering
+  // runs another step, none closes the turn.」
+  //
+  // 阈值改成 1 后，每一次漏记都会 steer 一次。**若闸门失效，就是无限循环**：
+  //     没写 → steer → 多跑一步 → 还是没写 → 再 steer → …
+  // 后果是 token 烧光 + 客户端卡死，比漏记严重得多。
+  //
+  // 所以必须有变异盯着这个闸门：改坏它，测试要能红。
+  {
+    id: 'steer-guard-removed',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: '拆掉防无限循环闸门（每轮都会 steer → 本轮永不关闭 → 烧 token）',
+    from: '      if (failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn) {',
+    to: '      if (failStreak >= WRITE_FAIL_STREAK_LIMIT) {',
   },
   // ---- 2026-11-16 v2：验证「忘写也要计数」这一半真的被守着 ----
   //

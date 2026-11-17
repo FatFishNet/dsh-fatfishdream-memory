@@ -10,6 +10,14 @@
  */
 
 // ---- 与 index.js 保持一致 ----
+// 2026-11-17 加：第 9 节要把错误提示的生成方式与白名单对照，
+// 需要读 index.js 源码（本文件其余各节只做纯函数测试，不需要 IO）。
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
 const MEM_MARKER_RE = /^<!--mem-(log|fact|note|fix)(?:[ \t]+topic=([^\n]*?))?[ \t]*(?:\n|-->)([\s\S]*?)-->/gm
 const TOPIC_WHITELIST = [
   '开发日志', '技术讨论', '构建/编译', '注入/预算', '插件/装载', '路径/沙箱',
@@ -103,6 +111,55 @@ console.log('\n=== 8. 多行正文不被误截 ===\n')
 {
   const r = parse('<!--mem-log topic=插件/装载\n- 第一行\n- 第二行\n- 第三行\n-->\n')
   check('三条要点都在', r[0]?.body.split('\n').length === 3, JSON.stringify(r[0]?.body))
+}
+
+// ---------------------------------------------------------------------------
+// 9. **错误提示里的 topic 清单必须与白名单一致**（2026-11-17 真 bug）
+//
+// ## 这条守的是什么
+//
+// `/log` 路由在 topic 非法时会返回 400，文案里带一份「请改用其中之一（…）」。
+// **那份清单原来是手写的**，于是和 `TOPIC_WHITELIST` 漂移了：
+//
+//   文案有、白名单没有：**情感交流** / **待办**   ← 照做必失败
+//   白名单有、文案没有：**格式/编码** / **情绪判据** ← 永远找不到
+//
+// 后果是**无限循环**：照提示改 → 再被 400 拒 → 报错还是同一份清单 → 出不去。
+//
+// 实测（隔壁工作区 SoftTest，2026-11-17 10:33）：
+//   `待办事项` → 400；改 `待办` → 400（提示里仍写着「待办」）
+//
+// 修法是让文案从 `TOPIC_WHITELIST.join(' / ')` 生成。
+// **这条断言守的就是「别再改回手写」。**
+//
+// ⚠️ 判据不是「文案里有 13 个词」——那样手写也能过。
+//    必须要求源码里出现 `TOPIC_WHITELIST.join` 这个**生成动作**。
+console.log('\n=== 9. 错误提示的 topic 清单必须由白名单生成 ===\n')
+{
+  const idxSrc = fs.readFileSync(
+    path.join(REPO, 'dsh-fatfishdream-memory/index.js'),
+    'utf8',
+  )
+
+  // ① 存在生成动作
+  check(
+    '错误文案用 TOPIC_WHITELIST.join 生成（不是手写）',
+    /请改用其中之一（\$\{TOPIC_WHITELIST\.join\(' \/ '\)\}）/.test(idxSrc),
+    '找不到 TOPIC_WHITELIST.join —— 可能又被改回手写清单了',
+  )
+
+  // ② 手写的两个「幽灵项」不得再出现在错误文案里
+  //
+  // 只在该文案附近找，避免命中文档/注释里的历史说明。
+  const anchor = idxSrc.indexOf('请改用其中之一')
+  const nearby = anchor < 0 ? '' : idxSrc.slice(anchor, anchor + 400)
+  for (const ghost of ['情感交流', '待办']) {
+    check(
+      `错误文案里不再出现幽灵项「${ghost}」`,
+      !nearby.includes(ghost),
+      `「${ghost}」不在 TOPIC_WHITELIST 里，写进提示会把人引向死路`,
+    )
+  }
 }
 
 console.log(`\n────────────────\n${pass} 通过 / ${fail} 失败`)

@@ -173,27 +173,59 @@ console.log('\n=== F. 连续写入失败提醒（2026-11-16）===\n')
 
 // ① 计数器声明 + 阈值常量
 const hasStreakMap = INDEX_SRC.includes('const writeFailStreak = new Map()')
-// ⚠️ 2026-11-17：阈值从 4 改为 **2**（用户定）。
-// 这里是**故意写死具体数值**的 —— 改阈值必须显式改这一行，
-// 否则「某天有人把 4 改成 100」，这道防线会在无人察觉时失效。
-// 不要改成「只要常量存在就算过」那种宽松判据。
-const hasLimitConst = INDEX_SRC.includes('WRITE_FAIL_STREAK_LIMIT = 2')
+// ⚠️ 2026-11-17 16:26：阈值从 2 改为 **1**（用户定）。
+//   演进：4 → 2 → 1。理由见 index.js 里 `writeFailStreak` 的注释：
+//   2 的话「第 1 轮必然漏」，而漏记率约 50%，等于每两轮就有一条永远没人补。
+//   1 是本轮没写就提醒 —— 唯一不依赖「后续轮次会来」的形态。
+//
+//   这里是**故意写死具体数值**的 —— 改阈值必须显式改这一行，
+//   否则「某天有人把 1 改回 100」，这道防线会在无人察觉时失效。
+//   不要改成「只要常量存在就算过」那种宽松判据。
+const hasLimitConst = INDEX_SRC.includes('WRITE_FAIL_STREAK_LIMIT = 1')
 
 // ② 写入结果必须更新计数 —— v2 改成「按轮结算」，判据移到 G 段断言。
 //    （v1 的 streakSuccessReset / streakFailIncrement 两条已随逻辑改写删除，
 //      留着会去匹配已经不存在的老正则，变成永远 FAIL 的噪声。）
 
 // ③ 提醒必须走 safePushMessage + 有阈值判断 + 成功后清零
-const reminderUsesSafePush = /safePushMessage\(\s*agent,\s*`\[dsh-memory\] 已连续/.test(INDEX_SRC)
+// ⚠️ 2026-11-17 16:26：文案从「已连续 N 轮」改成「这一轮」，因为阈值已是 1，
+//    「连续」这个词没有意义了。锚点同步改。
+const reminderUsesSafePush = /safePushMessage\(\s*agent,\s*`\[dsh-memory\] 这一轮还没把记忆写进流水/.test(INDEX_SRC)
 const reminderChecksLimit = /failStreak >= WRITE_FAIL_STREAK_LIMIT/.test(INDEX_SRC)
 const reminderResetsOnDelivered = /if \(delivered\) \{[\s\S]*?writeFailStreak\.set\(sessionKey, 0\)/.test(INDEX_SRC)
 
+// ④ 防无限循环闸门（2026-11-17 16:26 新增，随阈值改 1 一起加）
+//
+// ## 为什么这条断言必须存在
+//
+// DSH 契约（agent/turn-stopping）：「a listener that objects steers
+// (agent.steer(...)) and the machine re-reads its inbox: fresh steering
+// runs another step, none closes the turn.」
+//
+// 也就是说 steer 会让本轮不关闭、多跑一步。阈值改成 1 后，若没有闸门就是
+//     没写 → steer → 多跑一步 → 还是没写 → 再 steer → 无限循环
+// 会烧光 token、拖死客户端。
+//
+// 守两件事：①闸门键存在且带包名前缀 ②判断它时用的是「本轮已提醒过」
+const hasSteerGuard = INDEX_SRC.includes('const fatfishSteerGuard = new Map()')
+const guardKeyNamespaced = /FATFISH_STEER_GUARD_KEY = `\$\{PLUGIN_SOURCE_KIND\}:steer`/.test(INDEX_SRC)
+// 判重逻辑两段都要：
+//   ① `alreadyNudgedThisTurn` 的定义比的是「本轮 turn 号」
+//   ② steer 的 if 条件里带了 `!alreadyNudgedThisTurn`
+// 只查一半是不够的 —— 定义在但条件没用它，等于没闸门。
+const guardDefinedByTurn = /const alreadyNudgedThisTurn =[\s\S]{0,160}=== bpTurn/.test(INDEX_SRC)
+const guardUsedInCondition = /if \(failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn\)/.test(INDEX_SRC)
+const guardBlocksRepeat = guardDefinedByTurn && guardUsedInCondition
+
 for (const [label, ok, detail] of [
   ['有 writeFailStreak 计数器', hasStreakMap, '缺它 → 无法跨轮累计'],
-  ['阈值常量 = 2（2026-11-17 由 4 改）', hasLimitConst, '改阈值必须显式，不能埋魔法数字'],
+  ['阈值常量 = 1（2026-11-17 由 2 改）', hasLimitConst, '改阈值必须显式，不能埋魔法数字'],
   ['提醒走 safePushMessage', reminderUsesSafePush, '不走它 → turn-stopping 异常会中断会话'],
   ['提醒有阈值判断', reminderChecksLimit, '缺它 → 退回每轮提醒（217 次太吵）'],
   ['投递成功后清零', reminderResetsOnDelivered, '不清零 → 下轮仍触发，重复提醒'],
+  ['有防无限循环闸门', hasSteerGuard, '缺它 → steer 会让本轮永不关闭'],
+  ['闸门键带包名前缀', guardKeyNamespaced, '用大众名字会和别的插件撞（用户 2026-11-17 提醒）'],
+  ['闸门按 turn 判重', guardBlocksRepeat, '缺它 → 同一轮反复 steer，就是那个无限循环'],
 ]) {
   if (ok) { pass++; console.log(`  OK   ${label}`) }
   else { fail++; console.log(`  FAIL ${label} — ${detail}`) }
@@ -251,8 +283,13 @@ const incrementsWhenNotWritten = /const wroteThisTurn[\s\S]{0,400}?writeFailStre
 //   这与文件 L247 记的教训是同一个病（「只查有没有、不查在哪用」），
 //   只是这次连文件都没限定。修法：**只在提醒文案那一段里找**。
 //
-//   怎么定位那一段：`safePushMessage(` 调用里那句以「[dsh-memory] 已连续」开头的模板串。
-const REMIND_ANCHOR = '已连续'
+//   怎么定位那一段：`safePushMessage(` 调用里那句以「[dsh-memory] 这一轮还没把记忆写进流水」
+//   开头的模板串。
+//
+// ⚠️ 2026-11-17 16:26：锚点从「已连续」改成「这一轮还没把记忆写进流水」。
+//   阈值从 2 降到 1 后，「连续 N 轮」这个概念不再成立，文案已同步改写。
+//   改锚点时**必须同步改 index.js 里的文案**，否则这条会变成「永远定位不到」的假红。
+const REMIND_ANCHOR = '这一轮还没把记忆写进流水'
 const remindIdx = INDEX_SRC.indexOf(REMIND_ANCHOR)
 const remindSeg =
   remindIdx < 0 ? '' : INDEX_SRC.slice(remindIdx, remindIdx + 900)
@@ -278,7 +315,7 @@ for (const [label, ok, detail] of [
   ['没写过也 +1（v2 核心）', incrementsWhenNotWritten, '缺它 → 回到 v1，忘写仍然零检测'],
   // ⚠️ 这一条必须排在「提醒文案可执行」前面：定位不到文案时，
   //    「可执行」若仍判真就是假的（找不到 ⇒ 什么都测不到）。
-  ['能定位到提醒文案（否则下一条无意义）', remindLocated, 'index.js 里找不到「已连续」锚点，文案可能被改写'],
+  ['能定位到提醒文案（否则下一条无意义）', remindLocated, 'index.js 里找不到「这一轮还没把记忆写进流水」锚点，文案可能被改写'],
   ['提醒文案可执行', reminderActionable, '只说「没写」不够，要告诉怎么补'],
   ['写过时真的会清零（不是 if(false)）', resetsWhenWrote, '清零被跳过 → 提醒一次后永远卡在阈值'],
 ]) {

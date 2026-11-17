@@ -4312,6 +4312,51 @@ export function apply(ctx, rawConfig = {}) {
   /** sessionId → 本轮写类操作统计 */
   const turnActivity = new Map()
 
+  // ---- 轮次编号（2026-11-17 新增，DSH 原生）----
+  //
+  // ## 为什么需要这个
+  //
+  // DSH 的 `agent/turn-stopping` 一直带 `payload.turn`（见 cordis Event 契约），
+  // 但本插件历史上只解构了 `{ agent }`，把 `turn` 丢了 —— 于是退回用
+  // `sessionId` 当轮次键。后果有两层：
+  //
+  //   1. **重记看不见**：一轮内写 3 条流水，`turnActivity` 里只是同一个
+  //      `wroteLog=true` 被重复赋值，事后无法分辨「一轮 3 次」和「三轮各 1 次」。
+  //      实测证据：2026-11-17 05:53:52 那条 `logRouteHits:3` —— 计数器看得见
+  //      「调了 3 次」，却分不出是不是同一轮。
+  //   2. **漏记只能数轮次**：不知道当前是第几轮，`writeFailStreak` 只能累加计数。
+  //
+  // ## 为什么单独存一份
+  //
+  // `/log` 是 HTTP 路由，它**拿不到 agent 上下文**，因此无法直接取 `turn`。
+  // 这里在 `agent/pre-step` 里把「本会话当前轮次」记下来，`/log` 读它即可。
+  //
+  // ⚠️ 这是**进程内**状态，不跨重启。重启后第一个 turn 可能读不到已知轮次 ——
+  //    此时按 `null` 处理（宁可少一层校验，也不能把合法写入判成重记）。
+
+  /** sessionId → 当前轮次号（来自 agent/pre-step / agent/turn-stopping） */
+  const currentTurn = new Map()
+
+  /** sessionId → 本轮已经写过几次 /log —— 用于识别「同一轮写多条」 */
+  const turnLogWrites = new Map()
+
+  /**
+   * sessionId → 本轮是否已经在 `pre-step` 里提醒过「写流水」。
+   *
+   * 只对**当前这一轮**有效 —— 轮次变化时在下面的 pre-step 里重置。
+   *
+   * 存在的理由：`agent/pre-step` 每一步都会触发。没有这个闸门，
+   * 一轮里有 5 个 step 就会提醒 5 次，那是把「提醒」变成「骚扰」。
+   * 宁可一轮只提醒一次、漏了也认，也不要连环催。
+   *
+   * ⚠️ 2026-11-17：**必须按 sessionId 分，不能用一个全局布尔**。
+   * 同一工作区可以有多个会话并发（实测今天 18 个），
+   * 用一个变量会让 A 会话的提醒把 B 会话的闸门也关上 ——
+   * B 就永远收不到提醒，而表面上「功能是好的」。
+   * 这类「变量作用域错了但不报错」的问题今天已经犯过（turn 那个），别再犯。
+   */
+  const preStepReminded = new Map()
+
   // ---- 调试断点用的模块级变量（2026-11-17）----
   //
   // 用户要求按传统调试思路「给对话打断点」：在关键位置留下现场，
@@ -4429,10 +4474,136 @@ export function apply(ctx, rawConfig = {}) {
     }
   })
 
-  safeOn('agent/turn-stopping', async ({ agent }) => {
+  safeOn('agent/pre-step', async (payload, next) => {
+    // ⚠️ 这是 **waterfall** 事件，两条铁律：
+    //   1. 必须返回 `next()` 的结果 —— 不返回等于把这一步「截住」，
+    //      模型会永远收不到消息。这是能让整个会话卡死的位置。
+    //   2. `next()` 只能调用一次 —— 调两次会让同一步进两遍。
+    //
+    // 所以本监听器**故意不参与任何决策**：只把 turn 抄下来，然后无条件放行。
+    // 任何异常也必须兜住并继续放行，绝不能让「记个轮次号」弄坏主流程。
+    try {
+      const agent = payload?.agent
+      const turn = payload?.turn
+      const agentId = agent?.session?.id === undefined ? undefined : String(agent.session.id)
+
+      // ★ 2026-11-17 15:30：**留一条现场记录，用于区分三种失败形态**。
+      //
+      // 起因：`pre-step-write-nudge` 一条都没出现，但没法判断是哪一种情况：
+      //   ① `agent/pre-step` 根本没被调用（订阅没生效 / 事件名变了）
+      //   ② 被调用了，但 `agent.session.id` 取不到 → 整个 if 块被跳过
+      //   ③ 被调用了、也进了 if 块，但提醒条件不满足
+      //
+      // 没有这条 diag 就只能靠猜 —— AGENTS.md 记过：「reportBudget 静默失效」
+      // 就是「函数在、调用点没了」，查了两天才发现。这里把「调用点还在不在」
+      // 变成可观测的事实。
+      //
+      // ⚠️ 不能每步都写：`pre-step` 一轮可能有十几个 step，日志会被撑爆。
+      //    所以在两种情况下写：
+      //      · 进不了 if 块（形态 ②，必须看见）
+      //      · 轮次号变化（形态 ① 的正面证据：每轮至少一条）
+      const canProceed = agentId !== undefined && Number.isInteger(turn)
+      const isNewTurn = canProceed && currentTurn.get(agentId) !== turn
+      if (!canProceed || isNewTurn) {
+        diag('pre-step-hit', {
+          hasAgent: agent !== undefined,
+          agentId: agentId ?? null,
+          turn: Number.isInteger(turn) ? turn : null,
+          canProceed,
+        })
+      }
+
+      if (canProceed) {
+        const prev = currentTurn.get(agentId)
+        currentTurn.set(agentId, turn)
+        // 新一轮 → 清零本轮写次数与「已提醒」标记。
+        // 只在**轮次号变化**时清，同一轮的多步不会把计数抹掉。
+        if (prev !== turn) {
+          turnLogWrites.set(agentId, { turn, writes: 0 })
+          preStepReminded.set(agentId, { turn }) // 新一轮 → 打开闸门（记下是哪一轮）
+        }
+
+        // ★ 2026-11-17：**当场**提醒写流水（不是等到轮次结束）。
+        //
+        // ## 为什么要放在这里
+        //
+        // 原来唯一的提醒在 `turn-stopping` 里 —— 那是「轮次即将关闭」的时刻，
+        // 模型已经答完了。在那里 steer 会让 DSH 重新跑一个 step，
+        // 代价是**每次漏记都多一轮模型调用**（实测漏记率约 50%，等于成本翻倍）。
+        //
+        // 而 `agent/pre-step` 是**每一步开始之前**。在这里 steer 一条，
+        // 它会进 `inbox.nextStep`，在**下一个 step 的边界**被领取 —— 
+        // 模型本来就要继续干活，只是顺手多做一件小事，**不新开轮次**。
+        //
+        // ## 触发条件（三条同时满足才提醒）
+        //
+        //   ① 本轮**已经调过工具** —— 纯对话轮次不打扰。
+        //      依据：`turnActivity.writes` 由 `tools/result` 累加。
+        //      没有工具调用 = 这轮就是聊两句，不值得为它追加一步。
+        //   ② 本轮**还没写流水** —— 写了就别再提。
+        //   ③ 本轮**还没提醒过** —— 否则每走一步都催一次。
+        //
+        // ③ 是硬要求：`pre-step` 每步都会触发，没有这个闸门就会
+        // 「提醒 → 模型还没写完 → 下一步又提醒」的连环打扰。
+        // ---- 触发条件（两条，2026-11-17 晚修正）----
+        //
+        //   ① 本轮**还没写流水**
+        //   ② 本轮**还没提醒过**
+        //
+        // ⚠️ 2026-11-17 15:25 **删掉了第三条「本轮必须调过工具」**。
+        //
+        // 原来的判断是 `hasToolWork = (writes > 0)`，理由写的是
+        // 「纯对话轮次不打扰」。**那个理由是错的，而且和实测数据正好反着：**
+        //
+        //   实测（07:22 / 07:23 两轮）：漏记的两轮 `writes` **都是 0**，
+        //   即纯对话轮次 —— 而它们恰恰是漏得最多的那一类。
+        //
+        // 更根本的是，这条数据早就写在 `docs/漏记共识-跨工作区.md` §1.1 里：
+        //
+        //   > 漏记集中在「纯对话轮次」… 有交付物的轮次几乎不漏
+        //
+        // 我读过那段，却在设计条件时按相反的方向写了 ——
+        // 把「漏得最多的那一类」排除在提醒之外，等于这个功能对主症无效。
+        //
+        // 教训：**加过滤条件前，先回头看「被过滤掉的那一类是不是主要问题」。**
+        const rec = turnActivity.get(agentId)
+        const alreadyWrote = rec !== undefined && rec.wroteLog === true
+        // 闸门按会话分：`remindedFor.turn === turn` 表示**这一轮**已经提醒过
+        const remindedFor = preStepReminded.get(agentId)
+        const remindedThisTurn = remindedFor !== undefined && remindedFor.turn === turn
+        if (!alreadyWrote && !remindedThisTurn) {
+          preStepReminded.set(agentId, { turn })
+          const delivered = safePushMessage(
+            agent,
+            '（顺手记一条流水：把这一轮聊了什么 POST 到 /api/dsh-memory/log，' +
+              '然后接着做手头的事。这条只有你看得见。）',
+            'steer',
+          )
+          diag('pre-step-write-nudge', { turn, writes: rec?.writes ?? 0, delivered })
+        }
+      }
+    } catch (error) {
+      logger.warn?.(`[dsh-memory] pre-step 记录轮次失败：${error?.message ?? error}`)
+    }
+    // 无论上面成没成，都必须放行（且只放行一次）。
+    return next()
+  })
+
+  safeOn('agent/turn-stopping', async ({ agent, turn }) => {
     try {
       const sessionKey = agent?.session?.id === undefined ? undefined : String(agent.session.id)
       if (sessionKey === undefined) return
+
+      // 2026-11-17：用轮次终点兜住 currentTurn。
+      //
+      // 正常路径下 `agent/pre-step` 已经写了当前轮次；这里再写一次是**兜底**：
+      // 万一某轮一个 step 都没进（例如用户消息直接触发拒绝），pre-step 不会来，
+      // 那就只能靠终点事件拿到 turn。两个来源写的值应当一致。
+      if (sessionKey !== undefined && Number.isInteger(turn)) {
+        const prev = currentTurn.get(sessionKey)
+        currentTurn.set(sessionKey, turn)
+        if (prev !== turn) turnLogWrites.set(sessionKey, { turn, writes: 0 })
+      }
 
       // ---- 取本轮的两类信号 ----
       //
@@ -4460,6 +4631,14 @@ export function apply(ctx, rawConfig = {}) {
       //   所以顺序是：先算好 local 变量 → 重置 → 写 diag。
       const bpTurnMs = turnStartedAt === null ? null : Date.now() - turnStartedAt
       const bpLogRouteHits = logRouteHits
+      // 2026-11-17：本轮写了**几条**流水（只在同一轮内累加）。
+      // 与 `logRouteHits` 的区别：那个是「调了几次接口」，这个是
+      // 「被服务端认账的写入次数」。两者不等时说明有写入被拒。
+      // 当前轮次号也一并记下 —— 有了它，日志里才能分辨
+      // 「一轮写了 3 条」（重记）和「三轮各写 1 条」（正常）。
+      const bpCounter = turnLogWrites.get(sessionKey)
+      const bpTurn = Number.isInteger(currentTurn.get(sessionKey)) ? currentTurn.get(sessionKey) : null
+      const bpTurnWrites = bpCounter !== undefined && bpCounter.turn === bpTurn ? bpCounter.writes : 0
       turnStartedAt = null
       logRouteHits = 0
 
@@ -4552,6 +4731,11 @@ export function apply(ctx, rawConfig = {}) {
         injectedBytes: lastInjectionBytes,
         injectedHasWriteRule: lastInjectionHasWriteRule,
         logRouteHits: bpLogRouteHits,
+        // ---- 2026-11-17 新增：轮次维度 ----
+        // `turn` 来自 DSH 原生事件（agent/pre-step / turn-stopping），
+        // 以前这个字段被丢掉了，只能靠 streak 数轮次。
+        turn: bpTurn,
+        turnWrites: bpTurnWrites,
       })
       if (failStreak >= WRITE_FAIL_STREAK_LIMIT) {
         const delivered = safePushMessage(
@@ -5386,6 +5570,53 @@ export function apply(ctx, rawConfig = {}) {
               rec.wroteLog = true
               turnActivity.set(sid, rec)
             }
+
+            // ★ 2026-11-17：按轮计数，识别「同一轮写了多条」。
+            //
+            // ## 为什么需要它
+            //
+            // 历史实现里 `turnActivity` 以 `sessionId` 为键，一轮内写 3 条
+            // 只是把同一个 `wroteLog=true` 重复赋值 —— **事后完全分不清**
+            // 「一轮写了 3 条」和「三轮各写 1 条」。
+            //
+            // 实测（2026-11-17 05:53:52）：因为把 `system-reminder`（上下文刷新）
+            // 误当成新一轮，我在**同一轮**里写了 3 条流水。那一刻的断点记录是
+            // `logRouteHits:3` —— 计数器看得见「调了 3 次」，却无法判断
+            // 它们属于同一轮。这一条就是补上那个判断能力。
+            //
+            // ## 为什么不拦截
+            //
+            // **不拒绝第 2 条及以后的写入。** 一轮里写多条多数是正常的
+            // （先给方案、做完再看结果，各记一条 —— 今天实测 9 次多于 1 条，
+            //  其中 6 次是这种正当形态）。盲目去重会**丢掉真实内容**，
+            // 那比多记一条严重得多。
+            //
+            // 所以这里只**记录并留痕**，把判断权交给人和日志：
+            //   · turn=N 且 writes>1 → 写一条 `log-same-turn-multi` 诊断，
+            //     事后一眼能看出哪一轮重记了；
+            //   · 响应里带 `turn` 与 `turnWrites`，让调用方也看得见。
+            //
+            // 这样重记从「完全不可见」变成「有据可查」，且零数据损失。
+            let turnOfLog = null
+            let turnWrites = null
+            if (sid !== '') {
+              const known = currentTurn.get(sid)
+              if (Number.isInteger(known)) {
+                turnOfLog = known
+                const counter = turnLogWrites.get(sid)
+                if (counter !== undefined && counter.turn === known) {
+                  counter.writes += 1
+                  turnWrites = counter.writes
+                } else {
+                  // 没有计数器（插件刚重启 / 没收到 pre-step）→ 从 1 起算
+                  turnLogWrites.set(sid, { turn: known, writes: 1 })
+                  turnWrites = 1
+                }
+                if (turnWrites > 1) {
+                  diag('log-same-turn-multi', { turn: known, writes: turnWrites, logId: r.id })
+                }
+              }
+            }
             json(res, 200, {
               ok: true,
               id: r.id,
@@ -5395,6 +5626,9 @@ export function apply(ctx, rawConfig = {}) {
               topic: topicFinal,
               scopeFrom,
               streakCleared: sid !== '',
+              // 2026-11-17 新增：让调用方也能看见「这是第几轮、本轮第几条」
+              turn: turnOfLog,
+              turnWrites,
             })
           } catch (error) {
             json(res, 400, { ok: false, error: String(error?.message ?? error) })
@@ -6135,8 +6369,18 @@ export function apply(ctx, rawConfig = {}) {
     try {
       const checks = []
 
-      // 1. 事件监听：这四个缺一不可
-      const expectedEvents = ['session/event', 'tools/result', 'agent/turn-stopping', 'agent/created']
+      // 1. 事件监听：这五个缺一不可
+      //
+      // `agent/pre-step` 是 2026-11-17 新加的：它是**唯一**能拿到 DSH 原生
+      // `turn` 编号的入口（`tools/result` 的 exec 上没有 turn）。
+      // 缺了它，按轮去重就退回「只能数 streak」，重记会重新变得不可见。
+      const expectedEvents = [
+        'session/event',
+        'tools/result',
+        'agent/turn-stopping',
+        'agent/created',
+        'agent/pre-step',
+      ]
       for (const name of expectedEvents) {
         const attached = attachedEvents.has(name)
         checks.push({ name: `event:${name}`, ok: attached })

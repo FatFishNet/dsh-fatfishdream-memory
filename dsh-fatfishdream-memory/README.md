@@ -54,6 +54,25 @@ dsh plugin --profile <profile> add dsh-fatfishdream-memory
 
 ## 写流水：用 HTTP，不要写进正文
 
+最小调用（**3 个参数就够**，2026-11-17 起）：
+
+```powershell
+Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" `
+  -ContentType 'application/json' `
+  -Body (@{
+    text      = '正文'
+    sessionId = $env:DSH_SESSION_ID
+    cwd       = (Get-Location).Path
+  } | ConvertTo-Json)
+```
+
+`topic` 不传时补「开发日志」，`summary` 不传时从正文截取。
+
+> **为什么改短**：`cwd` 和 `sessionId` 省掉会写错项目 / 被误判成没写，这两个必带；
+> 其余参数省掉只是用了默认值。参数越多越容易「嫌麻烦就不写了」。
+
+要精确控制时再补全：
+
 ```powershell
 Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" `
   -ContentType 'application/json' `
@@ -70,12 +89,15 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" `
 | 参数 | 约束 |
 |---|---|
 | `text` | **必填**，为空返回 400 |
-| `topic` | 13 个分类之一；写错会被拒收置空 |
-| `summary` | ≤35 字；超出会截断 |
+| `topic` | **可省**（补「开发日志」）；传了就必须是 13 个分类之一 —— **可省 ≠ 可以乱写**，写错仍返回 400 |
+| `summary` | **可省**（从正文截取，去 markdown 记号 + 35 字截断）；传了超长会截断 |
 | `keywords` | 全角竖线 `｜` 分隔；无名词写 `无` |
 | `scope` | 可省，省略时按 `cwd` 解析 |
 | `cwd` | **目录必须存在**，否则 400 |
 | `sessionId` | 建议传，否则「连续未写」提醒会误报 |
+
+> `summary` 选**截取**而不是留空，是因为它是**检索与注入都依赖**的字段 ——
+> 留空等于「写了但搜不到」，比不写更坏。
 
 13 个 topic：开发日志 / 技术讨论 / 构建/编译 / 注入/预算 / 插件/装载 / 路径/沙箱 /
 格式/编码 / 文档/行号 / 情绪判据 / 用户画像 / 数据清理 / GUI/界面 / Git

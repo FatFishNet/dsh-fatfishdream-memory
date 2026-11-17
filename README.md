@@ -65,13 +65,12 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" `
   -ContentType 'application/json' `
   -Body (@{
     text      = '正文'
-    topic     = '开发日志'
-    summary   = '≤35 字概述'
-    keywords  = '词A｜词B'
     sessionId = $env:DSH_SESSION_ID
     cwd       = (Get-Location).Path
   } | ConvertTo-Json)
 ```
+
+`topic` 与 `summary` 可省（分别补「开发日志」、从正文截取），完整参数见包内 README。
 
 **三重收益**：
 

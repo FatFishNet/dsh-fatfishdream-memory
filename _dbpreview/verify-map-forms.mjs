@@ -176,10 +176,55 @@ const RE_ROUTE_ROW = /^\|\s*[A-Z/]+\s*\|\s*\*{0,2}`(\/api\/dsh-memory\/[^`]+)`\*
 const RE_SYM_CALL_BARE =
   /^\|\s*\*{0,2}`([A-Za-z_$][\w$]*)\s*(?:\([^`]*\))?`\*{0,2}\s*\|\s*\*{0,2}(\d{3,4})\*{0,2}\s*\|/
 
+// ── 形态 J：行首 L#### + `类型:锚点` —— §3.3「apply 内部」代码块 ──
+//
+// ⚠️ 2026-11-17 加。这一节原来写的是「L####  + 中文描述」，
+//    而**三个脚本全都不看它**：形态 B 要求行首 L#### 后跟**符号名**，
+//    这里是中文（「注入层」「情绪录入监听」），于是被归进「跳过」。
+//    实测 13 处里 **10 处指向无关代码**，而当时三个脚本同时报 0 失败。
+//
+//    **为什么不复用形态 B**：形态 B 只能判「该行非空/非注释」——
+//    那正是「错位后全绿」的根源。这里要求**锚点按声明形态精确匹配**：
+//
+//      fn:foo    → 必须是 foo 自己的定义行（function foo( / const foo = ( / const foo = async (）
+//      decl:foo  → const/let/var 声明 foo（允许无等号，如 `let dbStore`）
+//      call:foo  → 该行引用了 foo（`foo(` / `foo.` / `setTimeout(foo, n)` 都算）
+//      lit:text  → 该行字面包含 text（事件名用，引号要带上：lit:'session/event'）
+//
+//    **判据经过故障注入验证**（2026-11-17）：
+//      基线 25/25 通过、把行号改成 ±1/±2/±5/±20/±500 共 247 次 **全部抓到、0 漏**。
+//    ⚠️ 别把它降级成「该行包含某词」—— 实测 `dbStore` 在 62 行出现，
+//       那种判据等于没有判据（这是本文件诞生时踩过的同一个坑）。
+//    ⚠️ 2026-11-17 踩过的坑：最初写成 `(?:\s{2,}|$)`，结果**描述为空的行全部匹配不上**
+//       —— 因为地图是 CRLF，`split('\n')` 后每行尾部带 `\r`，而 `.`/`$` 在 `\r` 前不成立。
+//       （`\s` 本身包含 `\r`，所以 `\s{2,}` 能过；但 `$` 不能。）改用 `(?:\s{2,}|\r?$)`。
+//       这个 bug 是「盲区护栏」自己抓到的：它报「未带锚点 9 条」，而那 9 行明明有锚点。
+const RE_FORM_J = /^L(\d{3,4})\s{2,}(fn|decl|call|lit):(\S+?)(?:\s{2,}|\r?$)/
+// 「跳过」护栏：§3.3 代码块里**未带锚点**的行数上限。当前约定为 0。
+const FORM_J_MAX_UNANCHORED = 0
+
 lines.forEach((text, idx) => {
   const mapLine = idx + 1
 
-  let m = text.match(RE_TABLE_L)
+  // ── 形态 J 必须最先判断 ──
+  //   它的行首形态（`L####  中文`）与形态 B 重叠，但锚点规则更严。
+  //   放在 B 之前，才能保证「带锚点的行」走 J 的精确判据，
+  //   而不是被 B 当成非空行的弱判据放过去。
+  let m = text.match(RE_FORM_J)
+  if (m) {
+    results.push({
+      form: 'J',
+      mapLine,
+      kind: m[2],
+      anchor: m[3],
+      sym: m[3],
+      claimed: Number(m[1]),
+      raw: text.trim(),
+    })
+    return
+  }
+
+  m = text.match(RE_TABLE_L)
   if (m) {
     results.push({ form: 'A', mapLine, sym: m[1], claimed: Number(m[2]), raw: text.trim() })
     return
@@ -295,6 +340,33 @@ for (const [fk, ls] of Object.entries(sources)) {
   })
 }
 
+// ── 形态 J 的第二半：§3.3 代码块的「盲区计数护栏」 ──
+//
+// ⚠️ 2026-11-17 加。光给现有行加锚点只解决了「现在对不对」，
+//    挡不住下次有人按老格式（裸 L#### + 中文描述）再加一行 ——
+//    那种行会静默落进「跳过」，脚本照样全绿。
+//
+//    所以这里**主动扫一遍 §3.3 代码块**，数出「形如 L#### 但没带锚点」的行，
+//    超过 FORM_J_MAX_UNANCHORED 就判失败。
+//    这样「新增盲区」本身成为一个可失败的断言，而不是没人知道的默认值。
+const FORM_J_BLOCK_START = /^###\s*3\.3\b/
+const FORM_J_BLOCK_END = /^###\s*3\.4\b/
+const formJUnanchoredLines = []
+{
+  let inside = false
+  let inFence = false
+  lines.forEach((l, i) => {
+    if (FORM_J_BLOCK_START.test(l)) { inside = true; return }
+    if (inside && FORM_J_BLOCK_END.test(l)) { inside = false; return }
+    if (!inside) return
+    if (/^```/.test(l.trim())) { inFence = !inFence; return }
+    if (!inFence) return
+    // 代码块里形如 `L####  描述` 的行
+    if (!/^L\d{3,4}\s{2,}/.test(l)) return
+    if (!RE_FORM_J.test(l)) formJUnanchoredLines.push({ mapLine: i + 1, text: l.trim() })
+  })
+}
+
 // ── 核对 ──
 let pass = 0
 let fail = 0
@@ -302,9 +374,70 @@ let unknown = 0
 let skipped = 0
 const failures = []
 
+/**
+ * 形态 J 判据：按「声明形态」精确匹配，不是「该行包含某词」。
+ * 返回 { ok: true|false, why?: string }。
+ *
+ * ⚠️ 2026-11-17 实测记录（别退化它）：
+ *   最早试过「描述括号里的英文令牌出现在该行就算对」→ 3 处误报 + 3 处漏抓。
+ *   又试过「该行包含锚点词」→ `dbStore` 在 62 行都出现，等于没有判据。
+ *   最终这条「按 fn/decl/call 的声明形态匹配」：基线 25/25、故障注入 247/247 全抓。
+ */
+function checkFormJ(r) {
+  const line = sources.index[r.claimed - 1]
+  if (line === undefined) return { ok: false, why: `L${r.claimed} 超出 index.js 行数` }
+  // 注释行一律不算 —— 否则「注释里提到这个符号」会冒充「定义在这里」
+  if (/^\s*(\/\/|\*|\/\*)/.test(line)) return { ok: false, why: '该行是注释' }
+
+  const e = r.anchor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  let re
+  switch (r.kind) {
+    case 'fn':
+      // function foo( / const foo = ( / const foo = async ( / const foo = function
+      re = new RegExp(
+        `^\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${e}\\s*\\(` +
+          `|^\\s*(?:export\\s+)?(?:const|let|var)\\s+${e}\\s*=\\s*(?:async\\s*)?(?:function\\b|\\()`,
+      )
+      break
+    case 'decl':
+      // 允许无等号（`let dbStore`），也允许 `const routes = [`
+      re = new RegExp(`^\\s*(?:export\\s+)?(?:async\\s+)?(?:const|let|var)\\s+${e}\\s*(?:=|$)`)
+      break
+    case 'call':
+      // 引用即可：`setTimeout(checkWritableRoot, 1500)` 没有括号也算。
+      // 锚点自身可能带点（systemPrompt.context），所以左侧只排标识符字符，不排 `.`
+      re = new RegExp(`(^|[^\\w$])${e}([^\\w$]|$)`)
+      break
+    case 'lit':
+      // 事件名这类字面量：引号在锚点里带着，直接 includes 最准确
+      return { ok: line.includes(r.anchor), why: `该行不含字面量 ${r.anchor}` }
+    default:
+      return { ok: false, why: `未知类型 ${r.kind}` }
+  }
+  return { ok: re.test(line), why: `该行不满足 ${r.kind}:${r.anchor}` }
+}
+
 for (const r of results) {
   if (r.skip) {
     skipped++
+    continue
+  }
+
+  // 形态 J：§3.3 的带锚点行
+  if (r.form === 'J') {
+    const res = checkFormJ(r)
+    if (res.ok) {
+      pass++
+    } else {
+      fail++
+      // 给出「按声明形态找到的真实位置」，方便直接修文档
+      const found = r.kind === 'lit' ? null : findSymbol(r.anchor)
+      failures.push({
+        ...r,
+        actual: { file: 'index', line: found ? found.line : r.claimed },
+        note: res.why,
+      })
+    }
     continue
   }
 
@@ -385,7 +518,7 @@ for (const r of results) {
 // ── 输出 ──
 console.log('=== 项目地图行号校验（形态 A/B/C）===\n')
 console.log(`共扫描到 ${results.length} 处可结构化引用：`)
-for (const form of ['A', 'B', 'C', 'D', 'F', 'G', 'H', 'I', 'E']) {
+for (const form of ['A', 'B', 'C', 'D', 'F', 'G', 'H', 'I', 'J', 'E']) {
   const n = results.filter((r) => r.form === form).length
   if (n > 0) {
     const label = {
@@ -397,6 +530,7 @@ for (const form of ['A', 'B', 'C', 'D', 'F', 'G', 'H', 'I', 'E']) {
       G: '正文 L#### `符号`',
       H: '§11 HTTP 路由表',
       I: '| `符号(参数)` | 裸数字 |（§5）',
+      J: '§3.3 行首 L#### + 类型:锚点',
       E: '**L####**（无符号名，仅记录）',
     }[form]
     console.log(`  形态${form}（${label}）：${n}`)
@@ -411,12 +545,27 @@ if (mapRouteCount !== ROUTE_DECLS.length) {
 }
 console.log(`  跳过（行首是中文描述 / 加粗行号无符号名）：${skipped}`)
 console.log(`  无法自动核对（符号定位不到）：${unknown}`)
+
+// 形态 J 的盲区护栏
+const formJCount = results.filter((r) => r.form === 'J').length
+console.log(
+  `  §3.3 锚点行：${formJCount} 条；**未带锚点的行：${formJUnanchoredLines.length}**（上限 ${FORM_J_MAX_UNANCHORED}）`,
+)
+if (formJUnanchoredLines.length > 0) {
+  console.log('  ⚠️ 下面这些行会让它们静默落进「跳过」，等于没有校验：')
+  for (const u of formJUnanchoredLines) console.log(`     地图 L${u.mapLine}: ${u.text.slice(0, 90)}`)
+  console.log('     修法：按「L####  类型:锚点  中文描述」补锚点（类型见 §3.3 上方的约定表）')
+}
 console.log('')
 
 if (failures.length > 0) {
   console.log(`❌ 对不上 ${failures.length} 处：\n`)
   for (const f of failures) {
-    console.log(`  地图 L${f.mapLine} [形态${f.form}] \`${f.sym}\` 声称 L${f.claimed} → 实际 L${f.actual.line}（${f.actual.file}.mjs/js）`)
+    if (f.form === 'J') {
+      console.log(`  地图 L${f.mapLine} [形态J ${f.kind}] \`${f.anchor}\` 声称 L${f.claimed} —— ${f.note}`)
+    } else {
+      console.log(`  地图 L${f.mapLine} [形态${f.form}] \`${f.sym}\` 声称 L${f.claimed} → 实际 L${f.actual.line}（${f.actual.file}.mjs/js）`)
+    }
     console.log(`     原文: ${f.raw.slice(0, 100)}`)
   }
   console.log('')
@@ -426,4 +575,11 @@ console.log(`${failures.length === 0 ? '✅' : '❌'} 结果：PASS=${pass} FAIL
 // 路由条数不一致也算失败 —— 否则「表里少列一条」永远不会被发现
 const routeMismatch = mapRouteCount !== ROUTE_DECLS.length
 if (routeMismatch) console.log('❌ 路由条数与源码不一致')
-process.exit(fail === 0 && !routeMismatch ? 0 : 1)
+
+// 盲区护栏：§3.3 里未带锚点的行数超标也算失败 —— 否则「下次有人写回老格式」没人发现
+const formJBlind = formJUnanchoredLines.length > FORM_J_MAX_UNANCHORED
+if (formJBlind) {
+  console.log(`❌ §3.3 未带锚点的行 ${formJUnanchoredLines.length} 条，超过上限 ${FORM_J_MAX_UNANCHORED}`)
+}
+
+process.exit(fail === 0 && !routeMismatch && !formJBlind ? 0 : 1)

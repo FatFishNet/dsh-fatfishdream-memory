@@ -27,6 +27,8 @@
 
 **验证**：`faultinject-batch5-20261117` 逐个撤掉修复，**6 个变异全部 KILLED**。
 回归脚本数 48 → **50**。
+> 之后又补了 `verify-openmemdb-close`（6 项）+ `verify-copytree-failure`（14 项），
+> 给上面 `A` / `C` 两条**故障路径**补上行为验证 → 脚本数 **50 → 52**（当前值）。
 
 > ⚠️ **写这批故障注入时又踩了一个新形态**（第 4 次同源）：
 > 第一版把 `return 0` **插在注释之后**，以为撤掉了修复 ——
@@ -75,8 +77,9 @@ schema `drops: true` + VACUUM | ✅ |
 ### 层③：跑的是这版
 
 ```
-源码      index.js  6040 行
-安装版    index.js  6040 行（真实目录，非 link）
+源码      index.js  6135 行（去尾空行，与 verify-map 同口径）
+安装版    index.js  6135 行（真实目录，非 link）
+一致性    SHA256 逐字节相同（2026-11-17 核对：5C127D42…3824E5）
 真机验证  非法 topic → 400 ✅ / summary 缺失 → 400 ✅
           cwd 是文件 → 400 ✅ / 正常参数 → 写入成功 ✅
 ```
@@ -97,8 +100,8 @@ schema `drops: true` + VACUUM | ✅ |
 
 ### 结论
 
-**历史修复全部有效。** 46 条待办里**没有一条是「已修但坏了」** ——
-它们本来就是「还没修」（见下一节 A–Z）。
+**历史修复全部有效。** 那批待办里**没有一条是「已修但坏了」** ——
+它们本来就是「还没修」（见下一节七档清单）。
 
 ---
 
@@ -163,15 +166,15 @@ schema `drops: true` + VACUUM | ✅ |
 | # | 问题 | 位置 | 改动面 | 难度 | 为什么排前面 |
 |---|---|---|---|---|---|
 | **D** | `writePointer` 非原子写 + 吞一切错误 → 指针坏了静默换记忆根 | `index.js` L336 | **改 1 个函数（约 12 行）** | ★★ | 项目已有 `atomicWrite` 可复用；难点是「读失败也要留痕」需要新加 diag |
-| **G** | `readState` 解析失败静默返回空 fallback → 下次读-改-写把空 state **写实** | `index.js` L2011 | **改 1 个函数 + 3 个调用点** | ★★ | 要区分「文件不存在」（可 fallback）与「解析失败」（必须拒绝写回） |
+| **G** | `readState` 解析失败静默返回空 fallback → 下次读-改-写把空 state **写实** | `index.js` L2106 | **改 1 个函数 + 3 个调用点** | ★★ | 要区分「文件不存在」（可 fallback）与「解析失败」（必须拒绝写回） |
 
 #### 🥈 第二档：会丢数据，但触发条件窄或改动大
 
 | # | 问题 | 位置 | 改动面 | 难度 | 真实障碍 |
 |---|---|---|---|---|---|
-| **E** | `/heartbeat` POST 空 body 删掉用户手写收尾语行，**且无备份** | `index.js` L3915 + L5259 | 改 2 处 + 加备份 | ★★ | 要区分「显式清空」与「没传」——**API 语义变更**，得同时改 GUI |
-| **F** | `policy.md.pre-sync` **只写不读**，无恢复路径；固定文件名会被下次覆盖 | `index.js` L1774/1869 | 加时间戳 + 新增恢复路径 | ★★★ | 不只是改代码：要想清楚「恢复入口放哪」（GUI？自动检测？），涉及产品决策 |
-| **B** | 迁移窗口内仍往旧库写，切根后那几条**不在新库** | `index.js` L2444 + L2514 | 改时序（跨 3 个函数） | ★★★★ | 要么迁移期间停写，要么复制完再快照一次。**碰的是迁移主流程**，风险最高 |
+| **E** | `/heartbeat` POST 空 body 删掉用户手写收尾语行，**且无备份** | `index.js` L5370-5371（路由 L5354） | 改 2 处 + 加备份 | ★★ | 要区分「显式清空」与「没传」——**API 语义变更**，得同时改 GUI |
+| **F** | `policy.md.pre-sync` **只写不读**，无恢复路径；固定文件名会被下次覆盖 | `index.js` L1869 / L1956 | 加时间戳 + 新增恢复路径 | ★★★ | 不只是改代码：要想清楚「恢复入口放哪」（GUI？自动检测？），涉及产品决策 |
+| **B** | 迁移窗口内仍往旧库写，切根后那几条**不在新库** | `index.js` L2472（`migrateRoot` 定义） | 改时序（跨 3 个函数） | ★★★★ | 要么迁移期间停写，要么复制完再快照一次。**碰的是迁移主流程**，风险最高 |
 
 #### 🥉 第三档：检索/逻辑正确性 —— 不丢数据，但让用户的话不作数
 
@@ -184,8 +187,8 @@ schema `drops: true` + VACUUM | ✅ |
 
 | # | 问题 | 位置 | 改动面 | 难度 | 真实障碍 |
 |---|---|---|---|---|---|
-| **H** | `ensureLayout` 的读-改-写**不在 `serialize()` 内**，且调用点不 `await` | `index.js` L1999/2002 + L2830 | 包一层锁 | ★★ | 但 `syncPolicyOnce` 里有长文件 IO，**持锁时间长**，要评估是否阻塞启动 |
-| **I** | `/memory consolidate` 裸读-改-写 | `index.js` L4692 | 包一层锁 | ★ | 最简单的一条 |
+| **H** | `ensureLayout` 的读-改-写**不在 `serialize()` 内**，且调用点不 `await` | `index.js` L2083（定义）/ L2994（调用）/ L1886（`serialize`） | 包一层锁 | ★★ | 但 `syncPolicyOnce` 里有长文件 IO，**持锁时间长**，要评估是否阻塞启动 |
+| **I** | `/memory consolidate` 裸读-改-写 | `index.js` L4785 | 包一层锁 | ★ | 最简单的一条 |
 | **J** | `serialize` **无重入保护**：锁内再调会永久死锁且无日志 | `index.js` L1791 | 加 1 个布尔 + 抛错 | ★★ | 当前**无触发路径**，属于「防未来」 |
 | **K** | 跨进程 `state.json` 完全无保护；`writeState` 公开导出 | 全局 | 加文件锁 或 迁进 SQLite | ★★★★★ | **架构级改造**，不是修 bug |
 
@@ -196,18 +199,18 @@ schema `drops: true` + VACUUM | ✅ |
 | **Q** | 查询词含 NUL（`%00`）→ FTS 语法错 → 500 | `db-schema.mjs` `buildMatchQuery` | 加一行清洗 | ★ | 一行正则 |
 | **R** | 日期筛选用 `toISOString()`（UTC）→ +08:00 下凌晨 0-8 点「今天」筛出昨天 | `client.js` | 改 2-3 处 | ★ | 用本地日期拼串 |
 | **S** | 擦除器：标记含反引号时**把消息后半段一起擦掉** | `client.js` L1847/1861 | 改 2 个正则 | ★★★ | ⚠️ **改 `client.js` 前必读维护手册 §1**，且要完整重启客户端才生效 |
-| **T** | 勾「显示已停用」实际无效（后端要 `status=all`，前端从不发） | `client.js` L733 + `index.js` L4775 | 改 2 处 | ★ | 改一端即可，但要**实测**勾选前后条数不同 |
+| **T** | 勾「显示已停用」实际无效（后端要 `status=all`，前端从不发） | `client.js` L733 + `index.js` L4942 | 改 2 处 | ★ | 改一端即可，但要**实测**勾选前后条数不同 |
 
 #### 第六档：死代码 / 一致性 —— 无实际故障
 
 | # | 问题 | 位置 | 改动面 | 难度 | 说明 |
 |---|---|---|---|---|---|
-| **U** | `store.recordEmotion` **不存在**，该分支是死代码 | `index.js` L4016-4030 | 删 15 行 | ★ | 删前确认 `!dbStoreExists()` 分支真的不可达 |
-| **V** | `enqueueAmbiguous` **无调用方**，但 `clearAmbiguous` 每轮仍在锁内空转写盘 | `index.js` L2230 | 删或补调用方 | ★★ | **要决策**：接回来还是整条链路删掉？ |
-| **W** | `dbCopied` 死变量 | `index.js` L2339/2380 | 删 2 行 | ★ | 或者放进返回值（用户可能想知道「库搬了吗」） |
-| **X** | `rebindDbStore` 的 `catch` **够不到** —— `close()` 是返回失败不是抛错 | `index.js` L2809-2812 | 改 2 行 | ★ | 读返回值判断 `r.ok === false` |
-| **Y** | 两处 `setTimeout` 未清理也未 `unref`，卸载后仍执行一次 | `index.js` L2894/5890 | 存 handle + 进 `ctx.effect` | ★★ | 要接到已有 disposer 里 |
-| **Z** | 裸 `ROLLBACK` 未包 try → 原始错误被 ROLLBACK 的错误顶掉 | `db-store.mjs` L936/1045 | 各加 try | ★ | `purgeByStatus` 已有正确写法可照抄 |
+| **U** | `store.recordEmotion` **不存在**，该分支是死代码 | `index.js` L4166（及 L4183 第二处） | 删这一段 | ★ | 删前确认 `!dbStoreExists()` 分支真的不可达 |
+| **V** | `enqueueAmbiguous` **无调用方**，但 `clearAmbiguous` 每轮仍在锁内空转写盘 | `index.js` L2380（定义）/ L2718（导出） | 删或补调用方 | ★★ | **要决策**：接回来还是整条链路删掉？ |
+| **W** | `dbCopied` 死变量 | `index.js` L2499 / L2540 | 删 2 行 | ★ | 或者放进返回值（用户可能想知道「库搬了吗」） |
+| **X** | `rebindDbStore` 的 `catch` **够不到** —— `close()` 是返回失败不是抛错 | `index.js` L2969 | 改 2 行 | ★ | 读返回值判断 `r.ok === false` |
+| **Y** | 两处 `setTimeout` 未清理也未 `unref`，卸载后仍执行一次 | `index.js` L3057 / L6084 | 存 handle + 进 `ctx.effect` | ★★ | 要接到已有 disposer 里 |
+| **Z** | 裸 `ROLLBACK` 未包 try → 原始错误被 ROLLBACK 的错误顶掉 | `db-store.mjs` L740 / L974 / L1083 | 各加 try | ★ | L455 已是正确写法，可照抄 |
 
 #### 第七档：跨平台 —— **Windows 上结构上测不出来**
 
@@ -412,6 +415,10 @@ schema `drops: true` + VACUUM | ✅ |
 | 3 | `docs/维护手册.md:476`、`docs/TESTING.md:69` | 「113 处引用」→ 实际 **108** |
 | 4 | `CHANGELOG.md:219` | 根 `README.md` 319 行 → 实际 **321** |
 | 5 | `index.js:71` 注释 | `parseJson()` 说「L431」→ 实际 **L455**；且「文件后半段」的描述也不对（455/5843 是前 8%） |
+
+> ⚠️ **上表是 2026-11-17 早些时候的核对快照，数字全部按当时的源码行数。**
+> 不要再拿它当当前值：`index.js` 现在是 **6135 行**、`parseJson` 在 **L545**。
+> 表里保留原值是为了记录「当时发现了哪些过期」这一事实。
 | 6 | `index.js:3101/3102/3174` 注释 | 引用的 L3093 / L3148 均已失效，其中「判成情绪不影响写流水」那句**已被合并删除** |
 | 7 | `docs/第七轮审查发现.md` | 历史快照，多数行号已失效（L4293→4677 等）。**按 DECISIONS:637 的规矩不动**，但文件开头应加一句「这是历史快照，行号不再维护」 |
 
@@ -609,7 +616,7 @@ dist-tags.latest = 1.0.1
 
 ### 当前真实状态（2026-11-17 核对代码确认）
 
-**已经有兜底了。** `writeFailStreak`（`index.js` L4133 起）：
+**已经有兜底了。** `writeFailStreak`（`index.js` L4299 起）：
 
 ```js
 const writeFailStreak = new Map()
@@ -964,7 +971,7 @@ rules 表：无重复（用户手工维护，干净）
 > 是**丢整轮**，这也解释了 `handledMessageIds` 为什么需要 500 条上限。
 
 > **2026-11-16 原关闭记录**（保留，但看上面的修正）：
-> 去重逻辑抽成顶层纯函数 `makeMessageKey(session, payload)`（`index.js` L496），
+> 去重逻辑抽成顶层纯函数 `makeMessageKey(session, payload)`（`index.js` L675），
 > 新增 `_dbpreview/selfcheck-message-key.mjs`（26 项断言，已进 `SCRIPTS`），
 > 并加两条变异锚点 `message-key-no-session` / `message-key-uses-or`
 > （真跑 40/40 KILLED，两条都被 `selfcheck-message-key` 抓到）。

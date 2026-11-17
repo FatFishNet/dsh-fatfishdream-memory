@@ -274,12 +274,12 @@ $env:DSH_BASE = $env:DSH_WEB_URL
 |---|---|
 | 包版本 | `1.3.0`（MIT） |
 | schema | v5 |
-| 代码规模 | `index.js` 5843 行 / `client.js` 2499 行 / `db-store.mjs` 1694 行 / `db-schema.mjs` 422 行 |
+| 代码规模 | `index.js` 6135 行 / `client.js` 2499 行 / `db-store.mjs` 1766 行 / `db-schema.mjs` 446 行 |
 | HTTP 路由 | 22 条 |
-| 回归测试 | 50 个脚本 + 40 个变异（锚点须 40/40 匹配，真跑 40/40 KILLED） |
-| 每轮注入 | 约 6.5 KB / 约 1467 token（随记忆数据量浮动，非固定值） |
+| 回归测试 | 53 个脚本 + 40 个变异（锚点须 40/40 匹配，真跑 40/40 KILLED） |
+| 每轮注入 | 约 7.0 KB / 约 1624 token（随记忆数据量浮动，非固定值） |
 | 第三方依赖 | 零（仅 Node 内置模块） |
-| 平台 | Windows（macOS 未验证） |
+| 平台 | Windows 已实测；macOS / POSIX 有平台分支与 30 条回归，**未在真机验证** |
 | 健康自检 | 启动后核验 9 项挂载点 |
 
 ### 相对 1.0.1 的变更
@@ -292,6 +292,10 @@ $env:DSH_BASE = $env:DSH_WEB_URL
 | 修复：情绪判定 | 后置限定词降权 + 完成度削弱词，修正「成功了一半」「部分搞定」 |
 | 修复：rootReason | `/state` 的 `rootReason` 此前恒空，现真实返回 |
 | 修复：擦除器 | `isSafeToCollapse` 三道守卫（修全局滚动条失效）；完整标记同步快擦（修切会话闪烁） |
+| 修复：数据安全（1.3.0） | 收尾语含 `$&` / `$'` 时改写整份 `policy.md`；`appendArchive` 缺事务导致原文在库但搜不到；`isInside` 参数反了导致迁入子目录自我复制；`joinWithBudget` 单条超预算整条消失 |
+| 修复：输入校验（1.3.0） | `parseId()` / `clampInt()` 各收口 5~6 处：`{"id": true}` 会软删 id=1、`limit=-1` 静默返 0 条、`limit=2.5` 直接 500 |
+| 修复：检索口径（1.3.0） | `search()` 不过滤 `review='retracted'` —— GUI 里撤销的规则仍被当结论检索（`logs` 表无该列，不能加） |
+| 新增：跨平台（1.3.0） | `expandRoot` / `listCandidateDrives` / `systemFallbackRoot` / `resolveRoot` 四处平台分支。**POSIX 下原来会把记忆建进工作区**（违反安全边界） |
 | 新增：测试体系 | `run-all.mjs`（唯一清单）、`meta-mutation-test.mjs`、`meta-audit-coverage.mjs`、`lib-spawn-capture.mjs`（沙箱降级） |
 | 清理：死代码 | 删除 10 个死函数（含静默失效两天的 `reportBudget`） |
 | 修复：模板私货 | 用户的私人收尾语曾被同步进 `POLICY_TEMPLATE`（会成为所有新装用户的默认收尾语），已整条删除并加测试守着 |
@@ -303,7 +307,7 @@ $env:DSH_BASE = $env:DSH_WEB_URL
 
 | 限制 | 说明 |
 |---|---|
-| macOS 未验证 | 选址逻辑基于 Windows 盘符体系 |
+| macOS 未验证 | 有平台分支与 30 条回归（`selfcheck-posix-paths` 23 + `faultinject-posix-paths` 7），在 Windows 上用假 `platform` + `path.posix` 复现 POSIX 语义；**不含真机的权限 / APFS / TCC** |
 | `archive` 只增不减 | 无保留期、无体积上限，膨胀比约 6× |
 | 旧会话仍会闪 | 换通道前产生的历史消息里还有标记，切过去会闪一下。**不会再增加** |
 | 情绪无法识别反讽 | 词典 + 规则，识别不了客套、压抑、委婉否定 |

@@ -44,26 +44,37 @@
    是**损坏数据库**（页结构、WAL、FTS 影子表会不同步）。改数据走 GUI 或 HTTP 接口。
 
 3. **改了 `index.js` / `client.js` 的行数，必须重算 `docs/项目地图.md` 里的行号。**
-   地图是绝对行号，插几行后面全漂。准绳是 `verify-map-content.mjs`，
-   **不是** `verify-map`（后者只判「该行非空」，整片漂移它也全绿）。
+   地图是绝对行号，插几行后面全漂。**准绳是四个脚本，不是一个**：
+   `verify-map-content`（带符号名的引用）+ `verify-map-forms`（9 种结构化形态）
+   + `verify-symbol-lines`（§3.1 裸数字表）+ `verify-map`（兜底判非空）。
+   **只跑 `verify-map` 不够** —— 它只判「该行非空」，整片漂移也全绿。
+
+   > ⚠️ 而且**四个脚本全绿也不等于行号对**：地图 §3.3 代码块里那种
+   > 「行首 `L####` + 中文描述」的写法，四个脚本都看不见。
+   > 2026-11-17 实测那里 13 处错了 10 处，而当时四个脚本同时报 0 失败。
+   > **改完要人工抽查几处。** 详见 `docs/维护手册.md` §4.9。
 
 其余约束（备份、schema 迁移、注入预算）见仓库根的 `AGENTS.md`，
 那份文件就是本项目的工程约定全集，每条都带事故日期。
 
 ### 提交前跑一遍
 
-**不依赖 DSH 在运行**的最小验证（下面这 12 个，够挡住绝大多数回归）：
+**不依赖 DSH 在运行**的最小验证（下面这 14 个，够挡住绝大多数回归）：
 
 ```powershell
 $node = "<你的 node 路径>"
-foreach ($s in 'verify-functions','verify-map','verify-map-content','selfcheck-full',
-               'selfcheck-isolation','selfcheck-marker-hardened','selfcheck-dom-strip',
-               'selfcheck-scrubber-loop','selfcheck-topic-clean','test-marker-forms',
-               'selfcheck-search-tier','verify-doc-links') {
+foreach ($s in 'verify-functions','verify-map','verify-map-content','verify-map-forms',
+               'verify-symbol-lines','selfcheck-full','selfcheck-isolation',
+               'selfcheck-marker-hardened','selfcheck-dom-strip','selfcheck-scrubber-loop',
+               'selfcheck-topic-clean','test-marker-forms','selfcheck-search-tier',
+               'verify-doc-links') {
   & $node "_dbpreview\$s.mjs"
   "{0,-30} exit={1}" -f $s, $LASTEXITCODE
 }
 ```
+
+> 更省事的是直接跑 `_dbpreview\run-all.mjs` —— 它是脚本清单的**唯一真相**
+> （当前 53 个），这份 14 个的清单只是「不依赖 DSH」的子集。
 
 **改了 UI（`client.js`）的话**：它是浏览器模块，
 禁用→启用插件**不会**重新加载它，必须**完整重启客户端**再看效果。
@@ -80,7 +91,7 @@ foreach ($s in 'verify-functions','verify-map','verify-map-content','selfcheck-f
 > 另外 4 个虽然会读环境变量，但缺环境时**自动跳过 HTTP 段并以 0 退出**：
 > `selfcheck-archive`（存储层 36 项照跑）、`selfcheck-breakdown`（存储层 18 项）、
 > `verify-injection-consistency`、`selfcheck-log-alive`。所以**硬依赖只有那 3 个**。
-> 脚本总数不写死 —— 唯一真相是 `run-all.mjs` 的 `SCRIPTS` 数组（当前 41 个）。
+> 脚本总数不写死 —— 唯一真相是 `run-all.mjs` 的 `SCRIPTS` 数组（当前 53 个）。
 
 ### 代码风格
 

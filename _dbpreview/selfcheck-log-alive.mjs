@@ -180,10 +180,28 @@ if (rows.length > 0) {
     const newest = logFiles[0]
     // 只取最后 50 行 —— 心跳每 5 分钟一行，最后一行必然是最近的活动。
     // 整文件读进来没必要（2026-11-16 那个文件已经 426KB / 5071 行）。
+    //
+    // ⚠️ 2026-11-17 修：`tail` 曾被**两条断言共用**，而它们的需要不同：
+    //   ① 「最新时间戳距今 < 15 分钟」→ 50 行足够（要的正是最近活动）
+    //   ② 「日志里能看到 [heartbeat]」→ **50 行可能不够**
+    //
+    //   实测（2026-11-17 13:08）：心跳 05:07:44 写入后，4 分钟内产生了 50+ 行
+    //   对话日志（archive-assistant / write-streak-check 等），把心跳挤出了窗口。
+    //   那一刻插件**完全正常**（心跳确实在写），测试却报红。
+    //
+    //   这是**测试的脆弱点，不是代码问题** —— 但它会让人误判成「心跳挂了」。
+    //   修法：心跳扫描单独读**更长的窗口**（见下面 HEARTBEAT_SCAN_LINES），
+    //   不共用 tail。
+    const HEARTBEAT_SCAN_LINES = 2000
     let tail = []
+    let beatWindow = []
     try {
       const content = fsmod.readFileSync(newest.full, 'utf8')
-      tail = content.split('\n').filter((l) => l.trim() !== '').slice(-50)
+      const allLines = content.split('\n').filter((l) => l.trim() !== '')
+      tail = allLines.slice(-50)
+      // 心跳可以更靠前：对话活跃时 50 行只覆盖几分钟。
+      // 2000 行仍远小于整文件（实测约 5000+ 行），读一次不心疼。
+      beatWindow = allLines.slice(-HEARTBEAT_SCAN_LINES)
     } catch (e) {
       check('能读最新日志文件', false, String(e?.message ?? e))
     }
@@ -225,11 +243,16 @@ if (rows.length > 0) {
       // 防止「日志有行但不是心跳」蒙混过关：比如只有 user-message。
       // 那说明心跳被删了、但别的写入还在 —— 会让上面那条断言失去意义
       // （用户在场时它也成立，于是"死了"这个状态永远测不出来）。
-      const hasBeat = tail.some((l) => l.includes('[heartbeat]'))
+      //
+      // ⚠️ 2026-11-17：用 `beatWindow`（2000 行）而不是 `tail`（50 行）。
+      //   实测对话活跃时 50 行只覆盖 4 分钟，不足以容纳一次 5 分钟间隔的心跳。
+      //   **放宽窗口不等于放松判据** —— 判据仍是「日志里存在 [heartbeat] 行」，
+      //   只是不再要求它必须出现在最近 50 行这种与对话活跃度相关的窗口里。
+      const hasBeat = beatWindow.some((l) => l.includes('[heartbeat]'))
       check(
         '日志里能看到 [heartbeat] 行（心跳定时器在跑，不只是别的写入）',
         hasBeat,
-        `最后 ${tail.length} 行里没有 [heartbeat]。` +
+        `最近 ${beatWindow.length} 行里没有 [heartbeat]。` +
           `若日志有行却没有心跳，说明 setInterval 被移除或抛错了 —— ` +
           `这会让「日志有行」这个判据失去意义（用户在场时它也成立）。`,
       )

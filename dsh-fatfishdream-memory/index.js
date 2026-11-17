@@ -3246,11 +3246,39 @@ export function apply(ctx, rawConfig = {}) {
           //
           // ⚠️ 标记通道**没有删**，是兜底：HTTP 不通（端口变、接口挂）时仍可以
           // 退回写标记，插件照样解析入库。两条通一条就够。
-          `1. 每轮写一条流水（**必做**，和心跳同一级）：` +
-            `pwsh 里 \`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='正文';topic='13类之一';summary='≤35字';keywords='词A｜词B';sessionId=$env:DSH_SESSION_ID;cwd=(Get-Location).Path} | ConvertTo-Json)\`。`,
+          //
+          // ★ 2026-11-17 重写：「每轮必做」→「一个可以调用的动作」。
+          //
+          // 用户定调（原话）：「让写流水成为『我可以做的一件事』，而不是一条规则」。
+          //
+          // ## 为什么要改（有源码支撑，不是感觉）
+          //
+          // v1（chidaic/dsh-light-memory）注册了 `memory_append` **工具**，
+          // 一次调用只传 `content` 一个参数，而且它出现在每轮请求的 `tools` 数组里
+          // —— 是「候选动作」的一部分。
+          //
+          // 本插件因硬约束 1 不能注册工具，只能手写 HTTP 命令：六个参数、
+          // 其中三个有格式要求。实测漏记率 56%（156 轮里 88 轮没写），
+          // 且「纯分析型轮次」漏得最狠（03-04 点 archive/logs 比值 22.8 / 24.2）。
+          //
+          // ## 改动要点
+          //
+          // ① 给这件事**起名字**（`写流水`），让人读起来像动作而不是纪律；
+          // ② 命令**缩到最短**：只传 text + cwd，topic/summary 由服务端补默认值
+          //    （见 /log 路由里 `topicFinal` 与 `summary-derived` 那两段）；
+          // ③ 措辞从「必须」改成「回复前做一次」，并**给出可判断的时机**。
+          //
+          // ⚠️ 不要删掉 cwd 和 sessionId：
+          //    · cwd —— 不传会按进程 cwd 解析 scope，实测会写到 `desktop` 这种错项目里；
+          //    · sessionId —— 不传流水照样写进去，但 writeFailStreak 会认为「本轮没写」，
+          //      连续 2 轮后误报。两者都是**静默**出错，所以宁可命令行长一点。
+          `**写流水**（一个动作，不是纪律）：回复用户之前调用一次 →` +
+            `pwsh 里 \`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='本轮正文';cwd=(Get-Location).Path;sessionId=$env:DSH_SESSION_ID} | ConvertTo-Json)\`。` +
+            `topic 与 summary 可省 —— 服务端会补默认 topic、并从正文截取摘要。` +
+            `**省掉 cwd 会写错项目，省掉 sessionId 会被误判成没写**，这两个必带。`,
           // ⚠️ 2026-11-16 修：原来这里写 `sessionId='<会话id>'`，
           // 而模型**并不知道自己的会话 id** —— 只能猜或干脆不传。
-          // 不传的后果是 `streakCleared` 永远为 false，连续 4 轮后会误报
+          // 不传的后果是 `streakCleared` 永远为 false，连续 2 轮后会误报
           // 「你忘了写流水」。实测确认 `$env:DSH_SESSION_ID` 就在环境中
           // （如 `session-20d208a0-...`），所以直接用它，不要写占位符。
           // `cwd` 同理用 `(Get-Location).Path`，比手写路径更不容易错。
@@ -3419,8 +3447,12 @@ export function apply(ctx, rawConfig = {}) {
           // 而那条命令在注入上方 200 多字处。模型快速扫读时，
           // 「上面那条」是一个需要回头找的空引用，容易滑过去。
           // 现在直接给完整可粘贴的命令，**不需要往回看**。
+          //
+          // ★ 2026-11-17：命令缩到最短（topic/summary 可省，服务端补默认），
+          //   与上方「写流水」那一节保持**同一份命令**，避免两处写法不一致。
           '每轮回复结尾、心跳之前发一次（**必做，不跳轮**），整行照抄即可：',
-          `\`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='正文';topic='13类之一';summary='≤35字';keywords='词A｜词B';sessionId=$env:DSH_SESSION_ID;cwd=(Get-Location).Path} | ConvertTo-Json)\``,
+          `\`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='正文';cwd=(Get-Location).Path;sessionId=$env:DSH_SESSION_ID} | ConvertTo-Json)\``,
+          'topic 与 summary 已可省略（服务端补默认 topic、从正文截取摘要）；**cwd 与 sessionId 必带**。',
           '**正文里别出现标记** —— 发了 POST 就够了；再写等于多做一次还会闪。',
           // 流水长度给死数字：含糊的「3~5 行」实测被违反十几次（写到 400~900 字）。
           '正文 **≤150 字**（最多 5 行，一行一个要点）。超了就把细节留在对话里。',
@@ -3453,7 +3485,17 @@ export function apply(ctx, rawConfig = {}) {
       ? '<!-- 本段由插件注入。记忆存于 SQLite；模型用 HTTP 接口写流水，不要写进正文。 -->'
       : '<!-- 本段由插件注入。读写记忆请用 write / read / grep / edit 直接操作上面的路径，' +
         '不要期望有 memory_* 工具。 -->'
-    return `${header}\n\n${hint}\n\n${parts.join('\n\n')}\n`
+    // ★ 断点①：记录注入实际长度（2026-11-17）
+    //
+    // 为什么记这个：注入有预算截断（factsBytes / policyBytes 等分段预算）。
+    // 若某一轮「写流水」那段被挤出预算，模型就看不到那条要求 ——
+    // 那会是一个**完全不同的病因**（不是「想不起」，是「根本没给看」）。
+    // 之前没有任何办法区分这两种情况。
+    const injectionText = `${header}\n\n${hint}\n\n${parts.join('\n\n')}\n`
+    lastInjectionBytes = Buffer.byteLength(injectionText, 'utf8')
+    // 同时记录「写流水」那段本身还在不在 —— 这比总长度更关键
+    lastInjectionHasWriteRule = injectionText.includes('写流水')
+    return injectionText
   }
 
   // ---- 情绪强制录入：不依赖模型，也不进入模型请求 schema ----
@@ -4270,6 +4312,28 @@ export function apply(ctx, rawConfig = {}) {
   /** sessionId → 本轮写类操作统计 */
   const turnActivity = new Map()
 
+  // ---- 调试断点用的模块级变量（2026-11-17）----
+  //
+  // 用户要求按传统调试思路「给对话打断点」：在关键位置留下现场，
+  // 事后能还原「那一刻发生了什么」。这三项都是**只读诊断**，不参与任何业务逻辑。
+  //
+  // ⚠️ 为什么用模块级而不是放进 turnActivity：
+  //   turnActivity 每轮结束会被 delete，而这两项要跨越「注入 → 工具调用 → 结算」
+  //   三个阶段，用 Map 存反而更麻烦。这里单会话场景够用，多会话下会串 ——
+  //   但它只影响诊断精度，不影响功能，可接受。
+
+  /** 本轮起始时间（第一次 tools/result 时打点），算轮次耗时用 */
+  let turnStartedAt = null
+
+  /** 最近一次注入的字节数 —— 用来判断「写流水」那段会不会被预算挤掉 */
+  let lastInjectionBytes = null
+
+  /** 最近一次注入里**是否包含「写流水」那段** —— 这比总长度更关键 */
+  let lastInjectionHasWriteRule = null
+
+  /** 本轮调用 /log 的次数 —— 0 表示「从没尝试过」，>0 表示试了 */
+  let logRouteHits = 0
+
   /**
    * sessionId → 连续「写入失败」的轮数。
    *
@@ -4339,6 +4403,9 @@ export function apply(ctx, rawConfig = {}) {
       const record = turnActivity.get(sessionKey) ?? { writes: 0, wroteMemory: false, wroteLog: false }
       record.writes += 1
 
+      // ★ 断点②：本轮第一次工具调用时打点（2026-11-17）
+      if (turnStartedAt === null) turnStartedAt = Date.now()
+
       // 记录「本轮是否已经写过记忆目录」。
       //
       // 用途：如果本轮已经往记忆里写了东西（比如刚写完流水），
@@ -4383,6 +4450,18 @@ export function apply(ctx, rawConfig = {}) {
       const record = turnActivity.get(sessionKey)
       // 一轮只提醒一次：先出队再提醒，避免同轮多步重复注入。
       if (record !== undefined) turnActivity.delete(sessionKey)
+
+      // ★ 2026-11-17：重置断点状态。
+      //
+      // ⚠️ 必须在这里重置，且**必须在写 diag 之前完成读取**。
+      //   下面 diag 里用到的 `turnMs` / `logRouteHits` 都是「本轮」的量，
+      //   如果先重置再读，会全部变成 0 / null —— 那种「字段在但永远为空」
+      //   正是 AGENTS.md 里记过的「reportBudget 静默失效」同一个病。
+      //   所以顺序是：先算好 local 变量 → 重置 → 写 diag。
+      const bpTurnMs = turnStartedAt === null ? null : Date.now() - turnStartedAt
+      const bpLogRouteHits = logRouteHits
+      turnStartedAt = null
+      logRouteHits = 0
 
       // ---- 写操作提醒已取消（2026-11-13）----
       //
@@ -4445,11 +4524,34 @@ export function apply(ctx, rawConfig = {}) {
       //
       // 这条 diag 必须无条件写：它是判断「turn-stopping 有没有在跑」
       // 与「计数有没有涨」的唯一现场。
+      //
+      // ★ 2026-11-17：**加断点**（用户要求，传统调试思路）。
+      //
+      // 原记录只有 `streak / wroteThisTurn / hasRecord / limit` ——
+      // 只能看出「漏了」，看不出「为什么漏」。
+      //
+      // 实际调试时缺的是这几项：
+      //   · writes       本轮调了几次「写类工具」？0 = 纯对话轮次
+      //   · turnMs       本轮花了多久？
+      //   · injectedBytes 注入有多长（会不会把「写流水」那段挤出预算？）
+      //   · logRouteHits 本轮调过几次 /log（0 = 从没尝试过）
+      //
+      // 有了这四项，事后可以按「writes=0 / writes>0」分层，
+      // 看漏记到底集中在哪一类 —— 现在只能猜。
+      //
+      // ⚠️ 全部取自已有变量或廉价计算，不新增 I/O、不写 memory.db。
       diag('write-streak-check', {
         streak: failStreak,
         wroteThisTurn,
         hasRecord: record !== undefined,
         limit: WRITE_FAIL_STREAK_LIMIT,
+        // ---- 断点字段（2026-11-17 加）----
+        writes: record?.writes ?? 0,
+        wroteMemory: record?.wroteMemory ?? false,
+        turnMs: bpTurnMs,
+        injectedBytes: lastInjectionBytes,
+        injectedHasWriteRule: lastInjectionHasWriteRule,
+        logRouteHits: bpLogRouteHits,
       })
       if (failStreak >= WRITE_FAIL_STREAK_LIMIT) {
         const delivered = safePushMessage(
@@ -5181,14 +5283,38 @@ export function apply(ctx, rawConfig = {}) {
                   `这条没有被写入 —— 残缺的 topic 会让流水无法被索引。`,
               })
             }
-            const summary = sanitizeSummary(body.summary)
+            // ★ 2026-11-17：没传 topic → 用默认值「开发日志」，而不是留 null。
+            //
+            //   原来是「summary 必填、topic 可空」，现在两者都可缺省 ——
+            //   目标是让调用方**只传 text 就能写成一条完整流水**。
+            //   ⚠️ 但「传了但写错」仍然 400（上面那条判据不动）：
+            //      默认可缺省 ≠ 允许乱写。静默改掉调用方的错误 topic 才是真的坏事。
+            const topicFinal = topic ?? '开发日志'
+            if (topic === null) diag('topic-defaulted', { via: 'http', to: topicFinal })
+            let summary = sanitizeSummary(body.summary)
             const keywords = sanitizeKeywords(body.keywords)
+            // ★ 2026-11-17 改：summary 缺失时**从正文截取**，不再 400。
+            //
+            // 用户定调：「让写流水成为『我可以做的一件事』，而不是一条规则」。
+            // 背景（有源码支撑）：v1（dsh-light-memory）注册了 memory_append 工具，
+            // 一次调用只传 `content` 一个参数；本插件因硬约束 1 不能注册工具，
+            // 只能手写 HTTP 命令 —— 六个参数、其中三个有格式要求。
+            // 实测漏记率 56%（156 轮里 88 轮没写），「纯分析型轮次」漏得最狠
+            // （03-04 点 archive/logs 比值 22.8 / 24.2）。
+            //
+            // ⚠️ 为什么截取而不是置 null：
+            //   summary 是**检索与注入都依赖**的字段。置 null 等于「写了但搜不到」，
+            //   比不写更坏 —— 会让人以为记下来了。所以宁可自动截取，也不能留空。
+            //   取正文第一行、去 markdown 记号、按 35 字截断（与 sanitizeSummary 上限一致）。
             if (summary === null) {
-              diag('summary-missing', { topic, via: 'http' })
-              return json(res, 400, {
-                ok: false,
-                error: '缺少 summary（必填，≤35 字）。这条没有被写入 —— 没有摘要的流水在检索里等于不存在。',
-              })
+              const firstLine = text.split(/\r?\n/).find((l) => l.trim() !== '') ?? text
+              const cleaned = firstLine
+                .replace(/[#*`>_~]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+              const cut = cleaned.length > 35 ? `${cleaned.slice(0, 34)}…` : cleaned
+              summary = sanitizeSummary(cut) ?? cut.slice(0, 35)
+              diag('summary-derived', { via: 'http', from: 'text', summary })
             }
 
             // scope 解析：默认取请求方所在会话的项目名（与标记通道同源，
@@ -5230,10 +5356,18 @@ export function apply(ctx, rawConfig = {}) {
               })
             }
 
-            const r = dbStore.appendLog(scope, text, { topic, summary, keywords })
+            // ★ 断点③：记录「本轮调过 /log」（2026-11-17）
+            //
+            // 与 record.wroteLog 的区别：
+            //   wroteLog 是「被服务端认账了」（要求 sessionId 正确）
+            //   logRouteHits 是「模型真的来调了」（不管服务端认不认）
+            // 两者不一致时，说明是**计数器问题**而不是模型没写 —— 这个区分以前做不到。
+            logRouteHits += 1
+
+            const r = dbStore.appendLog(scope, text, { topic: topicFinal, summary, keywords })
             diag('mem-写流水', {
               project: r.project,
-              topic,
+              topic: topicFinal,
               summary: summary ?? null,
               keywords: keywords ?? null,
               db: true,
@@ -5258,7 +5392,7 @@ export function apply(ctx, rawConfig = {}) {
               scope: r.project,
               bytes: r.bytes,
               summary: r.summary,
-              topic,
+              topic: topicFinal,
               scopeFrom,
               streakCleared: sid !== '',
             })

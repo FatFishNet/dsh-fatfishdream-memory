@@ -101,21 +101,54 @@ console.log('【基线】')
     check('基线必须全部通过（FAIL=0）', /FAIL=0/.test(out), out.split('\n').filter((l) => /FAIL=/.test(l)).join(''))
 }
 
+// ── ★ 2026-11-17：锚点的行号**从地图动态读**，不再写死 ──
+//
+// 原来这里写死 `L2792` / `L6024` / `L3640` / `L4304`。后果：
+// 每次改 `index.js` 让行号漂移，这个脚本就整片失效 —— 实测一次改了 57 行，
+// 6 条用例全部匹配不上（`trial` 会报「变异没匹配上任何内容」，算失败，这点是对的），
+// 但要**手工改一遍脚本**才能继续用。
+//
+// 现在从地图当前内容里按「类型:锚点」查出它声称的行号，
+// 再针对那个行号做篡改。这样脚本**与行号解耦**，只依赖「地图里存在这一条」。
+function claimedOf(kind, anchor) {
+    const re = new RegExp(`^L(\\d{3,4})\\s{2,}${kind}:${escapeRe(anchor)}(?:\\s{2,}|\\r?$)`, 'm')
+    const m = original.match(re)
+    return m ? { n: m[1], text: m[0] } : null
+}
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** 把地图里某条锚点的行号改成指定值。返回新文本（找不到就原样返回）。 */
+function retarget(kind, anchor, newN) {
+    const re = new RegExp(`^L(\\d{3,4})(\\s{2,}${escapeRe(kind + ':' + anchor)}(?:\\s{2,}|\\r?$))`, 'm')
+    return original.replace(re, `L${newN}$2`)
+}
+
+const APPLY = claimedOf('fn', 'apply')
+const RHC = claimedOf('decl', 'runHealthCheck')
+const SE = claimedOf('lit', "'session/event'")
+const TR = claimedOf('lit', "'tools/result'")
+const FTB = claimedOf('fn', 'findTableById')
+
+// 缺任何一条都说明地图格式变了 —— 此时**不能静默跳过**，要显式失败
+for (const [name, got] of [['fn:apply', APPLY], ['decl:runHealthCheck', RHC], ["lit:'session/event'", SE], ["lit:'tools/result'", TR]]) {
+    check(`地图里能找到 ${name}（否则本脚本无法工作）`, got !== null, '地图 §3.3 里没有这一条')
+}
+
 // ── ① 行号篡改 ──
 console.log('\n【① 行号改错 → 必须红】')
 trial(
-    'L2792（fn:apply）行号 +1',
-    (t) => t.replace(/^L2792(\s{2,})fn:apply/m, 'L2793$1fn:apply'),
+    `L${APPLY?.n}（fn:apply）行号 +1`,
+    () => retarget('fn', 'apply', Number(APPLY.n) + 1),
     1,
 )
 trial(
-    'L6000（decl:runHealthCheck）行号 -1',
-    (t) => t.replace(/^L6000(\s{2,})decl:runHealthCheck/m, 'L5999$1decl:runHealthCheck'),
+    `L${RHC?.n}（decl:runHealthCheck）行号 -1`,
+    () => retarget('decl', 'runHealthCheck', Number(RHC.n) - 1),
     1,
 )
 trial(
-    'L3640（lit:session/event）行号 +500',
-    (t) => t.replace(/^L3640(\s{2,})lit:'session\/event'/m, 'L4140$1lit:\'session/event\''),
+    `L${SE?.n}（lit:session/event）行号 +500`,
+    () => retarget('lit', "'session/event'", Number(SE.n) + 500),
     1,
 )
 
@@ -123,28 +156,28 @@ trial(
 console.log('\n【② 锚点改成不存在的符号 → 必须红】')
 trial(
     'fn:apply → fn:noSuchFunction',
-    (t) => t.replace(/^L2792(\s{2,})fn:apply/m, 'L2792$1fn:noSuchFunction'),
+    () => original.replace(new RegExp(`^L${APPLY.n}(\\s{2,}fn:apply)`, 'm'), `L${APPLY.n}$1x`).replace('fn:applyx', 'fn:noSuchFunction'),
     1,
 )
 trial(
-    'lit:\'tools/result\' → lit:\'tools/not-exist\'',
-    (t) => t.replace(/^L4304(\s{2,})lit:'tools\/result'/m, 'L4304$1lit:\'tools/not-exist\''),
+    "lit:'tools/result' → lit:'tools/not-exist'",
+    () => retarget('lit', "'tools/result'", TR.n).replace("lit:'tools/result'", "lit:'tools/not-exist'"),
     1,
 )
 
 // ── ③ 类型篡改：同一行换一个不成立的类型 ──
 console.log('\n【③ 锚点类型换错 → 必须红】')
-// L2792 是 `export function apply(...)`，用 decl: 该行不满足（不是 const/let/var 声明）
+// `export function apply(...)` 用 decl: 该行不满足（不是 const/let/var 声明）
 trial(
-    'L2792 由 fn:apply 改成 decl:apply（类型不匹配）',
-    (t) => t.replace(/^L2792(\s{2,})fn:apply/m, 'L2792$1decl:apply'),
+    `L${APPLY?.n} 由 fn:apply 改成 decl:apply（类型不匹配）`,
+    () => original.replace(new RegExp(`^(L${APPLY.n})(\\s{2,})fn:apply`, 'm'), `$1$2decl:apply`),
     1,
 )
-// L6000 是 `const runHealthCheck = () => {`，用 fn: 也能过（fn 同时认 const X = (）。
+// `const runHealthCheck = () => {` 用 fn: 也能过（fn 同时认 const X = (）。
 // ⚠️ 这里**不能**期望 lit: 失败 —— 见下方「lit 天生弱」的说明。
 trial(
-    'L6000 由 decl:runHealthCheck 改成 call:runHealthCheck（该行不含调用形态... 实际含）',
-    (t) => t.replace(/^L6000(\s{2,})decl:runHealthCheck/m, 'L6000$1fn:runHealthCheck'),
+    `L${RHC?.n} 由 decl:runHealthCheck 改成 fn:runHealthCheck（fn 也认 const X = (，应仍绿）`,
+    () => original.replace(new RegExp(`^(L${RHC.n})(\\s{2,})decl:runHealthCheck`, 'm'), `$1$2fn:runHealthCheck`),
     0,
 )
 
@@ -164,15 +197,15 @@ trial(
 console.log('\n【③b lit 只服务事件名（已知取舍，不断言它为强判据）】')
 trial(
     'lit 用在事件名上：把 \'tools/result\' 改成 \'tools/other\' → 必须红（上面②已验证）',
-    (t) => t.replace(/^L4304(\s{2,})lit:'tools\/result'/m, "L4304$1lit:'tools/other'"),
+    () => original.replace(new RegExp(`^(L${TR.n})(\\s{2,})lit:'tools/result'`, 'm'), `$1$2lit:'tools/other'`),
     1,
 )
 
 // ── ④ 盲区护栏：删掉锚点退回裸中文描述 ──
 console.log('\n【④ 删锚点退回裸描述 → 必须红（盲区护栏）】')
 trial(
-    'L3886 删掉 fn:findTableById 锚点',
-    (t) => t.replace(/^L3886\s{2,}fn:findTableById\s*$/m, 'L3886  findTableById 定义'),
+    `L${FTB?.n} 删掉 fn:findTableById 锚点`,
+    () => original.replace(new RegExp(`^(L${FTB.n})\\s{2,}fn:findTableById\\s*\\r?$`, 'm'), `$1  findTableById 定义`),
     1,
 )
 

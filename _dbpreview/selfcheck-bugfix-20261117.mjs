@@ -294,7 +294,28 @@ try {
   // [回退验证] 删掉两个 return json(res, 400, ...)，本条红。
   {
     check('topic 不在白名单时 return 400', /topicRaw !== '' && topic === null[\s\S]{0,400}?return json\(res, 400/.test(SRC))
-    check('summary 缺失时 return 400', /summary === null\) \{[\s\S]{0,400}?return json\(res, 400/.test(SRC))
+
+    // ⚠️ 2026-11-17 改：summary 的判据**从「缺失即 400」改成「缺失即从正文截取」**。
+    //
+    // 这不是为了修测试而放松断言 —— 是**行为被有意改变了**（用户定调：
+    // 「让写流水成为『我可以做的一件事』，而不是一条规则」）。
+    // 原判据守的是「不能假成功」；新做法同样不假成功 ——
+    // 它生成一条**完整**的流水（topic 与 summary 都有值），不是残缺条目。
+    //
+    // 所以这里改成守**新的行为契约**，而且断言更严：
+    //   ① 必须存在 `summary === null` 的兜底分支
+    //   ② 该分支里**不能**出现 400（否则又回到「必填」）
+    //   ③ 必须真的调用 sanitizeSummary 回填（而不是置 null）
+    //   ④ 必须留 diag，便于事后查「这条摘要是不是自动生成的」
+    check(
+      'summary 缺失时不拒绝，而是从正文截取',
+      /summary === null\) \{[\s\S]{0,900}?sanitizeSummary\(cut\)/.test(SRC) &&
+        !/summary === null\) \{[\s\S]{0,400}?return json\(res, 400/.test(SRC),
+    )
+    check('摘要自动生成时留 diag（可追溯）', /diag\('summary-derived'/.test(SRC))
+    check('topic 缺失时补默认值而不是留 null', /const topicFinal = topic \?\? '开发日志'/.test(SRC))
+    // 「传了但写错」仍然必须拒绝 —— 这条不能因为「可缺省」被放松
+    check('topic 传了但写错仍然 400（可缺省 ≠ 允许乱写）', /topicRaw !== '' && topic === null[\s\S]{0,600}?return json\(res, 400/.test(SRC))
     check('拒收文案说明了「这条没有被写入」', /这条没有被写入/.test(SRC))
 
     // 行为验证：复刻 sanitizeSummary 的判断
@@ -303,9 +324,21 @@ try {
       const s = String(raw).replace(/--+>\s*$/g, '').trim()
       return s === '' ? null : s
     }
-    check('summary 缺失 → null（会被拒收）', sanitizeSummary(undefined) === null)
-    check('summary 空串 → null（会被拒收）', sanitizeSummary('   ') === null)
+    check('summary 缺失 → null（触发自动截取分支）', sanitizeSummary(undefined) === null)
+    check('summary 空串 → null（触发自动截取分支）', sanitizeSummary('   ') === null)
     check('summary 正常 → 保留', sanitizeSummary('摘要内容') === '摘要内容')
+
+    // 新增：验证「截取」这条规则本身（与源码里的逻辑同构）
+    //   判据：取第一行、去 markdown 记号、超 35 字截断加省略号
+    const deriveSummary = (text) => {
+      const firstLine = text.split(/\r?\n/).find((l) => l.trim() !== '') ?? text
+      const cleaned = firstLine.replace(/[#*`>_~]/g, '').replace(/\s+/g, ' ').trim()
+      return cleaned.length > 35 ? `${cleaned.slice(0, 34)}…` : cleaned
+    }
+    check('自动摘要：取第一行', deriveSummary('第一行\n第二行') === '第一行')
+    check('自动摘要：去掉 markdown 记号', deriveSummary('## 标题') === '标题')
+    check('自动摘要：超 35 字截断且带省略号', deriveSummary('啊'.repeat(50)).length === 35)
+    check('自动摘要：短文本原样保留', deriveSummary('短') === '短')
   }
 } finally {
   fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })

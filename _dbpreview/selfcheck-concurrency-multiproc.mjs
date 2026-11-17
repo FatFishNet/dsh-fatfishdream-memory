@@ -62,8 +62,23 @@ if (process.env.DSH_CONCURRENCY_WORKER === '1') {
     }
   }
   store.close()
-  // 用 stdout 回传结果（父进程解析）
-  process.stdout.write(JSON.stringify({ tag, ok: ok.length, errs: errs.length, sample: errs[0] ?? null }))
+  // ⚠️ 2026-11-17 改：结果写**文件**，不再走 stdout。
+  //
+  // 为什么改：受限沙箱（workspace-write）下程序不能开命名管道，
+  // `spawn` 用 `stdio: 'pipe'` 会直接 EPERM 抛错 —— 整个脚本还没测任何东西就崩了。
+  // 而本机默认就是受限沙箱（只有显式 danger-full-access 才放开）。
+  //
+  // 改成写文件后，父进程可以用 `stdio: 'ignore'`（沙箱允许），
+  // 完全绕开管道。这与 `lib-spawn-capture.mjs` 的退路是同一个思路。
+  const outFile = process.env.DSH_CONCURRENCY_OUT
+  if (outFile) {
+    try {
+      fs.writeFileSync(outFile, JSON.stringify({ tag, ok: ok.length, errs: errs.length, sample: errs[0] ?? null }), 'utf8')
+    } catch (e) {
+      // 写不出来就让父进程从「文件缺失」推断 worker 失败了 —— 不静默
+      process.exit(2)
+    }
+  }
   process.exit(0)
 }
 
@@ -96,6 +111,15 @@ try {
 
   const children = []
   for (let w = 0; w < WORKERS; w++) {
+    // ⚠️ 2026-11-17：结果走**临时文件**，不走 stdout 管道。
+    //
+    // 原实现用 `stdio: ['ignore', 'pipe', 'pipe']` 读子进程输出，
+    // 在 workspace-write 沙箱下直接 `spawn EPERM` —— 脚本什么都没测就崩了。
+    // 本机默认权限就是 workspace-write，所以这条必须按沙箱可用的方式写。
+    //
+    // `stdio: 'ignore'` 在沙箱下是允许的（exit code 依然准确），
+    // worker 把 JSON 写进 outFile，父进程读完即删。
+    const outFile = path.join(tmpRoot, `worker-${w}.json`)
     const child = spawn(process.execPath, [HERE + '/selfcheck-concurrency-multiproc.mjs'], {
       env: {
         ...process.env,
@@ -104,21 +128,25 @@ try {
         DSH_CONCURRENCY_TAG: String(w),
         DSH_CONCURRENCY_COUNT: String(PER),
         DSH_CONCURRENCY_START: String(startAt),
+        DSH_CONCURRENCY_OUT: outFile,
       },
-      // 受限沙箱下不能开命名管道 → 用 'inherit' 不行（要读输出），
-      // 所以显式 pipe；本脚本在正常权限下跑。
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: 'ignore',
     })
     children.push(
       new Promise((resolve) => {
-        let out = ''
-        let err = ''
-        child.stdout.on('data', (d) => { out += d })
-        child.stderr.on('data', (d) => { err += d })
         child.on('exit', (code) => {
           let parsed = null
-          try { parsed = JSON.parse(out) } catch { /* 解析失败=worker 崩了 */ }
+          let err = ''
+          try {
+            parsed = JSON.parse(fs.readFileSync(outFile, 'utf8'))
+          } catch (e) {
+            // 文件没有/读不动 = worker 没跑到写文件那步（崩了或被杀）
+            err = String(e?.message ?? e)
+          }
           resolve({ tag: w, code, parsed, err: err.slice(0, 300) })
+        })
+        child.on('error', (e) => {
+          resolve({ tag: w, code: null, parsed: null, err: `spawn 失败：${e?.message ?? e}` })
         })
       }),
     )

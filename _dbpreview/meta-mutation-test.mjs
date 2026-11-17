@@ -385,9 +385,15 @@ const MUTATIONS = [
   {
     id: 'log-http-cwd-guard-removed',
     file: 'dsh-fatfishdream-memory/index.js',
-    desc: '去掉 cwd 存在性检查（传错目录会凭空造出假工作区）',
+    desc: '去掉 cwd 校验（传错目录/文件路径都会凭空造出假工作区）',
     // ⚠️ 2026-11-16 实测过：这个变异确实能让 selfcheck-log-alive 段 5 变红。
-    from: '              if (!(await exists(cwd))) {',
+    //
+    // ⚠️ 2026-11-17 改锚点：判据从 `exists(cwd)` 升级成 `isDirectoryPath(cwd)`。
+    //   为什么升级：`exists()` 走 stat()，**文件也算存在** —— 传
+    //   `.../AGENTS.md` 也能通过校验，随后 basename 变成 scope 名，建出假工作区。
+    //   锚点必须跟着源码走，否则这条变异会 SKIP（= 防线空了）。
+    //   而 SKIP 在真跑时会被算成失败 —— 这正是「把防线失配当信号」的设计。
+    from: '              if (!(await isDirectoryPath(cwd))) {',
     to: '              if (false) {',
   },
   {

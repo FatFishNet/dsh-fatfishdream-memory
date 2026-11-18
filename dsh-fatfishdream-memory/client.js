@@ -494,11 +494,31 @@ window.__ModuleLoader__.load({
     }
 
     /** 新增条目的表单：规则可指定全局/项目；画像只有全局概念 */
-    function AddRuleForm({ scopes, defaultScope, isProfile, onAdded, onMessage, onCancel }) {
+    function AddRuleForm({ scopes, knownScopes, defaultScope, isProfile, onAdded, onMessage, onCancel }) {
       const [text, setText] = React.useState('')
       const [scope, setScope] = React.useState(defaultScope || '__global__')
       const [kind, setKind] = React.useState('pref')
       const [busy, setBusy] = React.useState(false)
+      // 工作区下拉的选项集：**所有已知工作区** ∪ 已有规则的工作区。
+      //
+      // ⚠️ 2026-11-18 修（用户报告「添加规则时无法指定工作区」）：
+      // 原来只用 `scopes`（= `listScopes('rules')` 的结果，即**已有 active 规则的
+      // 工作区**）。于是**一个还没有规则的工作区在表单里根本没有选项** ——
+      // 这正是「给某工作区建第一条规则」这个最该能做的动作做不到。
+      // 用户实测：6 个工作区里只有 2 个可选。
+      //
+      // 用 useMemo 缓存：下拉选项在打字时不该重算（objects 每次 render 都是新的）。
+      const scopeOptions = React.useMemo(() => {
+        const merged = new Set()
+        for (const name of knownScopes ?? []) {
+          if (name && name !== '__global__') merged.add(name)
+        }
+        for (const s of scopes ?? []) {
+          if (s && s.scope && s.scope !== '__global__') merged.add(s.scope)
+        }
+        // __global__ 已在上面单独渲染为第一项，这里排除，避免重复
+        return [...merged].sort((a, b) => a.localeCompare(b))
+      }, [knownScopes, scopes])
 
       const submit = async () => {
         const body = text.trim()
@@ -567,9 +587,12 @@ window.__ModuleLoader__.load({
                 'select',
                 { style: S.select, value: scope, onChange: (e) => setScope(e.target.value) },
                 h('option', { value: '__global__' }, '全局（所有项目）'),
-                ...scopes
-                  .filter((s) => s.scope !== '__global__')
-                  .map((s) => h('option', { key: s.scope, value: s.scope }, `项目：${s.scope}`)),
+                ...scopeOptions.map((name) => h('option', { key: name, value: name }, `项目：${name}`)),
+                // 没有任何已知工作区时，至少让人知道「为什么没有项目可选」。
+                // 否则下拉里只有「全局」一项，看起来像界面坏了。
+                scopeOptions.length === 0
+                  ? h('option', { value: '', disabled: true }, '（还没有登记过工作区）')
+                  : null,
               ),
           isProfile
             ? null
@@ -646,6 +669,23 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = React.useState('rules')
       const [entries, setEntries] = React.useState([])
       const [scopes, setScopes] = React.useState([])
+      // ---- 所有已知工作区（2026-11-18 新增）----
+      //
+      // ⚠️ 为什么必须有这个、不能继续用 `scopes`：
+      // `scopes` 来自 entries 响应的 `listScopes(table)`，它统计的是
+      // **已经有 active 规则的 scope** —— 于是「还没有任何规则的工作区」
+      // 根本不会出现在下拉框里，用户就**永远无法从 GUI 给那个工作区建第一条规则**。
+      // 2026-11-18 用户实测报的就是这个（原话：「GUI里目前无法筛选项目规则
+      // 并且添加规则时无法指定工作区」）：库里真实有 6 个工作区，下拉框只有
+      // `__global__` 和 `dsh-skill-switch-main`（因为只有这俩有规则数据），
+      // 用户自己的工作区 dsh-fatfishdream-memory / SoftTest / ForzaOverlay /
+      // design 全都选不到。
+      //
+      // 这是典型的鸡生蛋：数据源取自「已有数据」，而界面正是用来产生数据的。
+      // 所以改成取**所有已知工作区**：`/state` 的 projects ∪ `/scope/list`
+      // 的有数据工作区。两个接口各自覆盖一类「登记过但还没有该类数据」
+      // 与「有数据但 project 表里没有了」的情形，取并集才不会漏。
+      const [knownScopes, setKnownScopes] = React.useState([])
       const [kind, setKind] = React.useState('')
       // 默认「仅全局」：一进来就看到全部项目的一百多条会让人懵，
       // 而且多数时候想改的是全局规则。看某个项目再手动切。
@@ -815,6 +855,37 @@ window.__ModuleLoader__.load({
             if (alive && p.ok) setWsScopes(p.scopes ?? [])
           } catch {
             /* 拉不到就空列表，不弹错 */
+          }
+        })()
+        return () => { alive = false }
+      }, [tab])
+
+      // 所有已知工作区：**只在 规则页 / 新增规则表单 需要时拉一次**。
+      // 与 wsScopes（工作区改名页）分开存：那一个要求「改名时确实会动的」，
+      // 这一个要求「界面上能选到的」，口径不同，不能混用同一个 state。
+      React.useEffect(() => {
+        if (!(tab === 'rules' || tab === 'profile')) return undefined
+        let alive = true
+        void (async () => {
+          try {
+            // 两个来源取并集，缺一个都会漏：
+            //   /state 的 projects  —— 登记过的工作区（哪怕一条数据都没有）
+            //   /scope/list        —— 有数据的工作区（哪怕 project 表里已经没有了）
+            const [stateResp, listResp] = await Promise.all([
+              fetch(API_STATE).then((r) => r.json()).catch(() => null),
+              fetch(API_SCOPE_LIST).then((r) => r.json()).catch(() => null),
+            ])
+            const set = new Set()
+            for (const p of stateResp?.projects ?? []) {
+              if (p && typeof p.scope === 'string' && p.scope !== '' && p.scope !== '__global__') set.add(p.scope)
+            }
+            for (const s of listResp?.scopes ?? []) {
+              const name = typeof s === 'string' ? s : s?.scope
+              if (typeof name === 'string' && name !== '' && name !== '__global__') set.add(name)
+            }
+            if (alive) setKnownScopes([...set].sort((a, b) => a.localeCompare(b)))
+          } catch {
+            /* 拉不到就只有「已有规则的工作区」可选，不弹错 —— 那仍是可用状态 */
           }
         })()
         return () => { alive = false }
@@ -1542,6 +1613,7 @@ window.__ModuleLoader__.load({
                 ? adding
                   ? h(AddRuleForm, {
                       scopes,
+                      knownScopes,
                       isProfile: tab === 'profile',
                       defaultScope: tab === 'profile' ? '__global__' : scope || '__global__',
                       onAdded: () => {
@@ -1594,8 +1666,34 @@ window.__ModuleLoader__.load({
                         })(),
                       ),
                       h('option', { value: '' }, '全部项目'),
+                      // ⚠️ 2026-11-18 改为「所有已知工作区」，不再只列 entries 返回的 scopes。
+                      //
+                      // 原实现只列 `listScopes('rules')` 的结果 = **已经有 active 规则
+                      // 的工作区**。后果：还没建过规则的工作区不在下拉里 →
+                      // GUI 无法筛选到它、也无法给它建第一条规则（鸡生蛋）。
+                      // 用户实测报告：「GUI里目前无法筛选项目规则」
+                      // （当时库里 6 个工作区，下拉只有 2 项）。
+                      //
+                      // 条数仍然来自 `scopes`（entries 响应），**给了才显示**：
+                      // 没建过规则的工作区显示成「name」而不是「name（0）」，
+                      // 避免和「有 0 条 active 但其实是停用」混淆。
+                      ...knownScopes.map((name) => {
+                        const hit = scopes.find((s) => s.scope === name)
+                        return h(
+                          'option',
+                          { key: name, value: name },
+                          hit ? `${name}（${hit.n}）` : name,
+                        )
+                      }),
+                      // 兜底：库里有规则、但既不在 projects 也不在 scope/list 里的
+                      // 异常 scope（比如手工改库留下的）。不列出来就选不到、也看不见。
                       ...scopes
-                        .filter((s) => s.scope !== '__global__')
+                        .filter(
+                          (s) =>
+                            s.scope !== '__global__' &&
+                            s.scope !== '' &&
+                            !knownScopes.includes(s.scope),
+                        )
                         .map((s) => h('option', { key: s.scope, value: s.scope }, `${s.scope}（${s.n}）`)),
                     )
                   : null,

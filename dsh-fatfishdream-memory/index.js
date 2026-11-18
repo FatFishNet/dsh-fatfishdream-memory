@@ -648,6 +648,205 @@ function byteLength(text) {
 }
 
 /**
+ * 数一条消息里有几处「每轮收尾语」（心跳）。
+ *
+ * ## 为什么单独抽成顶层纯函数（2026-11-17）
+ *
+ * 它原先内联在 `session/event` 的归档分支里。内联版本**无法写出会失败的断言**：
+ * 要验「补写那条消息没加收尾语」，只能事后查 `archive` 表，而那时我已经
+ * 把同一轮其它正常回复的收尾语也算进去了 —— **数错对象**，得出过
+ * 「补写又加了一条」的错误结论。
+ *
+ * 抽成纯函数后，测试可以直接喂四种形态：
+ *   ① 正常回复（1 处，且在末行）
+ *   ② 补写消息（0 处）
+ *   ③ 正文里引用了收尾语（引用不该计数）
+ *   ④ 一条消息出现 2 处（用户形容的「打嗝」）
+ * 这四种都能写「改坏了它会红」的断言，不再依赖事后查表。
+ *
+ * ## 为什么跳过表格行与引用行
+ *
+ * 收尾语是一句带感叹号的人话，很容易被**引用**：做对比表、贴日志、
+ * 复述用户说过的话时都会原样出现。那些不是「本条消息在执行收尾」。
+ * 判据：以 `|`（表格）或 `>`（引用）开头的行不算。
+ *
+ * ⚠️ 但**行首无标记的裸引用仍然会被计入** —— 纯字符串匹配分不清
+ * 「在说这句话」和「在提这句话」。这是已知局限，不是 bug：
+ * 需要精确判断时看 `heartbeatLast`（末行是不是收尾语）。
+ *
+ * @param {string} text     消息正文
+ * @param {string} heartbeat 用户配置的收尾语（取自 policy.md），空串表示没配
+ * @returns {number|null} 出现次数；`null` 表示没配置收尾语、无从判断
+ */
+function countHeartbeat(text, heartbeat) {
+  if (typeof heartbeat !== 'string' || heartbeat === '') return null
+  if (typeof text !== 'string') return 0
+  let count = 0
+  for (const line of text.split('\n')) {
+    const t = line.trim()
+    if (t === '' || t.startsWith('|') || t.startsWith('>')) continue
+    if (t.includes(heartbeat)) count += 1
+  }
+  return count
+}
+
+/**
+ * 收尾语是不是本条消息的**最后一行**（`policy.md` 明确要求「放在最后一行」）。
+ *
+ * 与 `countHeartbeat` 分开的理由：「出现 1 次」和「出现在末行」是**两件事**。
+ * 实测过的形态：正文末尾有收尾语、但插件补记的步骤又在后面追加了一段 ——
+ * 那一条的 `count` 是 0（补记段自己没加），可**整轮看**收尾语就不在最后了。
+ * 两者都要能单独观测，才不会又把两件事混成一件。
+ *
+ * @returns {boolean|null} `null` 表示没配置收尾语
+ */
+function isHeartbeatLast(text, heartbeat) {
+  if (typeof heartbeat !== 'string' || heartbeat === '') return null
+  if (typeof text !== 'string') return false
+  return text.trimEnd().endsWith(heartbeat)
+}
+
+/**
+ * C1-A（2026-11-18 修正版）：**补记消息不该带收尾语**。
+ *
+ * ## 用户原话（比我最初的判据更准）
+ *
+ * > 「你在一段话感觉要结束的时候，收尾语会先出来，但是下面显示你依然在执行指令，
+ * >  指令结束后打嗝并发出第二条收尾语」
+ *
+ * 实盘三轮（本会话，`archive` 实测）：
+ *
+ * | turn | 真回答带收尾语 | 补记带收尾语 | 用户看到的 |
+ * |---|---|---|---|
+ * | 13 | ✅ len=831  | ✅ len=33 | 两条 → 打嗝 |
+ * | 14 | ❌ len=2816 | ✅ len=33 | 一条，但在**补记**上 |
+ * | 15 | ✅ len=1225 | ✅ len=33 | 两条 → 打嗝 |
+ *
+ * **共同点：补记那条每次都带。**
+ *
+ * 补记是插件用 `steer` 触发的一步「POST 一条流水」，**不是一轮回复**，
+ * 所以它本来就不该有收尾语 —— `policy.md` 那条规则说的是「每轮**回复**的结尾」。
+ *
+ * ## 为什么必须由代码兜底
+ *
+ * v3 的提醒文案**已经写明**「不要写『已补记』『id=xxx』之类的确认，
+ * 也不要写正文、**不要加收尾语**」。模型仍然加。
+ *
+ * 历史上三个版本的文案全部失败：
+ *   ①「不要再重复一遍收尾语」  → 照样发
+ *   ②「本步只发 id / topic」   → 收尾语连续消失（副作用更糟）
+ *   ③「不要输出任何文字」      → 改成发一个「。」
+ *
+ * **每一版都在管「模型想发什么」；放行点在代码里。**
+ * 与 `selfcheck-filler-guard.mjs` 同一思路：那次也是文案三版失败，
+ * 最后靠归档闸门拦住「。」。
+ *
+ * ## ⚠️ 它只改**归档那一份**，不改界面已显示的消息
+ *
+ * 要改显示中的消息需要 surface replace，已证实**结构上不可能**
+ * （`assistant/message` 禁止带 `sourceEventSeqs`，而 replace 要求它覆盖
+ * 被遮蔽节点，两条约束互相锁死 —— 见 `C1-C4-现有功能说明.md`）。
+ *
+ * 所以本函数的效果是：**数据库 `archive` 里不再打嗝**。
+ * 界面上那一下仍在，除非将来走 message projection 方案。
+ *
+ * @param {string} text      这条消息的正文
+ * @param {string} heartbeat 用户在 `policy.md` 里配的收尾语；空串表示没配
+ * @param {boolean} isToolStep 这条消息是不是「补记」这类工具性步骤产生的
+ * @returns {string} 应该写进 archive 的正文
+ */
+function stripHeartbeatFromToolStep(text, heartbeat, isToolStep) {
+  if (typeof heartbeat !== 'string' || heartbeat === '') return text
+  if (typeof text !== 'string') return text
+  // 非工具步骤（真正的回答）一个字都不动 —— 那是 policy.md 要求的
+  if (isToolStep !== true) return text
+
+  let out = text.trimEnd()
+  // 只删**末尾**那一次；正文中间提到收尾语是正常的（讨论这条规则本身）
+  if (!out.endsWith(heartbeat)) return text
+  out = out.slice(0, out.length - heartbeat.length)
+  // 去掉因删除残留的尾随空白，不留空尾行
+  out = out.replace(/[\s\u3000]+$/, '')
+  return out
+}
+
+/**
+ * C1-A「打嗝」判据：同一个 turn 里，多出来的收尾语该从哪条消息里去掉。
+ *
+ * ## 要解决的现象（2026-11-18 实测，全库 1055 个 turn）
+ *
+ * 97 个 turn（9.2%）里**两条或多条 assistant 消息各自带了一次收尾语**。
+ * 其中 95 个形态完全一致：
+ *
+ *     第 1 条（真正的回答）以收尾语结尾   ← 位置正确，不动
+ *     最后 1 条（补记/补充）又加了一次     ← 这是「打嗝」
+ *
+ * 用户形容它像打嗝：正话说完了，嗝一下又出来一句。
+ *
+ * ## 判据为什么按「末尾」而不是「包含」
+ *
+ * `policy.md` 要求的是「**每轮回复的结尾**加固定一句」。所以：
+ *   · 一条消息**以**收尾语结尾 → 它履行了这条规则
+ *   · 一条消息**中间**提到收尾语 → 可能是在讨论这条规则本身，不算
+ *
+ * 只按「包含」判会误伤后者 —— 本项目里真的发生过：我讨论收尾语时
+ * 在正文中间引用过它。那种情况不该被当成「重复」。
+ *
+ * ## 为什么返回「最后一条之外」而不是「删掉最后一条」
+ *
+ * 保留**最后**一条的收尾语是有意的：轮次结束时最后那条消息位于最底部，
+ * 收尾语在那里才符合「每轮回复的结尾」这个语义。
+ * 而中间那些（包括真正的回答）如果也各带一次，就形成了打嗝。
+ *
+ * ⚠️ 等等 —— 这与上面的「95 个形态」矛盾，必须说清楚：
+ *
+ *   实测的 95 个里，**第 1 条是真正的回答、位置也正确**。
+ *   如果按「只留最后一条」，那就会把**正确的那条**的收尾语删掉，
+ *   反而删错对象。
+ *
+ * 所以正确规则是：**保留第一条（最先出现的）里的收尾语，删掉后续的**。
+ * 理由：第一条是「这一轮真正说给人听的话」，它在那一刻就是本轮回复的
+ * 结尾；后面的补记消息是**工具性收尾**，不该再嗝一次。
+ *
+ * 这个方向与「删最后一条」相反 —— 判据必须按实测形态定，不能按直觉。
+ *
+ * @param {Array<{seq:number, text:string}>} messages 同一 turn 的 assistant 消息（按 seq 升序）
+ * @param {string} heartbeat 用户在 `policy.md` 里配的收尾语；空串表示没配
+ * @returns {Array<{seq:number, newText:string}>} 需要改写的那几条及其新正文
+ */
+function planHiccupFix(messages, heartbeat) {
+  if (typeof heartbeat !== 'string' || heartbeat === '') return []
+  if (!Array.isArray(messages) || messages.length < 2) return []
+
+  // 找出「以收尾语结尾」的那些消息，按出现顺序
+  const carriers = []
+  for (const msg of messages) {
+    const text = typeof msg?.text === 'string' ? msg.text : ''
+    if (text === '') continue
+    if (text.trimEnd().endsWith(heartbeat)) carriers.push(msg)
+  }
+  // 只有 0 或 1 条带收尾语 → 没有打嗝
+  if (carriers.length < 2) return []
+
+  // —— 保留第一条（真正的回答），删掉其余各条里的收尾语 ——
+  const keep = carriers[0]
+  const plan = []
+  for (const msg of carriers) {
+    if (msg === keep) continue
+    const text = msg.text
+    // 只删末尾那一次；正文中间出现的原样保留（见上面「为什么按末尾」）
+    let newText = text.trimEnd()
+    newText = newText.slice(0, newText.length - heartbeat.length)
+    // 去掉因删除而残留的尾随空白/分隔符，不留空尾行
+    newText = newText.replace(/[\s\u3000]+$/, '')
+    // 删完变空的话不写回（那会让这条消息消失）；此时放弃这次修复
+    if (newText.trim() === '') continue
+    plan.push({ seq: msg.seq, newText })
+  }
+  return plan
+}
+
+/**
  * 消息去重键：`<sessionId>:<turn>:<step>`。
  *
  * ## 为什么单独抽成函数（2026-11-16）
@@ -2104,7 +2303,13 @@ export function createStore(config) {
   }
 
   async function readState() {
-    const fallback = { version: 2, lastConsolidate: null, projects: {}, ambiguous: [] }
+    // 2026-11-18：`ambiguous` 字段已随待判队列一并删除（见 enqueueAmbiguous 删除处）。
+    //
+    // ⚠️ 老用户的 state.json 里**仍然有这个键**。这里**刻意不读它**，
+    // 但也不报错 —— 多出来的键被忽略即可。下一次 writeState 会把它自然抹掉。
+    // 千万不要为了「清理」而写一段迁移去删键：那会在启动路径上做
+    // 读-改-写，一旦中途失败整个插件起不来，而代价只是省下几十字节。
+    const fallback = { version: 2, lastConsolidate: null, projects: {} }
     const text = await readIfExists(paths.state)
     if (text === undefined) return fallback
     try {
@@ -2114,7 +2319,6 @@ export function createStore(config) {
         version: 2,
         lastConsolidate: parsed.lastConsolidate ?? null,
         projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
-        ambiguous: Array.isArray(parsed.ambiguous) ? parsed.ambiguous : [],
         // ⚠️ 2026-11-16：policy.md 一次性同步的版本号（见 syncPolicyOnce）。
         // **必须在这里透传**，否则每次 readState 都把它丢掉 →
         // 每次启动都以为「没同步过」→ **每次启动都覆盖 policy.md**，
@@ -2377,36 +2581,40 @@ export function createStore(config) {
     return out
   }
 
-  async function enqueueAmbiguous({ sessionId, text, candidates }) {
-    const quote = truncateBytes(String(text ?? '').replace(/\s+/g, ' ').trim(), 120).text
-    if (quote === '') return
-    return await serialize(async () => {
-      const state = await readState()
-      const queue = [...state.ambiguous]
-      if (queue.some((item) => item.text === quote)) return
-      queue.push({
-        id: randomUUID().slice(0, 8),
-        sessionId: sessionId ?? null,
-        text: quote,
-        candidates: candidates ?? [],
-        at: new Date().toISOString(),
-      })
-      state.ambiguous = queue.slice(-20)
-      await writeState(state)
-    })
-  }
-
-  async function peekAmbiguous() {
-    return (await readState()).ambiguous
-  }
-
-  async function clearAmbiguous(ids) {
-    return await serialize(async () => {
-      const state = await readState()
-      state.ambiguous = ids === undefined ? [] : state.ambiguous.filter((item) => !ids.includes(item.id))
-      await writeState(state)
-    })
-  }
+  // ---- 已删除：待判情绪队列的三个函数（2026-11-18）----
+  //
+  // 这里原本有 `enqueueAmbiguous` / `peekAmbiguous` / `clearAmbiguous`，
+  // 配合 `state.ambiguous` 数组，做「规则判不准的句子先入队、轮末由模型裁决」。
+  //
+  // ## 它为什么该删
+  //
+  // ① **生产者从来没接上。** `enqueueAmbiguous` 有定义、有导出，
+  //    但全项目 **0 个调用点**。2026-11-14 的需求变更就把它停用了
+  //    （那段原委写在 `session/event` 的情绪录入分支末尾）：
+  //    弱信号改为**直接入库**，不再排队等模型判「算不算情绪」。
+  //
+  // ② **仅剩的一条永远出不了队。** `state.json` 里唯一一条的
+  //    `sessionId` 是 `"session-1"`，而真实会话 id 形如
+  //    `session-1c419e4d-a1d2-4402-b411-6640da935f99`。消费端过滤条件是
+  //
+  //        item.sessionId === null || undefined || === sessionKey
+  //
+  //    `"session-1"` 与任何真实会话都不等 → 永远被过滤 → 永远留在队列里。
+  //    日志吻合：`[ambiguous-consumed]` 最后一次是 2026-11-13，之后 0 次。
+  //
+  // ③ **它还在向用户报假数。** `/memory status` 那句
+  //    「情绪记录：待判 N 条」数的是这个死队列（实测一直是 1 条）。
+  //
+  // ## 删掉的连带影响（已逐一确认）
+  //
+  //   · `readState` / `readStateSync` 的 `ambiguous` 字段 —— 已同步删
+  //     （老用户的 state.json 里还剩这个键，**故意不迁移**，读取时忽略即可）
+  //   · `turn-stopping` 里整段弱信号消费 —— 已同步删
+  //   · `overview()` 的 `ambiguous` 计数与 `/memory status` 那行 —— 已同步删
+  //
+  // 情绪录入本身**没有**被删：弱信号仍然由 `recordEmotion` 直接写库，
+  // 那才是 2026-11-14 之后的现状。守卫脚本：
+  // `_dbpreview/selfcheck-ambiguous-queue-removed.mjs`。
 
 
 
@@ -2435,7 +2643,10 @@ export function createStore(config) {
       lastConsolidate: state.lastConsolidate ?? null,
       policy: { bytes: policy === undefined ? 0 : byteLength(policy) },
       projects,
-      ambiguous: state.ambiguous.length,
+      // 2026-11-18：`ambiguous` 计数已删（待判队列不存在了）。
+      // ⚠️ 不要换成 `ambiguous: 0` —— 那会让 `/memory status` 继续显示
+      //    「待判 0 条」，等于告诉用户「这个功能还在，只是空的」。
+      //    删干净的做法是连字段一起删，让读它的地方一起改。
       statsSource: 'db',
       // 记忆目录名。设置页的说明文字要引用它，不能在前端硬编码 ——
       // 常量改过一次（dsh-memory → FatFishDream-memory），UI 文案漏改导致
@@ -2715,9 +2926,6 @@ export function createStore(config) {
     registerProject,
     policyTextSync,
     stripPolicyPhrases,
-    enqueueAmbiguous,
-    peekAmbiguous,
-    clearAmbiguous,
     overview,
     migrateRoot,
     moveProject,
@@ -2728,7 +2936,8 @@ export function createStore(config) {
 
 /** state.json 的同步读，供注入回调使用。 */
 function readStateSync(store) {
-  const fallback = { version: 2, lastConsolidate: null, projects: {}, ambiguous: [] }
+  // 2026-11-18：`ambiguous` 已随待判队列删除，这里与 `readState` 保持同构。
+  const fallback = { version: 2, lastConsolidate: null, projects: {} }
   const text = readCached(store.paths.state)
   if (text === undefined) return fallback
   try {
@@ -2738,7 +2947,6 @@ function readStateSync(store) {
       version: 2,
       lastConsolidate: parsed.lastConsolidate ?? null,
       projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
-      ambiguous: Array.isArray(parsed.ambiguous) ? parsed.ambiguous : [],
     }
   } catch {
     return fallback
@@ -3678,6 +3886,41 @@ export function apply(ctx, rawConfig = {}) {
   //   assistant/message → event.data.message.content   （多一层 message）
   safeOn('session/event', async (session, event) => {
     try {
+      // ---- C1 能力探针（2026-11-18，只读）----
+      //
+      // C1 要做「收尾语保持在最后一行」，方案是用官方的
+      // `surfaceOp: { op:'replace' }` 改写已落库的消息。
+      // 前提是：**在 session/event 回调里能拿到 session 并调它的 append**。
+      //
+      // 这一点此前从未验证过 —— 本插件对 session 只用过 `.id`，
+      // 全文 `session.append` 调用 **0 处**。
+      //
+      // 这个探针**只读不写**：记下能力形状，绝不调用 append。
+      // 先知道「有没有这条路」，再决定走不走 —— 反过来先写代码再验证，
+      // 就是 AGENTS.md 里记过的「恒真断言」那类盲区。
+      //
+      // ⚠️ 每轮只记一次（按 sessionId 去重），否则 assistant/message
+      //    每个 step 一条，日志会被撑爆。
+      if (event?.type === 'assistant/message' && !c1ProbeDone) {
+        c1ProbeDone = true
+        try {
+          diag('c1-probe', {
+            hasAppend: typeof session?.append === 'function',
+            appendArity: typeof session?.append === 'function' ? session.append.length : null,
+            hasSurface: session?.surface !== undefined && session?.surface !== null,
+            surfaceNodes: Array.isArray(session?.surface?.nodes) ? session.surface.nodes.length : null,
+            replaceGeneration: session?.surface?.replaceGeneration ?? null,
+            sessionIdIsString: typeof session?.id === 'string',
+            eventSeq: event.seq ?? null,
+            // 这些是 replace 需要的东西，顺带确认它们在不在
+            hasSnapshotEvents: typeof session?.snapshotEvents === 'function',
+            hasDeriveMessages: typeof session?.deriveMessages === 'function',
+          })
+        } catch (probeError) {
+          diag('c1-probe-error', { message: String(probeError?.message ?? probeError) })
+        }
+      }
+
       if (event?.type !== 'assistant/message') return
       const payload = event.data
       if (payload === undefined || payload === null) return
@@ -3688,7 +3931,27 @@ export function apply(ctx, rawConfig = {}) {
         .filter((block) => block?.type === 'text')
         .map((block) => block.text ?? '')
         .join('\n')
-      if (text.trim() === '') return
+      // ⚠️ 2026-11-18：**只有标点/空白的消息也算空**，不进 archive。
+      //
+      // 起因（用户实报 + 数据确认）：补记那一步文案已经明确要求「不要输出任何
+      // 文字」，但模型**仍然每轮发一个中文句号「。」**，界面上孤零零挂一个「。」。
+      //
+      // 数据实测（2026-11-17 全库扫，长度 ≤10 的 assistant 消息）：
+      //   极短内容**只有**中文句号「。」共 16 条（turn 21–38）；
+      //   其余最短都是 7 字符以上的真实过程语（「先补完整快照。」「开始。先备份。」
+      //   「让我直接查，不猜。」）。**没有一个 emoji、没有单字回复。**
+      //
+      // 要分清两件事（上一轮我在这里踩过坑）：
+      //   · 文案治不住 → 三个版本都试过（不要再重复收尾语 / 本步只发 id 与 topic /
+      //     不要输出任何文字），每一版都在管「模型自己想发的东西」，都失败了；
+      //   · 真正的放行点是**这一行** —— `'。'.trim()` 仍非空，于是照常归档、照常显示。
+      // 所以这里必须由代码兜底，不能再靠文案。
+      //
+      // 判据用 `\p{P}`（Unicode 标点），而不是写死「。」：
+      // 那样「，」「？」「……」这类就算换了形态也能拦住。
+      // ⚠️ 刻意**不拦 `\p{S}`（符号）** —— emoji 属于 Symbol，
+      //    而用户真的会发纯 emoji 的回复，那是有意义的内容，不能误伤。
+      if (text.trim() === '' || /^[\p{P}\s]+$/u.test(text)) return
 
       // 先按 sessionId:turn:step 去重，再做归档/标记 —— 两者共用同一份去重集合，
       // 否则热重载或事件重放时同一条会被存两遍（原文层尤其不能重复）。
@@ -3714,15 +3977,100 @@ export function apply(ctx, rawConfig = {}) {
       // 这是「完整记忆」的底层：模型回复原文一条不落。
       if (dbStoreExists()) {
         try {
+          // ---- C1-A：补记步骤产生的消息，归档前剥掉收尾语（2026-11-18）----
+          //
+          // ## 判定「这是补记步骤」
+          //
+          // `fatfishSteerGuard` 里存着「本会话上一次提醒发生在第几轮」。
+          // 若它等于本条消息的 turn，且编号**严格晚于**该轮的首个 step，
+          // 就说明这条消息是「补记提醒之后的那一步」产生的。
+          //
+          // ⚠️ 判据用的是 `turn` + step 比较，不是「消息里有没有『已记』」——
+          //    后者是文案匹配，模型换个说法就漏（文案三版失败的同一个坑）。
+          //
+          // ⚠️ 这段**只影响 archive 里存什么**，不影响界面已显示的内容。
+          //    要改显示需要 surface replace，已证实结构上不可能
+          //    （见 `C1-C4-现有功能说明.md` 的 C1-A 节）。
+          //
+          // ⚠️ **为什么这里引用 `fatfishSteerGuard`（声明在 L4921，晚于本监听器
+          //    L3887）不会触发 TDZ**：
+          //    `const` 确实不提升，但**监听器回调是注册、不是执行** ——
+          //    `safeOn('session/event', …)` 只是把函数登记进去，真正调用
+          //    要等有事件发生。届时 `apply()` 早已跑完，L4921 那行已执行过。
+          //    **今天已经因为同类问题栽过一次**（`logRouteHits.set` 写在
+          //    `const sid` 之前，`node --check` 查不出，靠核对行号才发现）。
+          //    区别在于：那次是**同一函数体内、同步执行**的顺序错误；
+          //    这里跨了「注册」与「执行」两个时刻，所以安全。
+          //    判据：**引用点是否在同一个同步执行流里**。
+          const hbForArchive = readHeartbeat()
+          let archiveText = text
+          let toolStepStripped = false
+          if (hbForArchive !== '' && Number.isInteger(payload.turn)) {
+            const guardKey = `${FATFISH_STEER_GUARD_KEY}:${session?.id === undefined ? '' : String(session.id)}`
+            const remindedTurn = fatfishSteerGuard.get(guardKey)
+            // 提醒发生在本轮 → 本轮后续 step 都是「补记步骤」
+            const isToolStep = Number.isInteger(remindedTurn) && remindedTurn === payload.turn
+            const stripped = stripHeartbeatFromToolStep(text, hbForArchive, isToolStep)
+            if (stripped !== text) {
+              archiveText = stripped
+              toolStepStripped = true
+            }
+          }
+
           const archived = dbStore.appendArchive({
             scope: projectKey || null,
             role: 'assistant',
-            text,
+            text: archiveText,
             sessionId: session?.id === undefined ? null : String(session.id),
             turn: payload.turn ?? null,
             step: payload.step ?? null,
           })
-          if (archived.written) diag('archive-assistant', { bytes: Buffer.byteLength(text, 'utf8') })
+          // 剥掉了就记一条，否则「archive 里没打嗝」这件事无法归因
+          if (toolStepStripped) {
+            diag('c1-toolstep-heartbeat-stripped', {
+              turn: payload.turn ?? null,
+              step: payload.step ?? null,
+              before: text.length,
+              after: archiveText.length,
+            })
+          }
+          // ★ 断点④（2026-11-17 20:xx 加）：**每条归档消息当场记录「带不带收尾语」**。
+          //
+          // ## 为什么需要它
+          //
+          // 前三个断点能看出「漏了 → 提醒 → 补写」三段，但**看不出补写那条消息
+          // 里到底有没有加收尾语** —— 而双收尾语正是这个问题的主症。
+          //
+          // 原来的 `archive-assistant` 只记 `bytes`。于是我要判断「补写有没有加」，
+          // 只能事后去查 `archive` 表里的原文。而**事后查表会数错对象**：
+          // 我拿「整个 turn 的收尾语总数」当判据，把同一轮里其它正常回复的
+          // 收尾语也算了进去，得出「补写又加了一条」的**错误结论**（2026-11-17 实测）。
+          //
+          // 正确判据是「**这一条消息**自己带不带」，而这个信息在归档那一刻
+          // 就在手里 —— 不需要任何额外 I/O，只是一次字符串包含判断。
+          //
+          // ## 为什么把 heartbeat 判定写成纯函数
+          //
+          // 收尾语是**用户可编辑**的（存在 policy.md，GUI 能改），所以不能写死
+          // 「大肥鱼」这个字面量。判据用 `readHeartbeat()` 的返回值，
+          // 取不到就记 null —— 那种情况下的 true/false 没有意义。
+          //
+          // ⚠️ `hbCount` 数的是**出现次数**，不是布尔值。
+          // 因为「一条消息里出现 2 次收尾语」也是要抓的形态（用户形容像「打嗝」），
+          // 只记布尔的 true 会把 2 次和 1 次混成一样。
+          const hbText = readHeartbeat()
+          const hbCount = countHeartbeat(text, hbText)
+          if (archived.written) {
+            diag('archive-assistant', {
+              bytes: Buffer.byteLength(text, 'utf8'),
+              turn: payload.turn ?? null,
+              step: payload.step ?? null,
+              // 断点④：这条消息里有几处收尾语（null = 读不到用户配置的收尾语）
+              heartbeat: hbCount,
+              // 收尾语是否在**最后一行** —— `policy.md` 要求「放在最后一行」
+              heartbeatLast: isHeartbeatLast(text, hbText),
+            })
+          }
         } catch (e) {
           diag('archive-write-failed', { role: 'assistant', message: String(e?.message ?? e) })
         }
@@ -4381,22 +4729,45 @@ export function apply(ctx, rawConfig = {}) {
   /** sessionId → 本轮已经写过几次 /log —— 用于识别「同一轮写多条」 */
   const turnLogWrites = new Map()
 
-  /**
-   * sessionId → 本轮是否已经在 `pre-step` 里提醒过「写流水」。
-   *
-   * 只对**当前这一轮**有效 —— 轮次变化时在下面的 pre-step 里重置。
-   *
-   * 存在的理由：`agent/pre-step` 每一步都会触发。没有这个闸门，
-   * 一轮里有 5 个 step 就会提醒 5 次，那是把「提醒」变成「骚扰」。
-   * 宁可一轮只提醒一次、漏了也认，也不要连环催。
-   *
-   * ⚠️ 2026-11-17：**必须按 sessionId 分，不能用一个全局布尔**。
-   * 同一工作区可以有多个会话并发（实测今天 18 个），
-   * 用一个变量会让 A 会话的提醒把 B 会话的闸门也关上 ——
-   * B 就永远收不到提醒，而表面上「功能是好的」。
-   * 这类「变量作用域错了但不报错」的问题今天已经犯过（turn 那个），别再犯。
-   */
-  const preStepReminded = new Map()
+  // ---- 已删除：preStepReminded 闸门与 pre-step 提醒通道（2026-11-18）----
+  //
+  // 这里原本有一个 `preStepReminded` Map，为 `agent/pre-step` 里的
+  // 「当场提醒写流水」（下称 v1）做「每轮只提醒一次」的闸门。
+  //
+  // ## 它为什么从来没有生效过
+  //
+  // 那个 Map 全文件只有两个写入点，而且两个都在同一轮里：
+  //
+  //   ① 轮次号变化时（pre-step 内）
+  //        preStepReminded.set(agentId, { turn })   ← 设成「当前轮」
+  //   ② 提醒分支内部
+  //        preStepReminded.set(agentId, { turn })
+  //
+  // 而判断写的是：
+  //
+  //   const remindedThisTurn = remindedFor !== undefined && remindedFor.turn === turn
+  //   if (!alreadyWrote && !remindedThisTurn) { … v1 … }
+  //
+  // ① 在**每次进入 pre-step 时**先执行，把值设成当前轮 → ② 的判据恒为真
+  // → v1 分支**永远进不去**。这不是「条件恰好没满足」，是结构上不可达。
+  //
+  // 日志侧完全吻合：`[pre-step-hit]` 235 次（11-17 共 131、11-18 共 104），
+  // 同期 `[pre-step-write-nudge]` **0 次**。
+  //
+  // ## 为什么直接删掉而不是修闸门
+  //
+  // 修好它会让 v1 真的开始发消息，而这与轮末那条 v3 的指令**正好相反**：
+  //   v1：「…然后接着做手头的事」（让模型继续发言）
+  //   v3：「…不要输出任何文字，直接结束这一步」
+  // 同一职责给出相反指令，只会让「收尾语被顶到中间」更严重。
+  // 用户 2026-11-18 决定：**删掉 v1，保留 v3 单通道**。
+  //
+  // 删它零行为变化 —— 它本来就一次都没执行过。
+  // 守卫脚本：`_dbpreview/selfcheck-prestep-single-channel.mjs`。
+  //
+  // ⚠️ **轮次记账必须留着**（`currentTurn` / `turnLogWrites` 仍由 pre-step 维护）：
+  //    `/log` 靠 `currentTurn` 判断「同一轮写多条」。删多了这一层，
+  //    重记检测会静默失效 —— 没有症状，所以上面那个脚本专门守着它。
 
   // ---- 调试断点用的模块级变量（2026-11-17）----
   //
@@ -4408,8 +4779,31 @@ export function apply(ctx, rawConfig = {}) {
   //   三个阶段，用 Map 存反而更麻烦。这里单会话场景够用，多会话下会串 ——
   //   但它只影响诊断精度，不影响功能，可接受。
 
-  /** 本轮起始时间（第一次 tools/result 时打点），算轮次耗时用 */
-  let turnStartedAt = null
+  /**
+   * sessionId → 本轮起始时间（第一次 tools/result 时打点），算轮次耗时用。
+   *
+   * ## 2026-11-18：从裸 `let` 改成 Map（C4）
+   *
+   * 原来是 `let turnStartedAt = null`，注释里写着「多会话下会串，
+   * 但它只影响诊断精度，不影响功能，可接受」。**那个判断只对了一半**：
+   *
+   *   · 确实不影响功能（它只喂 `turnMs` 这一个诊断字段）
+   *   · 但「串」的后果比想象中严重 —— 实测推演：
+   *
+   *       会话 A 在 t=1000 调工具 → turnStartedAt = 1000
+   *       会话 B 在 t=5000 调工具 → **不重置**（非 null 就跳过）
+   *       会话 A 在 t=3000 结算 → turnMs = 2000  ✅ 对的
+   *       会话 B 在 t=9000 结算 → turnMs = 8000  ❌ 变成了「从 A 开始」
+   *
+   *     B 的实际耗时是 4000，日志里却写 8000 —— **翻倍**。
+   *     而 `turnMs` 恰恰是用来判断「慢轮次」的字段，翻倍会让结论完全反向。
+   *
+   * 所以按 sessionId 分键。键的写法与其它 5 个状态 Map 一致。
+   *
+   * ⚠️ 清理由 `turn-stopping` 做（那里本来就有结算点），
+   *    **不要靠「下一轮覆盖」** —— 那正是原来那个 bug 的形态。
+   */
+  const turnStartedAt = new Map()
 
   /** 最近一次注入的字节数 —— 用来判断「写流水」那段会不会被预算挤掉 */
   let lastInjectionBytes = null
@@ -4417,8 +4811,40 @@ export function apply(ctx, rawConfig = {}) {
   /** 最近一次注入里**是否包含「写流水」那段** —— 这比总长度更关键 */
   let lastInjectionHasWriteRule = null
 
-  /** 本轮调用 /log 的次数 —— 0 表示「从没尝试过」，>0 表示试了 */
-  let logRouteHits = 0
+  /**
+   * C1 能力探针是否已经记过（2026-11-18）。
+   *
+   * ⚠️ 声明位置在监听器**之后**（L3764 注册、这里声明），这是安全的：
+   * 监听器只是注册，真正执行要等到有事件；而 apply() 会先跑完，
+   * 届时这个 `let` 早已初始化。**但不要把它挪到 apply 外面** ——
+   * 那样重载插件时不会清零，探针就只记第一次，后续重载看不到新值。
+   *
+   * 2026-11-18（C4 体检）：它也是跨会话共享的，但**只影响诊断条数**
+   * （多会话下少记几条探针），不影响任何功能。归入「已论证不改」一类，
+   * 判据脚本里有白名单。
+   */
+  let c1ProbeDone = false
+
+  /**
+   * sessionId → 本轮调用 /log 的次数。0 表示「从没尝试过」，>0 表示试了。
+   *
+   * ## 2026-11-18：从裸 `let logRouteHits = 0` 改成 Map（C4）
+   *
+   * 原来同样是跨会话共享的。后果：
+   *   会话 A 调了 2 次 /log → logRouteHits = 2
+   *   会话 B 结算时读到 2 → 日志里 B 的 `logRouteHits: 2`
+   *   **而 B 一次都没调过。**
+   *
+   * 这个字段的用途恰恰是「区分『模型没写』与『写了但被拒』」：
+   *   · logRouteHits = 0 → 从没尝试过（是真的没写）
+   *   · logRouteHits > 0 但 wroteThisTurn = false → 写了但没落库
+   * 串了之后这个区分就失效了 —— 而那正是漏记分析的**核心判据**。
+   *
+   * ⚠️ 写入点在 `/log` 路由里（那里用 `sid` 作键），
+   *    读取与清理在 `turn-stopping`（用 `sessionKey`）。
+   *    两处必须是**同一个 id 字符串**，否则等于没分键。
+   */
+  const logRouteHits = new Map()
 
   /**
    * sessionId → 连续「写入失败」的轮数。
@@ -4547,7 +4973,9 @@ export function apply(ctx, rawConfig = {}) {
       record.writes += 1
 
       // ★ 断点②：本轮第一次工具调用时打点（2026-11-17）
-      if (turnStartedAt === null) turnStartedAt = Date.now()
+      // 2026-11-18（C4）：按 sessionKey 分键 —— 原来是裸 let，
+      // 多会话下会算成「从别的会话开始的那一刻」，turnMs 翻倍。
+      if (!turnStartedAt.has(sessionKey)) turnStartedAt.set(sessionKey, Date.now())
 
       // 记录「本轮是否已经写过记忆目录」。
       //
@@ -4614,71 +5042,26 @@ export function apply(ctx, rawConfig = {}) {
       if (canProceed) {
         const prev = currentTurn.get(agentId)
         currentTurn.set(agentId, turn)
-        // 新一轮 → 清零本轮写次数与「已提醒」标记。
+        // 新一轮 → 清零本轮流水写入次数。
         // 只在**轮次号变化**时清，同一轮的多步不会把计数抹掉。
         if (prev !== turn) {
           turnLogWrites.set(agentId, { turn, writes: 0 })
-          preStepReminded.set(agentId, { turn }) // 新一轮 → 打开闸门（记下是哪一轮）
         }
 
-        // ★ 2026-11-17：**当场**提醒写流水（不是等到轮次结束）。
+        // ---- 2026-11-18：v1「当场提醒写流水」已整段删除 ----
         //
-        // ## 为什么要放在这里
+        // 这里原本还有一层 `if (!alreadyWrote && !remindedThisTurn)`，
+        // 往对话里 steer 一句「顺手记一条流水…然后接着做手头的事」。
         //
-        // 原来唯一的提醒在 `turn-stopping` 里 —— 那是「轮次即将关闭」的时刻，
-        // 模型已经答完了。在那里 steer 会让 DSH 重新跑一个 step，
-        // 代价是**每次漏记都多一轮模型调用**（实测漏记率约 50%，等于成本翻倍）。
+        // 它**一次都没有执行过**：闸门在每轮开始就被设成当前轮，
+        // 判据 `remindedFor.turn === turn` 恒为真。详细推导与日志证据
+        // 见上面 `preStepReminded` 删除处的大段注释。
         //
-        // 而 `agent/pre-step` 是**每一步开始之前**。在这里 steer 一条，
-        // 它会进 `inbox.nextStep`，在**下一个 step 的边界**被领取 —— 
-        // 模型本来就要继续干活，只是顺手多做一件小事，**不新开轮次**。
+        // 现在留在这里的只有**轮次记账**（`currentTurn` / `turnLogWrites`）——
+        // 这两个是 `/log` 判断「同一轮写多条」的依据，**不能一起删**。
         //
-        // ## 触发条件（三条同时满足才提醒）
-        //
-        //   ① 本轮**已经调过工具** —— 纯对话轮次不打扰。
-        //      依据：`turnActivity.writes` 由 `tools/result` 累加。
-        //      没有工具调用 = 这轮就是聊两句，不值得为它追加一步。
-        //   ② 本轮**还没写流水** —— 写了就别再提。
-        //   ③ 本轮**还没提醒过** —— 否则每走一步都催一次。
-        //
-        // ③ 是硬要求：`pre-step` 每步都会触发，没有这个闸门就会
-        // 「提醒 → 模型还没写完 → 下一步又提醒」的连环打扰。
-        // ---- 触发条件（两条，2026-11-17 晚修正）----
-        //
-        //   ① 本轮**还没写流水**
-        //   ② 本轮**还没提醒过**
-        //
-        // ⚠️ 2026-11-17 15:25 **删掉了第三条「本轮必须调过工具」**。
-        //
-        // 原来的判断是 `hasToolWork = (writes > 0)`，理由写的是
-        // 「纯对话轮次不打扰」。**那个理由是错的，而且和实测数据正好反着：**
-        //
-        //   实测（07:22 / 07:23 两轮）：漏记的两轮 `writes` **都是 0**，
-        //   即纯对话轮次 —— 而它们恰恰是漏得最多的那一类。
-        //
-        // 更根本的是，这条数据早就写在 `docs/漏记共识-跨工作区.md` §1.1 里：
-        //
-        //   > 漏记集中在「纯对话轮次」… 有交付物的轮次几乎不漏
-        //
-        // 我读过那段，却在设计条件时按相反的方向写了 ——
-        // 把「漏得最多的那一类」排除在提醒之外，等于这个功能对主症无效。
-        //
-        // 教训：**加过滤条件前，先回头看「被过滤掉的那一类是不是主要问题」。**
-        const rec = turnActivity.get(agentId)
-        const alreadyWrote = rec !== undefined && rec.wroteLog === true
-        // 闸门按会话分：`remindedFor.turn === turn` 表示**这一轮**已经提醒过
-        const remindedFor = preStepReminded.get(agentId)
-        const remindedThisTurn = remindedFor !== undefined && remindedFor.turn === turn
-        if (!alreadyWrote && !remindedThisTurn) {
-          preStepReminded.set(agentId, { turn })
-          const delivered = safePushMessage(
-            agent,
-            '（顺手记一条流水：把这一轮聊了什么 POST 到 /api/dsh-memory/log，' +
-              '然后接着做手头的事。这条只有你看得见。）',
-            'steer',
-          )
-          diag('pre-step-write-nudge', { turn, writes: rec?.writes ?? 0, delivered })
-        }
+        // 提醒模型的职责现在只由 `agent/turn-stopping` 里那一条承担
+        // （`write-fail-reminder`，静默补记文案）。
       }
     } catch (error) {
       logger.warn?.(`[dsh-memory] pre-step 记录轮次失败：${error?.message ?? error}`)
@@ -4703,19 +5086,148 @@ export function apply(ctx, rawConfig = {}) {
         if (prev !== turn) turnLogWrites.set(sessionKey, { turn, writes: 0 })
       }
 
-      // ---- 取本轮的两类信号 ----
+      // ---- C1-A：收尾语「打嗝」修复（2026-11-18）----
       //
-      // 1) 弱信号队列：字面和情绪可能不一致的句子（「算了」「呵呵」「你可真会安排」）。
-      //    这类句子规则引擎只能判到「模糊」，需要模型在对话中结合上下文判断。
-      //    之前这个队列只进不出 —— 句子进得去，没有任何人消费，
-      //    队列撑满 20 条上限后就再也不更新了。这里把它接上。
-      // 2) 写操作统计：本轮是否改过文件，决定要不要问「记不记」。
-      const pending = await store.peekAmbiguous()
-      // 只看本会话的（其它会话的留给它们自己处理）；sessionId 为 null 的是历史遗留，一并带上
-      const shown = pending.filter(
-        (item) => item.sessionId === null || item.sessionId === undefined || item.sessionId === sessionKey,
-      )
+      // ## 修的是什么
+      //
+      // 实测 97 个 turn（9.2%）里 ≥2 条 assistant 消息各自带了一次收尾语。
+      // 其中 95 个形态一致：第 1 条（真正的回答）以收尾语结尾 —— 位置正确；
+      // 最后 1 条（补记/补充）又加了一次。
+      //
+      // ## 怎么修
+      //
+      // 用官方的 `surfaceOp: { op:'replace' }` 改写。append-only 日志**不动**
+      // （审计完整），但模型后续看到的上下文与界面显示都是改后的版本。
+      //
+      // 这是**第 4 个方案**。前三个都是改文案去劝模型，全部失败：
+      //   ①「不要再重复一遍收尾语」      → 照样发
+      //   ②「本步只发 id/topic」         → 收尾语连续消失（副作用更大）
+      //   ③「不要输出任何文字」          → 改成发一个「。」
+      // 三次的共性是**都在管「模型想发什么」**；而放行点在代码里，
+      // 该管的是「最终落库什么」。
+      //
+      // ## 前提已验证，不是猜的
+      //
+      // 2026-11-18 探针（`[c1-probe]`）实测，在 `session/event` 回调里：
+      //   hasAppend:true / hasSurface:true / surfaceNodes:540 /
+      //   hasSnapshotEvents:true / hasDeriveMessages:true
+      //
+      // ## 为什么放在 turn-stopping 而不是 session/event
+      //
+      // `session/event` 里 append 会**再次触发自己**（递归风险）；
+      // 而 `turn-stopping` 是轮次即将关闭的时刻，此时本轮 assistant 消息
+      // 已经全部落库、不会再增，是「一次性收口」的正确时机。
+      //
+      // ## 失败必须完全静默
+      //
+      // 这是 serial 事件，抛异常会中断本轮会话。所以整段包在 try 里，
+      // 任何一步不满足就安静跳过 —— **宁可留着打嗝，也不能弄坏会话**。
+      try {
+        const session = agent?.session
+        const hbText = readHeartbeat()
+        if (hbText !== '' && typeof session?.snapshotEvents === 'function') {
+          // 取本轮的 assistant 消息（带 seq）
+          const events = session.snapshotEvents()
+          const mine = []
+          for (const ev of events ?? []) {
+            if (ev?.type !== 'assistant/message') continue
+            const d = ev.data
+            if (!Number.isInteger(d?.turn) || d.turn !== turn) continue
+            const text = (d?.message?.content ?? [])
+              .filter((b) => b?.type === 'text')
+              .map((b) => b.text ?? '')
+              .join('\n')
+            if (text === '') continue
+            mine.push({ seq: ev.seq, text, step: d.step ?? null, message: d.message, stream: d.stream })
+          }
 
+          const plan = planHiccupFix(mine, hbText)
+          if (plan.length > 0) {
+            // ---- 只读诊断探针（2026-11-18）----
+            //
+            // 上一版在这里直接被拒：
+            //   surface replace: sourceEventSeqs must include every shadowed
+            //   surface node; missing 2071
+            //
+            // 而官方契约自相矛盾：
+            //   · SurfaceIntent L361：assistant/message 的 `sourceEventSeqs?: never`
+            //   · SurfaceIntent L370：「assistant/message 不能携带 sourceEventSeqs」
+            //   · SurfaceOp      L339：replace 的节点 must include every shadowed
+            //                          surface node
+            // 两条规则互相排斥 → 按字面 assistant/message 的 replace 不可能成功。
+            //
+            // 但错误可能是**区间算错**而不是「契约禁止」：
+            // 官方 L348 说端点「按 surface 顺序而非数值序号顺序」定位。
+            // 我用 startSeq=endSeq=src.seq 做单点替换，如果中间夹着别的
+            // surface 节点，区间就会覆盖到不止一个 —— 那 missing 的就是区间里的其它节点。
+            //
+            // 所以**先只读，把现场打出来**，再决定改不改。
+            // 这一段绝不调用 append。
+            try {
+              const surfaceNodes = Array.isArray(session?.surface?.nodes) ? session.surface.nodes : []
+              const nodeSet = new Set(surfaceNodes)
+              const targets = plan.map((p) => p.seq)
+              const detail = mine.map((m) => ({
+                seq: m.seq,
+                step: m.step,
+                len: m.text.length,
+                inSurface: nodeSet.has(m.seq),
+                isTarget: targets.includes(m.seq),
+              }))
+              // 目标节点在 surface 里的下标，以及它与「前一个目标」之间的距离 ——
+              // 若相邻目标之间有其它 surface 节点，单点替换必然漏掉它们
+              const idxOf = (seq) => surfaceNodes.indexOf(seq)
+              const targetIdx = targets.map((s) => idxOf(s))
+              const between = []
+              for (let i = 0; i < targetIdx.length; i++) {
+                const a = targetIdx[i]
+                if (a === -1) { between.push(null); continue }
+                // 本 turn 第一条消息之前、到目标之间的 surface 节点数
+                between.push({ target: targets[i], surfaceIdx: a })
+              }
+              diag('c1-diag', {
+                turn,
+                planned: plan.length,
+                mode: 'readonly-probe',
+                // ① surface 的形状
+                surfaceNodeCount: surfaceNodes.length,
+                replaceGeneration: session?.surface?.replaceGeneration ?? null,
+                // ② 本 turn 每条 assistant 消息的 seq / 是否在 surface / 是否目标
+                detail,
+                // ③ 目标在 surface 里的下标
+                targetIdx: between,
+                // ④ surface 尾部（含目标附近）
+                surfaceTail: surfaceNodes.slice(-10),
+                // ⑤ 本 turn 所有事件（不只 assistant），看区间里还夹了什么
+                turnEventTypes: (events ?? [])
+                  .filter((e) => e?.data?.turn === turn)
+                  .map((e) => `${e.type}@${e.seq}${nodeSet.has(e.seq) ? '*' : ''}`),
+              })
+            } catch (diagError) {
+              diag('c1-diag-error', { message: String(diagError?.message ?? diagError) })
+            }
+
+            // ⚠️ 2026-11-18：**暂不执行修复**，等诊断结论。
+            //    恢复做法：取消下面这段的注释，并删掉上面那段只读探针。
+            //
+            // let fixed = 0
+            // for (const item of plan) { … session.append(…replace…) … }
+            // diag('c1-hiccup-fixed', { turn, planned: plan.length, fixed })
+            diag('c1-hiccup-deferred', { turn, planned: plan.length, note: '只诊断，不写；等契约结论' })
+          }
+        }
+      } catch (c1Error) {
+        diag('c1-hiccup-error', { turn, message: String(c1Error?.message ?? c1Error) })
+      }
+
+      // ---- 写操作统计 ----
+      //
+      // 2026-11-18：这里原本还要取「弱信号待判队列」（`store.peekAmbiguous()`），
+      // 供本函数末尾那段交给模型裁决情绪。那个队列已整个删除
+      // （生产者 11-14 就停用了，仅剩一条永远出不了队），原委见
+      // `enqueueAmbiguous` 删除处的大段注释。
+      //
+      // 现在弱信号由 `session/event` 的情绪录入分支**直接入库**，不经过这里。
       const record = turnActivity.get(sessionKey)
       // 一轮只提醒一次：先出队再提醒，避免同轮多步重复注入。
       if (record !== undefined) turnActivity.delete(sessionKey)
@@ -4727,8 +5239,14 @@ export function apply(ctx, rawConfig = {}) {
       //   如果先重置再读，会全部变成 0 / null —— 那种「字段在但永远为空」
       //   正是 AGENTS.md 里记过的「reportBudget 静默失效」同一个病。
       //   所以顺序是：先算好 local 变量 → 重置 → 写 diag。
-      const bpTurnMs = turnStartedAt === null ? null : Date.now() - turnStartedAt
-      const bpLogRouteHits = logRouteHits
+      //
+      // 2026-11-18（C4）：这两项已按 sessionKey 分键。
+      //   `turnStartedAt.get()` 取不到 → undefined（不是 null），
+      //   所以判据从 `=== null` 改成 `=== undefined`，别写成 `!x`
+      //   （`!0` 也是 true，会把手动置 0 的边界情况误判成「没打点」）。
+      const startAt = turnStartedAt.get(sessionKey)
+      const bpTurnMs = startAt === undefined ? null : Date.now() - startAt
+      const bpLogRouteHits = logRouteHits.get(sessionKey) ?? 0
       // 2026-11-17：本轮写了**几条**流水（只在同一轮内累加）。
       // 与 `logRouteHits` 的区别：那个是「调了几次接口」，这个是
       // 「被服务端认账的写入次数」。两者不等时说明有写入被拒。
@@ -4737,8 +5255,10 @@ export function apply(ctx, rawConfig = {}) {
       const bpCounter = turnLogWrites.get(sessionKey)
       const bpTurn = Number.isInteger(currentTurn.get(sessionKey)) ? currentTurn.get(sessionKey) : null
       const bpTurnWrites = bpCounter !== undefined && bpCounter.turn === bpTurn ? bpCounter.writes : 0
-      turnStartedAt = null
-      logRouteHits = 0
+      // ⚠️ 用 delete 而不是 set(0)：删掉才是真正的「这一轮结束」，
+      //    留下一个 0 会让 has() 判据下次误以为已经打过点。
+      turnStartedAt.delete(sessionKey)
+      logRouteHits.delete(sessionKey)
 
       // ---- 写操作提醒已取消（2026-11-13）----
       //
@@ -4856,10 +5376,6 @@ export function apply(ctx, rawConfig = {}) {
         if (Number.isInteger(bpTurn)) fatfishSteerGuard.set(guardKey, bpTurn)
         const delivered = safePushMessage(
           agent,
-          `[dsh-memory] 这一轮还没把记忆写进流水。\n` +
-            `这会让你下次开会话时不知道这段时间发生过什么。\n` +
-            `请用 pwsh POST 到 $env:DSH_WEB_URL/api/dsh-memory/log 补一条（text/topic/summary/keywords）。\n` +
-            `topic 必须是 13 类之一。**不要**改回在正文里写标记 —— 那正是占屏与闪烁的来源。\n` +
             // ⚠️ 2026-11-17 17:56 新增：**补写是「续上一步」，不是新的一次回复。**
             //
             // 起因（用户实报 + 数据确认）：同一轮里会出现**两条收尾语**。
@@ -4874,9 +5390,76 @@ export function apply(ctx, rawConfig = {}) {
             // `policy.md` 那条规则说「每轮回复的结尾加一句」，
             // 而补写这一步在我读来像「又一次回复」，于是又加了一句。
             //
-            // 所以修法就一句话：**说清这一步不是新回复**。
-            // 放在提醒末尾（最后看到的位置），比放在开头更不容易被漏掉。
-            `补完就结束，不要再重复一遍收尾语 —— 这一步是续上刚才那条，不是新回复。`,
+            // ---- 2026-11-17 20:xx 第二版：第一版说了「不要再重复」但没说「哪条规则让位」----
+            //
+            // 第一版文案是「补完就结束，不要再重复一遍收尾语 —— 这一步是续上刚才那条，
+            // 不是新回复」。**实测仍然复发**（用户截图确认 turn 9 依旧两条）。
+            //
+            // 为什么没用：它只说「不要重复」，可 `policy.md` 那条是**无条件现在时**
+            // （「每轮回复的结尾，加固定一句」）。两条规则同时命中时，
+            // 模型会认为「我刚发了一条消息 = 我又回复了一轮」→ 收尾语那条胜出。
+            // **「不要再重复」是劝阻，「不适用于这一步」才是豁免。**
+            //
+            // 所以第二版必须做三件事，缺一不可：
+            //   ① 明说这一步**不是**一轮新回复（定性，不是劝阻）
+            //   ② **点名** `policy.md` 的收尾语规则在本步**不适用**（豁免，不是建议）
+            //   ③ 说清本步**只发什么**（给了正向动作，模型才不会自由发挥补一段正文）
+            // 第 ③ 条是同时治「内部备忘被当正文发出去」那件事
+            // （2026-11-17 我发过一句「按提醒要求，这一步只发补记结果」——
+            //  那句是我自己编的、policy.md 与代码里都没有，读起来却像系统原文）。
+            //
+            // ---- 2026-11-17 20:23 第三版（用户定）：**整个补记过程静默，一个字都不要发** ----
+            //
+            // 用户原话：「已补记这句话本身应该是不出现的，默认不出现，
+            // 因为它提供的是每轮对话结束后，模型自动去补流水。」
+            //
+            // 这是历次方案里最彻底的一个，也解释了此前所有补丁为什么都治不干净：
+            //
+            //   第一版（只劝阻）：文案说「不要再重复收尾语」→ 复发，因为它没说哪条规则让位。
+            //   第二版（显式豁免）：点名 policy.md 不适用 + 本步只发 id/topic → 收尾语确实不重复了，
+            //     但**副作用严重**：那句「本步只发两样」效力过强，把豁免带到了**后续轮次**，
+            //     从 turn 19 起收尾语**连续消失**（断点④：heartbeat=0 连续 4 条，含 3064B 长正文）。
+            //     而且「已补记 id=xxx」这条消息本身一直存在，位置飘忽（有时夹在两段正文中间）。
+            //
+            //   根因是**需求本身错了**：我们一直在纠结「这条消息里该说什么」，
+            //   而用户要的是「**这条消息根本不该存在**」。
+            //
+            // ## 可行性已经验证，不是猜的
+            //
+            // `archive` 里存在大量 **step 号缺口**（turn 9 只有 step 1,3；turn 12/13 缺 step 4；
+            // turn 14 缺 step 3）。那些 step 执行了工具调用但**没产出任何文本**，
+            // 因此不进 archive。**说明 DSH 本来就允许「只调工具、不发消息」。**
+            // 而补记那一步现在恰恰是 step 2 或 4 —— 它本来就能不出文本。
+            //
+            // ## 为什么这样也顺带治好了「收尾语消失」
+            //
+            // 不再有「补记消息」这个东西 → 没有第二条收尾语、没有夹心、没有位置飘忽。
+            // 正文那条的收尾语仍然是它自己的末行，`policy.md` 那条规则**从头到尾没被豁免**，
+            // 所以不会再出现「豁免延续到下一轮」的副作用。
+            //
+            // ---- 2026-11-17 20:45 删掉「若强制就发句号」（用户定）----
+            //
+            //
+            // 三条独立证据都指向「不需要它」：
+            //   ① `AssistantMessage` 契约里**没有任何「必须含文本块」的约束**
+            //      （`cordis_inspect_query` host/Event → `session/event` 查到的定义）
+            //   ② `archive` 里存在大量无文本 step（turn 21 有 16 个）——
+            //      那些 step 调了工具、没发消息，说明 DSH 本来就允许
+            //   ③ 用户 2026-11-17 的判断（比我的查证更贴近实际）：
+            //      **「DSH 客户端不会轻易改变自己的规则，那样会造成
+            //      几乎一半以上的插件出现恶性 bug。」**
+            //
+            // 第 ③ 条才是根本理由：契约会变、文档会过时，但**生态约束**不会 ——
+            // 一个有大量插件的平台，改这种基础规则等于自毁。
+            // 所以「万一哪天强制了」这个担心，**在架构层面就是低概率的**，
+            // 为一个低概率假设在界面上留一个孤零零的句号，代价明显更大。
+            //
+            // 留档：删前实测出现过两次纯句号消息（id=6912 turn21 step26、
+            // id=6924 turn24 step4），都是这段文案造成的。
+            `本轮流水还没写。现在**静默补记**：用 pwsh POST 一份到 /api/dsh-memory/log，\n` +
+            `然后**不要输出任何文字**，直接结束这一步。\n` +
+            `不要写「已补记」「id=xxx」之类的确认，也不要写正文、不要加收尾语 —— 用户不需要看到记账过程。\n` +
+            `本步**不需要任何文字输出**，DSH 允许只调工具不发言（archive 里有大量无文本 step）。`,
           'steer',
         )
         // 投递成功与否都要记 —— 失败时更需要这条证据。
@@ -4886,46 +5469,24 @@ export function apply(ctx, rawConfig = {}) {
         }
       }
 
-      // 弱信号队列没有内容 → 什么都不做
-      if (shown.length === 0) {
-        // 队列里若有其它会话的条目，这里不消费，保持原样
-        return
-      }
-
-      // ---- 只处理弱信号（情绪判断）----
-      const blocks = []
-
-      if (shown.length > 0) {
-        const listed = shown
-          .slice(0, 3)
-          .map((item, index) => `${index + 1}. 「${item.text}」`)
-          .join('\n')
-        blocks.push(
-          `[dsh-memory] 以下句子字面和情绪可能不一致，规则判不准，请你结合上下文判断：\n` +
-            `${listed}\n` +
-            // ⚠️ 这里不能用完整的标记写法（含尖括号全称）：
-            //    这段话本身会被推回会话，写全形一旦被当成正文复用就会自匹配。
-            //    所以要举例就拆开写 —— 前段和后段各用反引号包住、中间隔中文。
-            `如果确实有情绪（尤其是友善、爱意、夸赞、吐槽），用回复正文里的 mem-log 标记` +
-            `（行首 \`<!--mem-log topic=情绪判据\` … 单独一行 \`-->\`）记一条，` +
-            `写下「用户说了什么 + 你判断是什么情绪 + 依据」。\n` +
-            `如果只是中性表达或技术讨论，**就不要记** —— 证据不足时宁可不记，也不要硬凑。`,
-        )
-      }
-
-      if (blocks.length === 0) return
-
-      const delivered = safePushMessage(agent, blocks.join('\n\n'), 'steer')
-
-      // ---- 投递成功后才出队 ----
+      // ---- 已删除：弱信号待判消费（2026-11-18）----
       //
-      // 顺序很重要：先出队再投递的话，构造函数抛异常就意味着这几条弱信号
-      // 既没有被模型看到、也从队列里消失了 —— 静默丢失。
-      // 这里只有确认投递成功才清，失败就留在队列里下一轮再问。
-      if (delivered && shown.length > 0) {
-        await store.clearAmbiguous(shown.map((item) => item.id))
-        diag('ambiguous-consumed', { count: shown.length })
-      }
+      // 这里原本是一段「把队列里的句子列给模型，让它判断算不算情绪」的
+      // steer。删它的理由不是那段写错了 —— 恰恰相反，它的投递顺序
+      // （**投递成功才出队**）是本项目里少见的正确写法：
+      //
+      //     if (delivered && shown.length > 0) {
+      //       await store.clearAmbiguous(shown.map((item) => item.id))
+      //     }
+      //
+      // 它被删是因为**没有东西可消费了**：生产者 `enqueueAmbiguous`
+      // 自 2026-11-14 起就没有调用点，队列里唯一一条的 `sessionId`
+      // 是 `"session-1"`（不是真实会话 id），永远匹配不上、永远出不了队。
+      //
+      // ⚠️ 保留这段注释是为了**不要让下一个人误以为这里从未正确过**。
+      //    真正的教训在别处：一个「生产端死掉」的队列不会报错，
+      //    它会安静地留在 state.json 里，并继续在 `/memory status`
+      //    显示一个看起来像功能正常的数字。
     } catch (error) {
       logger.warn?.(`[dsh-memory] 轮次提醒失败：${error?.message ?? error}`)
     }
@@ -5058,7 +5619,10 @@ export function apply(ctx, rawConfig = {}) {
                   kind: 'success',
                   text: [
                     `根目录：${info.root}`,
-                    `情绪记录：待判 ${info.ambiguous} 条`,
+                    // 2026-11-18：删掉「情绪记录：待判 N 条」这一行。
+                    // 它数的是已死的待判队列 —— 实测长期显示「待判 1 条」，
+                    // 而那一条是 2026-11-12 的孤儿，永远没有消费者。
+                    // 显示一个不动的数字比不显示更糟：它让用户以为功能还在。
                     healthLine(info),
                     `项目（${info.totals.projects}）：`,
                     ...info.projects.map((item) => `  ${item.key}\n    ${item.dir}`),
@@ -5699,7 +6263,18 @@ export function apply(ctx, rawConfig = {}) {
             //   wroteLog 是「被服务端认账了」（要求 sessionId 正确）
             //   logRouteHits 是「模型真的来调了」（不管服务端认不认）
             // 两者不一致时，说明是**计数器问题**而不是模型没写 —— 这个区分以前做不到。
-            logRouteHits += 1
+            //
+            // 2026-11-18（C4）：改成按 sessionId 分键。
+            //   原来是一个裸的 `logRouteHits += 1`，于是：
+            //     会话 A 调 2 次 → 计数器 = 2
+            //     会话 B 结算 → 日志里 B 的 logRouteHits 也是 2，而 B 一次没调过
+            //   这个字段恰恰用来区分「没写」与「写了被拒」，串了就没意义了。
+            //
+            // ⚠️ 计数**必须放在 `sid` 定义之后**（见下面那行）。
+            //    我第一版写在了前面，`node --check` 照样通过 ——
+            //    因为这是 `const` 的暂时性死区（TDZ），**只有运行时才抛**。
+            //    这正是「语法检查查不出」的那类问题，写的时候得盯着**数据依赖顺序**，
+            //    不是盯着缩进。
 
             const r = dbStore.appendLog(scope, text, { topic: topicFinal, summary, keywords })
             diag('mem-写流水', {
@@ -5717,11 +6292,18 @@ export function apply(ctx, rawConfig = {}) {
             // 这一轮没写 → 连续 4 轮后误报「你忘了写流水」。
             // 那会把「换成新通道」变成「被自己的兜底机制反复指责」，
             // 比不改还糟。sessionId 由查询参数带，拿不到就不记（宁可漏计数）。
+            //
+            // ⚠️ 这里同时是 `logRouteHits` 的唯一写入点。
+            //    键必须与 `turn-stopping` 里的 `sessionKey` 是同一个字符串：
+            //    那边是 `String(agent.session.id)`，这边是请求体里的 sessionId。
+            //    模型 POST 时若传错（或没传），这里记不上 —— 那是**预期的**
+            //    「宁可漏计数」，由 `sid !== ''` 守卫住。
             const sid = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
             if (sid !== '') {
               const rec = turnActivity.get(sid) ?? { writes: 0, wroteMemory: false, wroteLog: false }
               rec.wroteLog = true
               turnActivity.set(sid, rec)
+              logRouteHits.set(sid, (logRouteHits.get(sid) ?? 0) + 1)
             }
 
             // ★ 2026-11-17：按轮计数，识别「同一轮写了多条」。

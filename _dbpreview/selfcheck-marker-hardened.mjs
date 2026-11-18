@@ -190,7 +190,19 @@ const hasLimitConst = INDEX_SRC.includes('WRITE_FAIL_STREAK_LIMIT = 1')
 // ③ 提醒必须走 safePushMessage + 有阈值判断 + 成功后清零
 // ⚠️ 2026-11-17 16:26：文案从「已连续 N 轮」改成「这一轮」，因为阈值已是 1，
 //    「连续」这个词没有意义了。锚点同步改。
-const reminderUsesSafePush = /safePushMessage\(\s*agent,\s*`\[dsh-memory\] 这一轮还没把记忆写进流水/.test(INDEX_SRC)
+// ⚠️ 2026-11-18 换锚点：v1 的 `[dsh-memory] 这一轮还没把记忆写进流水` 四行已删
+//（同一条提醒里它和 v3「静默补记」互相矛盾，见 verify-injection-consistency 反向断言）。
+//
+// ⚠️ 这里**不能**用 `safePushMessage(\s*agent,\s*<文案>` 这种跨参正则：
+//    那条提醒里 `agent,` 与文案之间夹着 80 行注释（补记三版迭代的留档），
+//    `\s*` 过不去 → 正则恒不匹配 → 断言永远红。
+//    正确做法是**分段判断**：从文案往前找最近的 `safePushMessage(`，
+//    再从文案往后找 `'steer',`，两头都在同一次调用里才算「走了 safePushMessage」。
+//
+// ⚠️ 这段依赖下面的 `remindIdx`，所以实际计算挪到了它定义之后（见 G 段）。
+//    2026-11-18 第一次改时放错位置，`node --check` 通过但运行时报
+//    `Cannot access 'remindIdx' before initialization` ——
+//    check 查不出 TDZ，只能跑一遍才发现。
 const reminderChecksLimit = /failStreak >= WRITE_FAIL_STREAK_LIMIT/.test(INDEX_SRC)
 const reminderResetsOnDelivered = /if \(delivered\) \{[\s\S]*?writeFailStreak\.set\(sessionKey, 0\)/.test(INDEX_SRC)
 
@@ -217,16 +229,23 @@ const guardDefinedByTurn = /const alreadyNudgedThisTurn =[\s\S]{0,160}=== bpTurn
 const guardUsedInCondition = /if \(failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn\)/.test(INDEX_SRC)
 const guardBlocksRepeat = guardDefinedByTurn && guardUsedInCondition
 
+// ⚠️ `reminderUsesSafePush` 在下面 G 段才定义（它依赖 remindIdx），
+//    这里**不能**引用它 —— 连 `typeof x` 都会因 TDZ 抛
+//    `Cannot access 'x' before initialization`（2026-11-18 实际踩到，
+//    `node --check` 查不出）。这条断言挪到 G 段末尾统一跑。
+const DEFERRED = Symbol('deferred')
 for (const [label, ok, detail] of [
   ['有 writeFailStreak 计数器', hasStreakMap, '缺它 → 无法跨轮累计'],
   ['阈值常量 = 1（2026-11-17 由 2 改）', hasLimitConst, '改阈值必须显式，不能埋魔法数字'],
-  ['提醒走 safePushMessage', reminderUsesSafePush, '不走它 → turn-stopping 异常会中断会话'],
+  ['提醒走 safePushMessage', DEFERRED, '不走它 → turn-stopping 异常会中断会话'],
   ['提醒有阈值判断', reminderChecksLimit, '缺它 → 退回每轮提醒（217 次太吵）'],
   ['投递成功后清零', reminderResetsOnDelivered, '不清零 → 下轮仍触发，重复提醒'],
   ['有防无限循环闸门', hasSteerGuard, '缺它 → steer 会让本轮永不关闭'],
   ['闸门键带包名前缀', guardKeyNamespaced, '用大众名字会和别的插件撞（用户 2026-11-17 提醒）'],
   ['闸门按 turn 判重', guardBlocksRepeat, '缺它 → 同一轮反复 steer，就是那个无限循环'],
 ]) {
+  // DEFERRED 占位不在这里判定，见 G 段末尾
+  if (ok === DEFERRED) continue
   if (ok) { pass++; console.log(`  OK   ${label}`) }
   else { fail++; console.log(`  FAIL ${label} — ${detail}`) }
 }
@@ -289,10 +308,36 @@ const incrementsWhenNotWritten = /const wroteThisTurn[\s\S]{0,400}?writeFailStre
 // ⚠️ 2026-11-17 16:26：锚点从「已连续」改成「这一轮还没把记忆写进流水」。
 //   阈值从 2 降到 1 后，「连续 N 轮」这个概念不再成立，文案已同步改写。
 //   改锚点时**必须同步改 index.js 里的文案**，否则这条会变成「永远定位不到」的假红。
-const REMIND_ANCHOR = '这一轮还没把记忆写进流水'
+//
+// ⚠️ 2026-11-18：v1 那四行（含「这一轮还没把记忆写进流水」）已整体删除。
+//   原因：它和同一处 v3 的「静默补记 / 不要输出任何文字」互相矛盾，
+//   模型只能折中成「补完再说一句确认」，每轮多一条废话。
+//   锚点随之换成 v3 首句。**历史没有被抹掉** —— 见 verify-injection-consistency
+//   里那三条反向断言：v1 的三种特征一旦回潮，那边立刻红。
+const REMIND_ANCHOR = '本轮流水还没写。现在**静默补记**'
 const remindIdx = INDEX_SRC.indexOf(REMIND_ANCHOR)
 const remindSeg =
   remindIdx < 0 ? '' : INDEX_SRC.slice(remindIdx, remindIdx + 900)
+
+// ③ 判断「提醒走的是 safePushMessage 且以 steer 收尾」（2026-11-18 分段判定）
+//
+// 不用跨参正则的原因见上面 ③ 的注释：`agent,` 与文案之间夹着 80 行注释。
+// 这里从文案往前找**最近的** `safePushMessage(`，剥掉注释后要求它紧接 `agent,`；
+// 再往文案之后找 `'steer',`，两者都成立才算「走了 safePushMessage」。
+const remindBack = remindIdx < 0 ? '' : INDEX_SRC.slice(Math.max(0, remindIdx - 8000), remindIdx)
+const remindCallStart = remindBack.lastIndexOf('safePushMessage(')
+const remindForward = remindIdx < 0 ? '' : INDEX_SRC.slice(remindIdx, remindIdx + 1200)
+const remindCallSeg = remindCallStart < 0 ? '' : remindBack.slice(remindCallStart)
+const remindCallCode = remindCallSeg
+  .replace(/\/\/[^\n]*/g, '') // 去行注释
+  .replace(/\/\*[\s\S]*?\*\//g, '') // 去块注释
+const reminderUsesSafePush = () =>
+  remindIdx >= 0 &&
+  remindCallStart >= 0 &&
+  // 剥掉注释后，调用应是 `safePushMessage(\n  agent,` 形态。
+  // 不能写成「8000 字符里出现过 agent,」—— 那样别的调用也能让它成立，断言退化成恒真。
+  /^safePushMessage\(\s*agent\s*,/.test(remindCallCode) &&
+  remindForward.includes("'steer',")
 // 自检：定位不到时判红而不是判绿 —— 否则「找不到文案」会被当成「文案没问题」。
 const remindLocated = remindIdx >= 0
 const reminderActionable =
@@ -315,9 +360,15 @@ for (const [label, ok, detail] of [
   ['没写过也 +1（v2 核心）', incrementsWhenNotWritten, '缺它 → 回到 v1，忘写仍然零检测'],
   // ⚠️ 这一条必须排在「提醒文案可执行」前面：定位不到文案时，
   //    「可执行」若仍判真就是假的（找不到 ⇒ 什么都测不到）。
-  ['能定位到提醒文案（否则下一条无意义）', remindLocated, 'index.js 里找不到「这一轮还没把记忆写进流水」锚点，文案可能被改写'],
+  //    ⚠️ 注意 detail 里的锚点说明也要跟着换 —— 否则报错时会指向一个已删的句子，
+  //       下一个人按那句去 grep 会找不到。
+  ['能定位到提醒文案（否则下一条无意义）', remindLocated, 'index.js 里找不到「本轮流水还没写。现在**静默补记**」锚点，文案可能被改写'],
   ['提醒文案可执行', reminderActionable, '只说「没写」不够，要告诉怎么补'],
   ['写过时真的会清零（不是 if(false)）', resetsWhenWrote, '清零被跳过 → 提醒一次后永远卡在阈值'],
+  // ---- 这里才是 F 段那条「提醒走 safePushMessage」的真正判定（2026-11-18 延后）----
+  // 它依赖 remindIdx / remindCallSeg，F 段执行时那些还没定义（TDZ）。
+  // 放在最后判定，且**保持原 label 原文**，便于和 F 段列表对照。
+  ['提醒走 safePushMessage', reminderUsesSafePush(), '不走它 → turn-stopping 异常会中断会话'],
 ]) {
   if (ok) { pass++; console.log(`  OK   ${label}`) }
   else { fail++; console.log(`  FAIL ${label} — ${detail}`) }

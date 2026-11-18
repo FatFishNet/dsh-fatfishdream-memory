@@ -342,8 +342,12 @@ const MUTATIONS = [
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '提醒不再走 safePushMessage（turn-stopping 异常会中断会话）',
     // ⚠️ 2026-11-17 16:26：文案随阈值 1 改写（「已连续 N 轮」→「这一轮」），锚点同步。
-    from: "        const delivered = safePushMessage(\n          agent,\n          `[dsh-memory] 这一轮还没把记忆写进流水。",
-    to: "        const delivered = agent?.steer({\n          id: 'x',\n          role: 'user',\n          content: [{ type: 'text', text: `[dsh-memory] 这一轮还没把记忆写进流水。",
+    // ⚠️ 2026-11-18：v1 前四行已删（与同处 v3 的「静默补记」矛盾），锚点换成 v3 首句。
+    //    注意 `agent,` 与文案之间夹着 80 行注释（补记三版迭代留档），
+    //    所以锚点只能取「调用头 + agent,」这一段，**不能跨到模板串**。
+    //    变异后模板串仍留在原位，只是不再走 safePushMessage —— 这正是要注入的语义。
+    from: '        const delivered = safePushMessage(\n          agent,',
+    to: "        const delivered = agent?.steer({\n          id: 'x',\n          role: 'user',\n          content: [{ type: 'text', text:",
   },
   // ---- 2026-11-17 16:26：防无限循环闸门（随阈值改 1 新增）----
   //

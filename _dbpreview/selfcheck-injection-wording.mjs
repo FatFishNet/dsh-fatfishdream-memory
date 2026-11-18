@@ -114,7 +114,7 @@ for (const s of pushToUser) {
   check(`不含「${s}」`, !INJECT_TEXT.includes(s))
 }
 
-console.log('\n=== 5. POLICY_TEMPLATE 同步（硬约束 13）===\n')
+console.log('\n=== 5. POLICY_TEMPLATE 同步（硬约束 9）===\n')
 const tmplStart = IDX.indexOf('const POLICY_TEMPLATE = `')
 /**
  * ⚠️ 2026-11-16 修：原来用 `IDX.indexOf('`\n', tmplStart)` 找结束位置。

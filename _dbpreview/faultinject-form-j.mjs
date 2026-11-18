@@ -146,9 +146,23 @@ trial(
     () => retarget('decl', 'runHealthCheck', Number(RHC.n) - 1),
     1,
 )
+// ⚠️ 2026-11-18 修：这里原本是 `+500`，**会撞上另一处真实注册**。
+//
+// `lit:'session/event'` 在 index.js 里**不唯一** —— 共有 2 处合法注册：
+//   · L3738  标记写入监听（assistant/message）
+//   · L4238  情绪录入监听（user/message）
+// 两者都写着 `safeOn('session/event', …`，所以「行号 +500」这一篡改
+// **恰好命中另一个真实位置**，`verify-map-forms` 判定仍然合法 → 注入幸存。
+//
+// 这不是被测代码的问题，是**故障注入自己的判据有缺陷**：
+// 它假设「改了行号就一定对不上」，而这个锚点全文不唯一。
+//
+// 改法：偏移改成 `+1`（下一行是 `try {`，肯定不含该字面量），
+// 对任何锚点都稳定生效，不依赖「附近没有同名注册」这种巧合。
+// 教训与 AGENTS.md「变异锚点必须唯一」同源 —— 这次是**目标行不唯一**。
 trial(
-    `L${SE?.n}（lit:session/event）行号 +500`,
-    () => retarget('lit', "'session/event'", Number(SE.n) + 500),
+    `L${SE?.n}（lit:session/event）行号 +1`,
+    () => retarget('lit', "'session/event'", Number(SE.n) + 1),
     1,
 )
 

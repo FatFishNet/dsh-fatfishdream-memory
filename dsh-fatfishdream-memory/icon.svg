@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Memory">
-  <rect x="6" y="10" width="52" height="10" rx="3" fill="#6f83ff" opacity="0.95"/>
-  <rect x="6" y="27" width="38" height="10" rx="3" fill="#6f83ff" opacity="0.7"/>
-  <rect x="6" y="44" width="26" height="10" rx="3" fill="#6f83ff" opacity="0.45"/>
-  <circle cx="52" cy="49" r="6" fill="none" stroke="#6f83ff" stroke-width="3"/>
-</svg>

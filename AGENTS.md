@@ -251,6 +251,47 @@ schema 版本用 `PRAGMA user_version` 管理。
     排除的目录下** —— 会 git 不上传、npm 不打包，README 里的链接永久断链。
     改完跑 `verify-doc-links.mjs` 核对。
 
+20. **工作区行尾必须是 LF，`core.autocrlf` 不许是 `true`。**
+
+    **2026-11-21 实踩，代价是一整棵树 11 个假红。** 本项目回归大量用**字符串锚点**
+    去 `index.js` 里找代码再注入变异，锚点里写死的是 `\n`。
+    而宿主本来是 `core.autocrlf = true` + `.gitattributes` 的 `* text=auto` →
+    **index 存 LF、检出到工作区变 CRLF** → 锚点永远匹配不上。
+    干净 worktree 检出同一棵代码，两种行尾实测：
+
+    | 工作区行尾 | 结果 |
+    |---|---|
+    | CRLF | `TOTAL=77 FAIL=12` |
+    | 全部归一 LF | `TOTAL=77 FAIL=0` |
+
+    那 12 个红全是「锚点没匹配上 → 下面的自证无效」这种，**看着像代码坏了，其实是环境不对**。
+    这种假红比不报更糟：它会让人去改一个没坏的东西。
+
+    **修复要设两个（只设第一个不够，2026-11-21 实测）**：
+
+    ```
+    git config core.autocrlf false     # 不自动转换
+    git config core.eol lf             # ★ 关键：text=auto 下 checkout 仍回落到 core.eol，
+                                       #   它在 Windows 默认 native = CRLF
+    ```
+
+    实测：只设 `autocrlf=false`，`git diff` 仍打印
+    `warning: LF will be replaced by CRLF the next time Git touches it`；
+    两个都设才消失。**所以守卫只查 autocrlf 会报「通过」而问题还在**。
+
+    **已固化守卫**：`_dbpreview/verify-eol.mjs`，放在 `SCRIPTS` **第 1 位** ——
+    它是**前置条件检查**，不是并列的第 79 项。四项：autocrlf 不能 true /
+    eol 必须是 lf / 工作区无 CRLF / 冻结夹具的 sha256 与 `expected.json` 一致。
+    **改过它之后必须重跑故障注入**（文件改 CRLF / autocrlf 改 true / eol 改 native /
+    篡改夹具一字节，四条都应变红，还原后必须变绿）。
+
+    > ⚠️ 特别值得记的一条：`selfcheck-miss-audit` 的夹具里冻着源切片的 sha256，
+    > 用来证明「夹具没被改过」。而 CRLF 化**改的就是字节** → sha 变了 →
+    > 它报「不一致说明切片被改过」。**一条守「没被改过」的断言，被行尾转换本身改掉了。**
+
+    **恢复/迁移文件后必须做这一步**：从备份、副本或 git 里捞回来的文件，
+    行尾很可能与仓库不一致。捞完先跑 `verify-eol`，别等全量回归炸出一堆假红再回头查。
+
 ## 标记擦除器（`client.js`）
 
 正文里的 `mem-log` 标记在界面上是**被 DOM 擦掉的**，不是渲染器隐藏的。

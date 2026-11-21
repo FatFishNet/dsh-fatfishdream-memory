@@ -60,6 +60,13 @@ const REPO = path.resolve(HERE, '..')
 //
 // 完整自检只手动跑：`node _dbpreview/audit-full.mjs`（见 docs/TESTING.md §0.01）
 export const SCRIPTS = [
+  // 2026-11-21 新增，**必须是第 1 个**。
+  // 为什么放最前：后面 76 个脚本全靠「字符串锚点去 index.js 里找代码」，
+  // 而锚点里写死的是 \n。一旦工作区是 CRLF（core.autocrlf=true 的默认后果），
+  // 锚点永远匹配不上 —— 实测同一棵树 CRLF 下 FAIL=12、归一 LF 后 FAIL=0，
+  // 那 12 个红全是环境噪音，会把人引去改没坏的东西。
+  // 这是**前置条件检查**，不是并列的第 78 项。
+  'verify-eol',
   'verify-functions',
   'verify-map',
   'verify-map-content',

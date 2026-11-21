@@ -27,10 +27,31 @@ const check = (name, ok, detail) => {
   console.log(`${ok ? '✅' : '❌'} ${name}${ok || !detail ? '' : '  ← ' + detail}`)
 }
 
+/**
+ * 找一份 v2 时代的库备份，用来验证 v2→v3 的迁移路径。
+ *
+ * ## 返回 `null` 而不是抛错（2026-11-21 改）
+ *
+ * `_dbbackup/` 是**用户本机的备份区**，2026-11-21 被用户清掉了
+ * （原话「没关系 已经不需要了 后面需要再建」）。
+ * 它从来不进 git（`.gitignore` 里有下划线目录规则），所以**任何 clone 都没有它**。
+ *
+ * 原来的写法是 `readdirSync` 后若为空就 `throw` —— 于是：
+ *   - 目录不存在 → `ENOENT` 直接崩，**整个脚本挂掉**，第 ② 段也跑不到
+ *   - 目录空 → 主动 throw
+ *
+ * 两种情况都让「空库全量建」（②，不依赖备份）**跟着一起失败** ——
+ * 那是把「环境缺件」误报成「代码坏了」。
+ *
+ * 现在的策略：**拿不到就跳过 ①，明确打印原因，② 照跑**。
+ * 判据来自 AGENTS.md 那条「回归测试不该依赖用户数据」——
+ * 同一个道理：也不该依赖用户本机有没有留备份。
+ */
 function backupSource() {
   const dir = path.join(ROOT, '_dbbackup')
+  if (!fs.existsSync(dir)) return null
   const files = fs.readdirSync(dir).filter((f) => f.includes('before-v3')).sort()
-  if (files.length === 0) throw new Error('_dbbackup 里找不到 before-v3 备份')
+  if (files.length === 0) return null
   return path.join(dir, files[files.length - 1])
 }
 
@@ -42,113 +63,122 @@ function count(db, table) {
   return db.prepare(`SELECT COUNT(*) c FROM ${table}`).get().c
 }
 
-// ---------------------------------------------------------------- ① 迁移
-console.log('=== ① 现有库迁移（v2 → v3）===\n')
+// 先取备份路径（可能为 null —— `_dbbackup/` 不进 git，任何 clone 都没有它）
 const src = backupSource()
-const migrated = path.join(TMP, 'migrated-v3.db')
-for (const suffix of ['', '-wal', '-shm']) {
-  try { fs.unlinkSync(migrated + suffix) } catch {}
+
+if (src === null) {
+  // ⚠️ 本机没有 v2 时代的库备份 → 跳过 ①，**但 ② 空库全量建照跑**。
+  // 这是「环境缺件」，不是「代码坏了」—— 不能因此让整个脚本失败。
+  console.log('⏭  跳过 ①：_dbbackup 里没有 before-v3 备份（该目录不进 git，属正常情形）')
+  console.log('   要跑这一段：往 _dbbackup/ 放一份 v2 时代的 memory.db 副本即可。\n')
+} else {
+  // ---------------------------------------------------------------- ① 迁移
+  console.log('=== ① 现有库迁移（v2 → v3）===\n')
+  const migrated = path.join(TMP, 'migrated-v3.db')
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.unlinkSync(migrated + suffix) } catch {}
+  }
+  fs.copyFileSync(src, migrated)
+  console.log('源: ' + path.basename(src) + '\n')
+
+  const db = openMemoryDb(DatabaseSync, migrated)
+
+  check('SCHEMA_VERSION = 5', SCHEMA_VERSION === 5, String(SCHEMA_VERSION))
+  check('user_version 已升到 5',
+    db.prepare('PRAGMA user_version').get().user_version === 5,
+    String(db.prepare('PRAGMA user_version').get().user_version))
+
+  const logCols = db.prepare('PRAGMA table_info(logs)').all().map((c) => c.name)
+  check('logs 有 summary 列', logCols.includes('summary'))
+  check('logs 有 keywords 列', logCols.includes('keywords'))
+  check('logs_fts 是 5 列', ftsCols(db, 'logs').length === 5, ftsCols(db, 'logs').join(','))
+
+  // ---- v4：原始对话归档 ----
+  const archCols = db.prepare('PRAGMA table_info(archive)').all().map((c) => c.name)
+  check('archive 表存在且列齐全',
+    ['ts', 'scope', 'role', 'text', 'session_id', 'turn', 'step'].every((c) => archCols.includes(c)),
+    archCols.join(','))
+  check('archive_fts 是 2 列（text, seg）',
+    ftsCols(db, 'archive').join(',') === 'text,seg', ftsCols(db, 'archive').join(','))
+  check('FTS_COLUMNS.archive 与建表一致',
+    FTS_COLUMNS.archive.join(',') === ftsCols(db, 'archive').join(','))
+  check('logs_fts 列顺序 = summary,keywords,text,topic,seg',
+    ftsCols(db, 'logs').join(',') === 'summary,keywords,text,topic,seg',
+    ftsCols(db, 'logs').join(','))
+  check('FTS_COLUMNS.logs 与建表列一致',
+    FTS_COLUMNS.logs.join(',') === ftsCols(db, 'logs').join(','))
+
+  const nLogs = count(db, 'logs')
+  check('流水条数与备份一致（487）', nLogs === 487, String(nLogs))
+  check('其他三表条数不变（profile 11 / rules 136 / emotion 17）',
+    count(db, 'profile') === 11 && count(db, 'rules') === 136 && count(db, 'emotion') === 17,
+    `${count(db, 'profile')}/${count(db, 'rules')}/${count(db, 'emotion')}`)
+
+  const nullSummary = db.prepare('SELECT COUNT(*) c FROM logs WHERE summary IS NULL').get().c
+  const emptySummary = db.prepare("SELECT COUNT(*) c FROM logs WHERE summary=''").get().c
+  check('所有流水都有 summary 兜底（无 NULL / 空串）',
+    nullSummary === 0 && emptySummary === 0, `NULL=${nullSummary} 空=${emptySummary}`)
+
+  // 抽样：summary 必须是 text 前 40 字（JULIAN 之外还要真比对，不能只看条数）
+  const samples = db.prepare('SELECT id,text,summary FROM logs ORDER BY id LIMIT 5').all()
+  const sampleOk = samples.every((r) => r.summary === String(r.text).slice(0, 40))
+  check('抽样 5 条：summary = text 前 40 字', sampleOk,
+    samples.map((r) => `#${r.id} ${JSON.stringify(r.summary)}`).join(' | '))
+
+  // FTS 重建：中文逐字（seg 列）与英文（text 列）都要能命中
+  const zh = buildMatchQuery('行号')
+  const en = buildMatchQuery('bm25')
+  const zhHit = db.prepare(
+    `SELECT COUNT(*) c FROM logs_fts f JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ?`,
+  ).get(zh).c
+  const enHit = db.prepare(
+    `SELECT COUNT(*) c FROM logs_fts f JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ?`,
+  ).get(en).c
+  check('中文（逐字）能检索到', zhHit > 0, `MATCH ${zh} → ${zhHit}`)
+  check('英文技术词能检索到', enHit > 0, `MATCH ${en} → ${enHit}`)
+
+  // bm25 5 权重必须能跑（个数不对会直接抛）
+  let weightOk = false
+  let weightErr = ''
+  try {
+    const row = db.prepare(
+      `SELECT l.id, bm25(logs_fts, 3.0, 2.0, 1.0, 1.0, 1.0) score FROM logs_fts f
+       JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ? ORDER BY score ASC LIMIT 3`,
+    ).all(zh)
+    weightOk = row.length > 0 && typeof row[0].score === 'number'
+  } catch (e) {
+    weightErr = e.message
+  }
+  check('bm25 接受 5 个权重且能排序', weightOk, weightErr)
+
+  // 更新路径：syncFts 用 'delete' 带原值，5 列 contentless 表必须能删
+  let updateOk = false
+  let updateErr = ''
+  try {
+    const r = db.prepare('SELECT id,text,topic,summary,keywords FROM logs ORDER BY id LIMIT 1').get()
+    const next = { ...r, summary: '改过的摘要' }
+    db.exec('BEGIN')
+    syncFts(db, 'logs', r.id, next, r)
+    db.prepare('UPDATE logs SET summary=? WHERE id=?').run(next.summary, r.id)
+    db.exec('COMMIT')
+    const hit = db.prepare('SELECT COUNT(*) c FROM logs_fts WHERE logs_fts MATCH ?')
+      .get(buildMatchQuery('改过')).c
+    updateOk = hit > 0
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch {}
+    updateErr = e.message
+  }
+  check('更新时 contentless FTS 可 delete + 重插', updateOk, updateErr)
+
+  const integ = db.prepare('PRAGMA integrity_check').get().integrity_check
+  check('integrity_check = ok', integ === 'ok', integ)
+  db.close()
+
+  // 二次打开不得重复迁移（迁移按 user_version 跳过）
+  const again = openMemoryDb(DatabaseSync, migrated)
+  check('二次打开不重跑迁移，条数不变', count(again, 'logs') === 487, String(count(again, 'logs')))
+  again.close()
 }
-fs.copyFileSync(src, migrated)
-console.log('源: ' + path.basename(src) + '\n')
-
-const db = openMemoryDb(DatabaseSync, migrated)
-
-check('SCHEMA_VERSION = 5', SCHEMA_VERSION === 5, String(SCHEMA_VERSION))
-check('user_version 已升到 5',
-  db.prepare('PRAGMA user_version').get().user_version === 5,
-  String(db.prepare('PRAGMA user_version').get().user_version))
-
-const logCols = db.prepare('PRAGMA table_info(logs)').all().map((c) => c.name)
-check('logs 有 summary 列', logCols.includes('summary'))
-check('logs 有 keywords 列', logCols.includes('keywords'))
-check('logs_fts 是 5 列', ftsCols(db, 'logs').length === 5, ftsCols(db, 'logs').join(','))
-
-// ---- v4：原始对话归档 ----
-const archCols = db.prepare('PRAGMA table_info(archive)').all().map((c) => c.name)
-check('archive 表存在且列齐全',
-  ['ts', 'scope', 'role', 'text', 'session_id', 'turn', 'step'].every((c) => archCols.includes(c)),
-  archCols.join(','))
-check('archive_fts 是 2 列（text, seg）',
-  ftsCols(db, 'archive').join(',') === 'text,seg', ftsCols(db, 'archive').join(','))
-check('FTS_COLUMNS.archive 与建表一致',
-  FTS_COLUMNS.archive.join(',') === ftsCols(db, 'archive').join(','))
-check('logs_fts 列顺序 = summary,keywords,text,topic,seg',
-  ftsCols(db, 'logs').join(',') === 'summary,keywords,text,topic,seg',
-  ftsCols(db, 'logs').join(','))
-check('FTS_COLUMNS.logs 与建表列一致',
-  FTS_COLUMNS.logs.join(',') === ftsCols(db, 'logs').join(','))
-
-const nLogs = count(db, 'logs')
-check('流水条数与备份一致（487）', nLogs === 487, String(nLogs))
-check('其他三表条数不变（profile 11 / rules 136 / emotion 17）',
-  count(db, 'profile') === 11 && count(db, 'rules') === 136 && count(db, 'emotion') === 17,
-  `${count(db, 'profile')}/${count(db, 'rules')}/${count(db, 'emotion')}`)
-
-const nullSummary = db.prepare('SELECT COUNT(*) c FROM logs WHERE summary IS NULL').get().c
-const emptySummary = db.prepare("SELECT COUNT(*) c FROM logs WHERE summary=''").get().c
-check('所有流水都有 summary 兜底（无 NULL / 空串）',
-  nullSummary === 0 && emptySummary === 0, `NULL=${nullSummary} 空=${emptySummary}`)
-
-// 抽样：summary 必须是 text 前 40 字（JULIAN 之外还要真比对，不能只看条数）
-const samples = db.prepare('SELECT id,text,summary FROM logs ORDER BY id LIMIT 5').all()
-const sampleOk = samples.every((r) => r.summary === String(r.text).slice(0, 40))
-check('抽样 5 条：summary = text 前 40 字', sampleOk,
-  samples.map((r) => `#${r.id} ${JSON.stringify(r.summary)}`).join(' | '))
-
-// FTS 重建：中文逐字（seg 列）与英文（text 列）都要能命中
-const zh = buildMatchQuery('行号')
-const en = buildMatchQuery('bm25')
-const zhHit = db.prepare(
-  `SELECT COUNT(*) c FROM logs_fts f JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ?`,
-).get(zh).c
-const enHit = db.prepare(
-  `SELECT COUNT(*) c FROM logs_fts f JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ?`,
-).get(en).c
-check('中文（逐字）能检索到', zhHit > 0, `MATCH ${zh} → ${zhHit}`)
-check('英文技术词能检索到', enHit > 0, `MATCH ${en} → ${enHit}`)
-
-// bm25 5 权重必须能跑（个数不对会直接抛）
-let weightOk = false
-let weightErr = ''
-try {
-  const row = db.prepare(
-    `SELECT l.id, bm25(logs_fts, 3.0, 2.0, 1.0, 1.0, 1.0) score FROM logs_fts f
-     JOIN logs l ON l.id=f.rowid WHERE logs_fts MATCH ? ORDER BY score ASC LIMIT 3`,
-  ).all(zh)
-  weightOk = row.length > 0 && typeof row[0].score === 'number'
-} catch (e) {
-  weightErr = e.message
-}
-check('bm25 接受 5 个权重且能排序', weightOk, weightErr)
-
-// 更新路径：syncFts 用 'delete' 带原值，5 列 contentless 表必须能删
-let updateOk = false
-let updateErr = ''
-try {
-  const r = db.prepare('SELECT id,text,topic,summary,keywords FROM logs ORDER BY id LIMIT 1').get()
-  const next = { ...r, summary: '改过的摘要' }
-  db.exec('BEGIN')
-  syncFts(db, 'logs', r.id, next, r)
-  db.prepare('UPDATE logs SET summary=? WHERE id=?').run(next.summary, r.id)
-  db.exec('COMMIT')
-  const hit = db.prepare('SELECT COUNT(*) c FROM logs_fts WHERE logs_fts MATCH ?')
-    .get(buildMatchQuery('改过')).c
-  updateOk = hit > 0
-} catch (e) {
-  try { db.exec('ROLLBACK') } catch {}
-  updateErr = e.message
-}
-check('更新时 contentless FTS 可 delete + 重插', updateOk, updateErr)
-
-const integ = db.prepare('PRAGMA integrity_check').get().integrity_check
-check('integrity_check = ok', integ === 'ok', integ)
-db.close()
-
-// 二次打开不得重复迁移（迁移按 user_version 跳过）
-const again = openMemoryDb(DatabaseSync, migrated)
-check('二次打开不重跑迁移，条数不变', count(again, 'logs') === 487, String(count(again, 'logs')))
-again.close()
 
 // ---------------------------------------------------------------- ② 空库
 console.log('\n=== ② 空库全量建 ===\n')

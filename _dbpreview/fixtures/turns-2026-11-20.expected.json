@@ -1,0 +1,94 @@
+{
+  "_readme": [
+    "2026-11-20 真实漏记数据的『已知答案』。配套原始切片 turns-2026-11-20.txt。",
+    "",
+    "为什么要有这一份：统计口径错了**不会报错**，只会算出一个看起来成立的数字。",
+    "2026-11-20 当天我就被坑过两次（把 11 毫秒的临时会话算成漏记、用 scope=all 得到 0 条）。",
+    "有了已知答案，改统计逻辑时能立刻验证 —— 而『算错了』与『口径不同』也能区分开。",
+    "",
+    "⚠️ 这些数字**不是**用手写推出来的，是先从切片独立算出来、再写进这里的。",
+    "   顺序不能反过来：先跑工具再抄它的输出，等于把 bug 变成标准答案。",
+    "",
+    "⚠️ 这份夹具守的是**统计口径**，不是『模型该不该写流水』。",
+    "   后者是模型行为，回归测不了（AGENTS.md：回归不测模型行为，那是运行时职责）。"
+  ],
+  "date": "2026-11-20",
+  "source": {
+    "log": "D:/dsh-fatfishdream-memory/logs/2026-11-20.log",
+    "slice": "turns-2026-11-20.txt",
+    "sliceBytes": 26885,
+    "sliceLines": 181,
+    "sliceSha256": "4990ab0f8b4a0c05fed93690cf3c6f22375fd55007f71b6cc0d50e0f36ee8bf4",
+    "cutAt": "2026-11-20T05:00:00",
+    "cutReason": "源日志在 05:02 之后又出现了 session-1/2/3 那种 11 毫秒的临时会话；截到 05:00 是为了让夹具冻结在『交接时刻』，不再随日志增长而变。",
+    "onlyTags": ["user-message", "turn-end-hit", "write-streak-check"],
+    "note": "逐字节复制，未手写、未改一个字符。要复核用 sha256；对不上说明夹具被改过，不是数据变了。"
+  },
+
+  "counts": {
+    "userMessage": 63,
+    "turnEnd": 62,
+    "streak": 56,
+    "_why": "三个数不同是正常的：user-message 63 条里有 1 条是 04:56:21 那条（它的 turn-end 在 05:00 之后，已被截掉）。"
+  },
+
+  "window": {
+    "from": "2026-11-20T04:00:00",
+    "to": "2026-11-20T04:57:00",
+    "sessions": ["session-205f0125-3bb0-49eb-a621-9b81a052ed00"],
+    "turns": 25,
+    "missed": 18,
+    "wrote": 7,
+    "wroteTurns": [39, 40, 47, 48, 51, 52, 53],
+    "missedTurns": [31, 32, 33, 34, 35, 36, 37, 38, 41, 42, 43, 44, 45, 46, 49, 50, 54, 55],
+    "_why": [
+      "25 轮 = turn 31..55（连续编号）。其中 7 轮写了、18 轮没写。",
+      "⚠️ 交接单一处写『24 轮 / 18 漏』—— 自相矛盾：31..54 是 24 轮，",
+      "   而那 24 轮里 17 漏（7 写了）。25 轮 / 18 漏才自洽，第 18 个是 turn 55",
+      "   （04:55:48，用户原话『如果是用当前会话里漏记的那些数据呢』）。",
+      "   这一条正是『没有已知答案时，边界数字每次算都可能差一』的现场。"
+    ]
+  },
+
+  "traps": {
+    "_why": "同一个切片、四种错口径各自会算出什么。夹具必须能把它们和正确值区分开 —— 否则改坏了聚合逻辑，测试照样绿。",
+    "legacyRowsWithoutSessionId": {
+      "rows": 20,
+      "missed": 6,
+      "turnRange": [2, 47],
+      "_why": "01:10–02:52 的老行**完全没有 sessionId**（该字段 03:35 才加上）。它们无法归属到任何会话，必须单列，绝不能并进窗口口径。"
+    },
+    "aggregateByTurnNumberOnly": {
+      "rows": 27,
+      "missed": 19,
+      "distinctSessions": 3,
+      "_why": "按 turn 号跨会话聚合（31..55）会得到 27 行 / 漏 19，而正确值是 25 / 18。多出来的 2 行来自 session-92ced88a（它也有 turn=47）与一条无 sid 老行。**turn 号每个会话各自从 1 数起，跨会话聚合必然串账。**"
+    },
+    "turnEndAsDenominator": {
+      "turnEndRows": 62,
+      "pairedWithStreak": 36,
+      "unsettled": 26,
+      "_why": "把 turn-end 行数当分母是错的：62 − 36 = 26 轮**根本没有 streak 记录**（不是『漏记』，是没结算）。判据必须来自 streak 行本身，不能拿 turn-end 减。"
+    },
+    "pairingByTimestamp": {
+      "exactTsMatches": 8,
+      "pairingBySessionIdAndTurn": 36,
+      "maxTsSkewMs": 59,
+      "_why": "⚠️ 按 ts 精确配对会失败（62 条里只有 8 条同 ts），差值最大 59ms。**配对键必须是 (sessionId, turn)，不是时间戳。** 靠时间差区分在这条链路上不成立。"
+    }
+  },
+
+  "allDay": {
+    "turns": 56,
+    "missed": 27,
+    "_why": "全天口径。**不能拿它对窗口的 18** —— 口径不同。交接单里两个数并存，是它只讲了窗口那个。"
+  },
+
+  "sanity": {
+    "turnEndAlwaysHasSessionId": true,
+    "streakWithSessionId": 36,
+    "streakWithoutSessionId": 20,
+    "distinctSessionKeys": 3,
+    "_why": "turn-end 100% 带 sid，streak 只有 36/56 带。**配对是不对称的**：61 个 (sid,turn) 键里只有 36 个能在 streak 侧找到。"
+  }
+}

@@ -15,6 +15,43 @@ window.__ModuleLoader__.load({
     const API_PERSONA = '/api/dsh-memory/persona-check'
 
     /**
+     * 本地日期 `YYYY-MM-DD`。
+     *
+     * ## 为什么需要它，而不是随手写 `toISOString().slice(0,10)`
+     *
+     * `toISOString()` 按规范**永远输出 UTC**，与机器时区无关。
+     * 本机是 UTC+8，所以**每天本地 00:00–08:00 这 8 小时**里，
+     * UTC 还停在**前一天** —— 用 `toISOString()` 取的「今天」会整整差一天。
+     *
+     * 2026-11-20 05:23 实测（正好落在那个窗口里）：
+     *
+     *     「今天」按钮   → 2026-11-19   应为 2026-11-20
+     *     「近 7 天」to  → 2026-11-19   应为 2026-11-20
+     *     「近 7 天」from→ 2026-11-12   应为 2026-11-13
+     *
+     * 表现不是「差 8 小时」，而是**点「今天」筛出昨天**：
+     * 当天写的流水一条都看不见，反而看到昨天的 520 条。
+     *
+     * ## 这不是新增的取舍，是补齐遗漏的那一层
+     *
+     * 存储层早就是本地时间了 —— `db-store.mjs` 的 `nowIso()`（2026-11-14 统一）、
+     * `index.js` 的 `diagTimestamp()` 与 `localDay()`（2026-11-18 改）**都**用
+     * `getFullYear/getMonth/getDate`。只有 `client.js` 的日期筛选还留着
+     * `toISOString()`，于是**后端与本地的口径在前端断开**。
+     *
+     * 所以这里**刻意与 `index.js` 的 `localDay()` 逐字同口径**（同样三个 getter），
+     * 不要换成 `toLocaleDateString()` —— 那会引入 locale 依赖，
+     * 某些地区输出 `2026/11/20`，与 `<input type="date">` 要求的 `YYYY-MM-DD` 不符。
+     *
+     * @param {Date} [date] 默认当前时刻；传参是为了可测（回归里注入固定时刻）
+     * @returns {string} 形如 `2026-11-20`
+     */
+    const localDayStr = (date = new Date()) => {
+      const p = (n) => String(n).padStart(2, '0')
+      return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}`
+    }
+
+    /**
      * 人称规范提示。
      *
      * 为什么需要：记忆的写者和读者是模型，但 GUI 里看它的是人。
@@ -770,7 +807,29 @@ window.__ModuleLoader__.load({
           // 只是以前这边没传。
           if (tab === 'log' && logScope) params.set('scope', logScope)
           // 勾选「显示已停用」时取全部状态，再在前端区分
-          if (!showInactive) params.set('status', 'active')
+          //
+          // ⚠️ 2026-11-20 修：**勾选时必须显式传 `status=all`**。
+          //
+          // 原来只有「不勾」这一支：
+          //     if (!showInactive) params.set('status', 'active')
+          // 勾选时**什么都不传** —— 而后端 `status: q.get('status') || 'active'`
+          // 在缺省时回落成 'active'，于是「显示已停用的」永远列不出停用条目。
+          //
+          // 这个 bug 的形态值得记：**后端在 2026-11-16 就修好了**（见 index.js
+          // `/entries` 路由里那段长注释，专门解释了「不能靠传 undefined」），
+          // 但**前端那一半从来没接上** —— 所以修了半年，用户在界面上依然看不到。
+          //
+          // 实测（2026-11-20，本机）：
+          //     不传 status → total=8，8 条全是 active
+          //     status=all  → total=9，多出 1 条 stale（正是用户停用的那条）
+          //
+          // 教训：修「读写两端」的 bug 时，**两端都要改**，
+          // 只改一端会得到一个「代码说修好了、行为没变」的状态。
+          if (showInactive) {
+            params.set('status', 'all')
+          } else {
+            params.set('status', 'active')
+          }
           if (query.trim()) params.set('q', query.trim())
           // 时间范围只对情绪/流水生效（规则与画像没有可靠时间）
           if (tab === 'emotion' || tab === 'log') {
@@ -1775,7 +1834,10 @@ window.__ModuleLoader__.load({
                       {
                         style: S.btn,
                         onClick: () => {
-                          const today = new Date().toISOString().slice(0, 10)
+                          // ⚠️ 不要写回 `new Date().toISOString().slice(0,10)`：
+                          //    那是 UTC 日期，本地 00:00–08:00 会差一整天，
+                          //    表现是「点『今天』筛出昨天」。见 localDayStr 的注释。
+                          const today = localDayStr()
                           setFromDate(today)
                           setToDate(today)
                         },
@@ -1787,10 +1849,15 @@ window.__ModuleLoader__.load({
                       {
                         style: S.btn,
                         onClick: () => {
+                          // ⚠️ 这里原来连着两处 `toISOString()`：
+                          //    · `setDate(d.getDate() - 7)` 改的是**本地**日期，
+                          //      紧接着 `toISOString()` 又按 **UTC** 取 —— 等于混算两次；
+                          //    · `toDate` 直接用 UTC 的「今天」，本地凌晨会取到昨天。
+                          //    现在两处都走 localDayStr，与后端 nowIso/localDay 同口径。
                           const d = new Date()
                           d.setDate(d.getDate() - 7)
-                          setFromDate(d.toISOString().slice(0, 10))
-                          setToDate(new Date().toISOString().slice(0, 10))
+                          setFromDate(localDayStr(d))
+                          setToDate(localDayStr())
                         },
                       },
                       '近 7 天',
@@ -1915,7 +1982,7 @@ window.__ModuleLoader__.load({
     // ---- 界面侧：把记忆标记从对话渲染里擦掉 ----
     //
     // 为什么放在客户端（2026-11-13 定案）：
-    //   标记是唯一的写入通道（硬约束 2 禁止注册工具），而 DSH 的对话渲染
+    //   标记是唯一的写入通道（硬约束 1 禁止注册工具），而 DSH 的对话渲染
     //   把 HTML 注释当纯文本吐出来 —— 渲染器里那行是
     //   `case "html": return r.omitHtml ? null : e.value`，而对话消息
     //   （ui-chat 的 AssistantMarkdown）调 MarkdownText 时没传 omitHtml。
@@ -1943,6 +2010,46 @@ window.__ModuleLoader__.load({
      * 这同时符合真实标记的写法（永远独占一行起头）。
      */
     const MEM_STRIP_RE = /^[ \t]*<!--mem-(?:log|fact|note|fix)\b[^`]*?-->[ \t]*$/gm
+
+    /**
+     * 「**假装是标记的命令式注释**」—— 2026-11-21 用户实报。
+     *
+     * ## 现场
+     *
+     * 另一个工作区（ForzaOverlay）的模型把「写记忆」写成了**一段 HTML 注释里的命令**：
+     *
+     *     <!-- 记忆写入命令：& .\.dsh-fatfishdream-memory\log.ps1 "正文" "闲聊" -->
+     *
+     * 它**既没进库、也没被擦掉**，就这么原样露在界面上。
+     *
+     * ## 为什么两个环节都放过了它（不是 bug，是各自都没覆盖）
+     *
+     *   · 解析（`index.js` 的 `MEM_MARKER_RE`）要求 `<!--mem-log` **紧贴**，
+     *     这条开头是 `<!--` + **空格** + 中文，且**根本不含 `mem-log`** → 不命中 → 不进库
+     *   · 擦除（`MEM_STRIP_RE`）同样只认 `mem-*` 形式 → 不命中 → 原样显示
+     *
+     * 实测三个形态（2026-11-21）：
+     *
+     * | 写法 | 解析 | 擦除 |
+     * |---|---|---|
+     * | `<!--mem-log topic=x` ⏎ 正文 ⏎ `-->` | ✅ | ✅ |
+     * | `<!--mem-log topic=x -->`（单行、无正文） | ❌ | ✅ |
+     * | `<!-- 记忆写入命令：… -->`（本条） | ❌ | ❌ |
+     *
+     * ## 判据：擦的是「形态」，不是「内容」
+     *
+     * 条件收得很紧，宁可漏也不误伤：
+     *   ① `<!--` **后紧跟空白**（真实标记是紧贴的 `<!--mem-`）
+     *   ② 整块**独占一行**（起止都在同一行，`^…$`）
+     *   ③ 行内**不含反引号**（讲解格式时写的 `` `<!--…-->` `` 是行内代码）
+     *   ④ 中间内容**至少 2 个字符**（`<!---->` / `<!-- -->` 这类空壳不在此列）
+     *
+     * ⚠️ 为什么不连内容一起判（比如只擦含「log.ps1」的）：
+     *    那会把范围绑死在**当前**的误用写法上。用户看到的是这一条，
+     *    但下一个工作区的模型可能写成 `<!-- 记忆：POST /api/... -->`。
+     *    **按 `<!--` + 空白 + 独占行**这个形态判，才能覆盖同类。
+     */
+    const MEM_COMMENT_LIKE_RE = /^[ \t]*<!--[ \t]+[^`\n]{2,}?-->[ \t]*$/gm
 
     /**
      * 流式输出时「还没写完的标记」。
@@ -2016,7 +2123,11 @@ window.__ModuleLoader__.load({
         {
           acceptNode(node) {
             const v = node.nodeValue
-            if (!v || v.indexOf('<!--mem-') === -1) return NodeFilter.FILTER_REJECT
+            // ⚠️ 2026-11-21 扩：原来只认 `<!--mem-`，于是「命令式注释」整个被跳过，
+            //    连 `closest('code, pre')` 那层保护都没机会生效 —— 它根本没被选中。
+            //    现在「像标记」或「像注释」都进候选，具体擦不擦由两个正则各自把关。
+            if (!v) return NodeFilter.FILTER_REJECT
+            if (v.indexOf('<!--') === -1) return NodeFilter.FILTER_REJECT
             // 反引号行内代码与代码块里的示例一律不碰
             const el = node.parentElement
             if (el && el.closest('code, pre')) return NodeFilter.FILTER_REJECT
@@ -2034,6 +2145,18 @@ window.__ModuleLoader__.load({
         // 先擦完整的（可能一条回复里有多条）
         let after = before.replace(MEM_STRIP_RE, '')
         removed += (before.match(MEM_STRIP_RE) || []).length
+        // ★ 2026-11-21：再擦「假装是标记的命令式注释」（`<!-- 记忆写入命令：… -->`）。
+        //
+        // ⚠️ 必须**在完整标记之后**、**在未闭合尾巴之前**处理：
+        //   · 放在完整标记之前 → 不会冲突（两个正则的起头条件互斥），
+        //     但语义上「真标记优先」更清楚；
+        //   · 放在未闭合尾巴之后 → 那一步可能已经把 `-->` 之前的内容吃掉，
+        //     这条注释就再也匹配不上完整形态了。
+        const commentHits = after.match(MEM_COMMENT_LIKE_RE) || []
+        if (commentHits.length > 0) {
+          after = after.replace(MEM_COMMENT_LIKE_RE, '')
+          removed += commentHits.length
+        }
         // 再擦没闭合的尾巴（流式输出中途）
         //
         // ⚠️ `skipPartial` 时跳过：同步快擦只处理**已经完整**的标记。
@@ -2358,17 +2481,41 @@ window.__ModuleLoader__.load({
        */
       const hasMarker = (node) => {
         if (!node) return false
-        if (node.nodeType === 3) return (node.nodeValue ?? '').includes('<!--mem-')
-        if (node.nodeType === 1) return (node.textContent ?? '').includes('<!--mem-')
+        // ★ 2026-11-21：**必须同时认「命令式注释」**。
+        //
+        // ## 这是同一天撞到的第三次「改了一端、另一端没接上」
+        //
+        // 我改了 `acceptNode`、加了 `MEM_COMMENT_LIKE_RE`、接进了擦除循环 ——
+        // 但**漏了这个**。用户实测：DevTools 里擦除器装了、`首屏擦除 0 处`，
+        // 而正文里的 `<!-- 测试 -->` 照样露着。
+        //
+        // 原因：MutationObserver 收到新消息时**先问这里**
+        // （`if (hasCompleteMarker(n)) fastStrip(n)`）。
+        // 这里只认 `<!--mem-` → 返回 false → **根本没走到擦除那一步**。
+        //
+        // 我在「擦什么」上做对了，却死在「要不要擦」上。
+        // 判据（以后同类改动都要过）：**改了筛选条件，就把所有"先判断"的地方找齐** ——
+        // 本项目至少有四处：`acceptNode` / `hasMarker` / `hasCompleteMarker` / 两个正则。
+        if (node.nodeType === 3) {
+          const v = node.nodeValue ?? ''
+          return v.includes('<!--mem-') || v.includes('<!-- ')
+        }
+        if (node.nodeType === 1) {
+          const v = node.textContent ?? ''
+          return v.includes('<!--mem-') || v.includes('<!-- ')
+        }
         return false
       }
 
       /**
        * 这个节点里有没有**已闭合**的标记（含 `-->`）。
        *
-       * 与 `hasMarker` 的区别就是「完不完整」。用途见下面 `fastStrip`。
+       * 与 `hasMarker` 的区别就是「完不完面」。用途见下面 `fastStrip`。
+       *
+       * ⚠️ 2026-11-21：`<!-- `（带空格）那一支是给「命令式注释」用的。
+       *    不加它，新消息永远不会走 fastStrip —— 而 fastStrip 是**切会话的主路径**。
        */
-      const COMPLETE_MARKER_HINT = /<!--mem-(?:log|fact|note|fix)\b[\s\S]*?-->/
+      const COMPLETE_MARKER_HINT = /(?:<!--mem-(?:log|fact|note|fix)\b|<!-- )[^`]*?-->/
       const hasCompleteMarker = (node) => {
         if (!node) return false
         if (node.nodeType === 3) return COMPLETE_MARKER_HINT.test(node.nodeValue ?? '')

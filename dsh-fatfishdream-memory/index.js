@@ -68,7 +68,7 @@ const PACKAGE_VERSION = (() => {
     //   2026-11-16 实测：克隆到 `D:/我的 项目/` 时版本号静默变空。
     const here = dirname(fileURLToPath(import.meta.url))
     const raw = readFileSync(join(here, 'package.json'), 'utf8')
-    // ⚠️ 这里刻意**不调用 parseJson()**：它定义在后面（L455），
+    // ⚠️ 这里刻意**不调用 parseJson()**：它定义在后面（L613），
     // 虽然函数声明会提升、实际能跑，但让模块顶部的常量依赖后面才出现的工具
     // 太脆弱了 —— 将来有人把它改成 const 箭头函数就会在加载期炸掉。
     // 只用 Node 内置的 JSON.parse 就够，这份文件是包作者自己写的，不会有 BOM。
@@ -182,6 +182,74 @@ const DEFAULT_CONFIG = {
   logMonths: 3,
 }
 
+// ---------------------------------------------------------------- 注入序号实验（2026-11-19）
+
+/**
+ * 是否给「写流水」那一行追加递增序号，强制它每轮 cache miss。
+ *
+ * ## 这个实验要回答什么
+ *
+ * `policy.md` 的「立即执行 log.ps1」那条规则，**每轮都在注入里**（实测
+ * `injectedHasWriteRule` 恒 true）。但实测缓存命中率 99.37%，且 84.8% 的
+ * step miss < 2000 token —— 说明注入段一直在命中区里，模型拿到的可能是
+ * 「算好的旧 KV」而不是每轮重读一遍。
+ *
+ * 用户假设（2026-11-19）：**规则只有作为 cache miss 时才真正"新鲜"**。
+ * 如果成立，让这一行每轮字节不同，就该提高「写流水」的执行率。
+ * 如果不成立，说明它一直是共因（有实事才写），本实验会给出否证。
+ *
+ * ## 成本（实测口径）
+ *
+ * 本会话 433 step，每 step 多约 2000 miss → +86.6 万 token → **约 0.87 元**。
+ * 上限值，实际更低（部分单元会重新命中）。
+ *
+ * ## 怎么关
+ *
+ * 改成 `false` 即可。下面三个函数保留，不删。
+ */
+// 【开关作用】在注入里「写流水」那一行末尾追加不可见递增序号（U+2063#N），
+// 强制每轮 cache miss。2026-11-19 实验结论：漏记率 60%→12.9%（p<0.001）。
+// 但霍桑效应未排除，且一直没升成正式配置项 —— 现按用户决定禁用（保留代码，不删）。
+const POLICY_INJECT_SEQ = false
+
+/** 序号计数器（模块级，进程内递增；重载插件归零） */
+let policyInjectSeq = 0
+
+/** 实验开关 + 序号自增。返回本轮的序号。 */
+function nextInjectSeq() {
+  policyInjectSeq += 1
+  return policyInjectSeq
+}
+
+/** 开关的统一出口（便于以后加环境变量控制而不改调用点） */
+function injectSeqEnabled() {
+  return process.env.DSH_MEMORY_NO_INJECT_SEQ === undefined
+}
+
+/**
+ * 把序号附到「写流水」那一行末尾。
+ *
+ * ## 为什么用 U+2063 而不是可见字符
+ *
+ * U+2063 (INVISIBLE SEPARATOR) 在字节层面**确实不同**（必然 cache miss），
+ * 但界面上不占位置、不改变阅读体验，也不影响模型对那句话的理解。
+ *
+ * ⚠️ **不要改成可见的 `#N`** —— 那会让每一轮注入里多出人眼可见的噪音，
+ *    而这个实验要验证的正是「不可见的变化是否足够」。
+ *
+ * ## 匹配失败怎么办
+ *
+ * 如果 `policy.md` 那一行被用户改写过（不再匹配正则），**原样返回**，
+ * 不报错、不阻断注入。实验失效比注入失败轻得多。
+ */
+function appendInjectSeq(text, seq) {
+  const lineRe = /(- 立即执行[^\n]*log\.ps1[^\n]*)/
+  if (!lineRe.test(text)) return text
+  const mark = `\u2063#${seq}`
+  return text.replace(lineRe, (_m, line) => `${line}${mark}`)
+}
+
+
 /**
  * 记忆目录名。盘符探测（第 3 级选址）与首次安装都按这个名字找/建。
  *
@@ -242,7 +310,7 @@ function isSystemDriveTarget(target) {
  *      被同步服务在写入中途抓取有损坏风险（硬约束 5 的同源问题）；
  *   ③ `~/.dsh` 是 DSH 自己的目录，语义上就是「这个工具的私有数据」。
  *
- * 本机已证实 `~/.dsh` 存在（`$env:DSH_HOME = C:\Users\ZC\.dsh`）。
+ * 本机已证实 `~/.dsh` 存在（`$env:DSH_HOME = <用户主目录>\.dsh`）。
  */
 function posixFallbackRoot() {
   const dshHome = String(process.env.DSH_HOME ?? '').trim()
@@ -1065,7 +1133,7 @@ async function exists(path) {
  * `exists()` 走的是 `stat()`，**文件和目录都返回 true**。
  *
  * 而 `/log` 的 cwd 校验需要的是「这是个真实的工作区目录」这个判断。
- * 2026-11-17 实测复现：我在 `C:\Users\ZC\.dsh\profiles\desktop` 下执行命令
+ * 2026-11-17 实测复现：我在 `<用户主目录>\.dsh\profiles\desktop` 下执行命令
  * （pnpm 操作留下的 cwd），POST /log 时不传 scope、只传 cwd →
  * `exists(cwd)` 为真 → `resolveProjectKey` 取 basename = `desktop`
  * → **凭空建出一个只有 2 条流水的假工作区**。
@@ -1081,6 +1149,194 @@ async function isDirectoryPath(path) {
   } catch {
     return false
   }
+}
+
+/**
+ * 工作区里那个放短命令脚本的目录名。
+ *
+ * 为什么叫这个名字、以点开头：与 `.dsh/`（dsh-skill-switch 的技能开关状态）、
+ * `.dsh-handoff/`（交接文档）是同一类 —— **只对本机有意义的运行时状态**。
+ * 用户在 ForzaOverlay 的 .gitignore 里就是这么归类的：
+ *   「DSH 技能开关状态与本机会话交接单：都是本机绑定，对 clone 仓库的人无意义」
+ *
+ * ⚠️ 本插件**不自动改任何 .gitignore**（2026-11-18 用户明确要求）：
+ * 那是别人的文件，改它等于替用户做仓库决策；而且有些工作区（做文档、做视频
+ * 网页的）根本不进 git，对着它跑 git 判断本身就是错的。
+ * 想忽略就由用户自己加，README 里给了一句建议。
+ */
+const WORKSPACE_DIR_NAME = '.dsh-fatfishdream-memory'
+
+/**
+ * 写流水用的短命令脚本。
+ *
+ * 设计目标：**调用方只需要记住「说一句什么」**。
+ * cwd / sessionId / JSON 编码 / POST 方法 / Content-Type 全部固化在这里，
+ * 调用形状只有：`& .\.dsh-fatfishdream-memory\log.ps1 "一句话"`
+ *
+ * 幂等：服务端在 topic 缺省时补「开发日志」、summary 缺省时从正文截取
+ * （见 /log 路由的 `topicFinal = topic ?? '开发日志'`），所以只传 text 就够。
+ */
+const WORKSPACE_LOG_PS1 = `param(
+    [Parameter(Position = 0, Mandatory = $true)][string]$Text,
+    [Parameter(Position = 1)][string]$Topic
+)
+# 由 dsh-fatfishdream-memory 插件生成。删掉没关系，下次在该工作区对话时会重建。
+if (-not $env:DSH_WEB_URL) { Write-Error 'DSH_WEB_URL 未设置：不在 DSH 会话里？'; exit 1 }
+$body = @{ text = $Text; cwd = (Get-Location).Path; sessionId = $env:DSH_SESSION_ID }
+if ($Topic) { $body.topic = $Topic }
+try {
+    $r = Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body ($body | ConvertTo-Json)
+
+    # ★ 2026-11-19：**必须把 turnWrites 打出来**。
+    #
+    # ## 为什么加这一行（真实事故）
+    #
+    # 原来只打 \`ok id=N turn=M\`。于是同一轮里连写 5 条时，输出是：
+    #     ok id=972 turn=54
+    #     ok id=973 turn=54     ← turn 没变，但我没注意
+    #     ...
+    # 我据此得出了「连续 5 轮都写了」的错误结论 —— 实际那**5 条全是同一轮**。
+    # 服务端一直在响应里返回 \`turnWrites\`，**是脚本没打出来**。
+    #
+    # 判据：一条信息如果服务端已经给了、只是没显示，那「没显示」就是缺陷。
+    #
+    # ★ 2026-11-20：**同理补上 topic**（第三次同源）。
+    #
+    # ## 为什么（真实事故，就在补 turnWrites 的第二天）
+    #
+    # 我调用时只传了一个参数：
+    #     & .\\log.ps1 "…判为闲聊"          ← 少了第二个参数
+    # 而 \`param\` 里 \`$Topic\` 是 Position 1 的可选参数 → 它是 \$null →
+    # 请求体里没有 topic → 服务端补默认值「开发日志」。
+    # 结果：正文写着「判为闲聊」，实际**归进了开发日志**，而输出只说
+    #     ok id=1105 turn=48 (本轮第 1 条)
+    # —— **一个字都没提 topic**，所以我以为写对了。
+    #
+    # 服务端响应里一直有 topic 字段，**又是脚本没打出来**。
+    #
+    # ⚠️ 别把这件事当成「三个输出字段的事」。它们的共同点是：
+    # **脚本把服务端的响应剪裁成一行，剪掉了判断对错所需的信息。**
+    # 以后要加输出，先问：**这个字段缺了，我会不会看不出自己写错了？**
+    if ($r.turnWrites -and $r.turnWrites -gt 1) {
+        Write-Output "ok id=$($r.id) turn=$($r.turn) topic=$($r.topic) —— ⚠️ 本轮第 $($r.turnWrites) 条（同一轮重复写入，不是新一轮！）"
+    } else {
+        Write-Output "ok id=$($r.id) turn=$($r.turn) topic=$($r.topic) (本轮第 $($r.turnWrites) 条)"
+    }
+    # 没传第二个参数时**显式警告**：这次多半是分类写错了
+    #
+    # 为什么不静默：不传 topic 是**合法调用**（服务端会补默认值），
+    # 所以它永远不报错 —— 而「没报错」正是它危险的原因。
+    # 想按类记录却忘了传时，这条警告是唯一的现场。
+    if (-not $Topic) {
+        Write-Output "  ℹ️ 未指定 topic，服务端补了「$($r.topic)」。要归到别的类请传第二个参数：log.ps1 '正文' '闲聊'。"
+    }
+} catch { Write-Error "写流水失败: $($_.Exception.Message)"; exit 1 }
+`
+
+/**
+ * 给使用者看的说明。放纯文本而不是 .md：它只在用户翻到这个目录时才读一次，
+ * 不需要渲染，也不该被当成项目文档维护。
+ *
+ * ⚠️ 刻意**不写记忆库的绝对路径**：记忆根可以被 `/memory root move` 迁走，
+ * 写死的路径迟早过期，而过期的说明比没有说明更误导。
+ */
+const WORKSPACE_README_TXT = `此文件夹是 DSH 记忆插件「大肥鱼的梦」的依赖项，请不要删除。
+
+如果你看到这个文件夹，说明插件已经在这个工作区里记录过对话。
+
+【里面有什么】
+  log.ps1     写流水用的短命令，把一句结论发到本机记忆库
+  README.txt  就是你正在看的这份
+
+【为什么需要它】
+  记忆插件要求每轮对话结束后写一条「流水」到数据库。
+  原先要手写六个参数的完整命令，实测漏记率约 58% ——
+  现在压缩成一行，只留「说一句什么」这一个决定。
+
+【关于 git】
+  本目录与 .dsh/、.dsh-handoff/ 一样，属于「只对本机有意义」的运行时状态，
+  对 clone 这个仓库的人没有价值。如果这个工作区提交进 git，
+  建议自己把它加进 .gitignore（插件不会替你改那个文件）：
+
+      .dsh-fatfishdream-memory/
+
+【注意】
+  · 这个文件夹删掉也没关系，下次在该工作区对话时插件会重建。
+  · 如果脚本报「无法加载，因为在此系统上禁止运行脚本」，
+    说明文件被 Windows 打了「来自网络」标记，执行一次：
+        Unblock-File .\\.dsh-fatfishdream-memory\\log.ps1
+  · 记忆数据本身不在这个文件夹里 —— 它由插件管理，位置见插件设置。
+    请不要手工改动记忆数据。
+
+【备注】
+  这个文件由插件生成，每次重建时会被覆盖。想改措辞请改插件源码。
+`
+
+/**
+ * 确保工作区里有短命令脚本（2026-11-18）。
+ *
+ * 判据是「文件存在**且内容与模板一致**」，不是「目录存在」，也不只是「文件存在」。
+ *
+ * ## 为什么从 `exists()` 改成比内容（2026-11-19 实踩）
+ *
+ * 原实现是 `if (await exists(scriptPath)) return false` —— 只看**存在**。
+ * 于是模板一旦改过，已经生成过的那些工作区**永远不会更新**，而且失败是静默的：
+ *
+ *   · `log.ps1` 里新加的 `turnWrites` 输出分支（同日刚加）一次都没执行过；
+ *   · 三个工作区的脚本全都停在 11-18 那版（718 字节 vs 模板 1599 字节），
+ *     手动覆盖后才拿到新行为；
+ *   · 这个函数返回 `false` 兼作「没新建」，上层只在 `true` 时打
+ *     `workspace-script-installed`，所以「跳过了旧的」在日志里**一个字都没有**。
+ *
+ * 这正是 AGENTS.md 记过的「改了代码，但跑的不是这版」在**派生文件**上的形态：
+ * 源码改了、插件重载了，可工作区里那份副本是旧的。
+ *
+ * ## 为什么用 sha256 比全文
+ *
+ * 直接 `have !== WORKSPACE_LOG_PS1` 也能判，但比较字符串会把整个模板留在
+ * 两个变量里多占一份内存；哈希只有 64 个字符，且失败时更容易一眼看出不同。
+ * `createHash` 本文件早已导入（L38，另有一处 sha1 的用途），不引入新依赖。
+ *
+ * ## 代价
+ *
+ * 从一次 `stat` 变成一次 `readFile`（模板约 1.6 KB）。相比「静默跑旧版」，
+ * 这点 I/O 可以忽略。
+ *
+ * ## 已知取舍：会覆盖用户手改
+ *
+ * 用户若自己往 `log.ps1` 里加了调试输出，这里会**静默覆盖**。
+ * 这是**有意选择**（2026-11-19 用户定）：`log.ps1` 是插件生成的派生文件，
+ * 保证它与模板一致比保留手改更重要，而且删掉也能自愈 ——
+ * README.txt 里已经写明「这个文件由插件生成」。
+ * 想加调试请改源码里的 `WORKSPACE_LOG_PS1`，那才是唯一真相源。
+ *
+ * ⚠️ `README.txt` **不参与比较**：它只是给人看的说明，内容陈旧不影响功能，
+ * 而每次会话都重写它属于无谓的写盘。所以它仍然只在「新建」这一支里写。
+ *
+ * 调用方必须自己包 try —— 这个函数会抛（上层负责降级成一条诊断日志）。
+ */
+async function ensureWorkspaceScripts(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return false
+  const base = join(cwd, WORKSPACE_DIR_NAME)
+  const scriptPath = join(base, 'log.ps1')
+
+  const wanted = createHash('sha256').update(WORKSPACE_LOG_PS1, 'utf8').digest('hex')
+  // 读失败（不存在 / 权限 / 编码）一律当作「内容不符」→ 走覆写分支自愈。
+  // 这里**不能用 exists() 先探一次**：那是两次 I/O，而且中间有竞态窗口。
+  const current = await readFile(scriptPath, 'utf8').catch(() => undefined)
+  if (current !== undefined) {
+    const actual = createHash('sha256').update(current, 'utf8').digest('hex')
+    if (actual === wanted) return false
+  }
+
+  await mkdir(base, { recursive: true })
+  await writeFile(scriptPath, WORKSPACE_LOG_PS1, 'utf8')
+  // README 只在「新建」时写：它内容陈旧不影响任何行为，
+  // 而每次重写它会让文件时间戳一直在变、干扰「这个工作区最近动过吗」的判断。
+  if (current === undefined) {
+    await writeFile(join(base, 'README.txt'), WORKSPACE_README_TXT, 'utf8')
+  }
+  return true
 }
 
 async function atomicWrite(path, content) {
@@ -1238,25 +1494,265 @@ function readCached(path) {
   }
 }
 
+// -------------------------------------------------------------- 收尾语解析
+
+/**
+ * 收尾语在 `policy.md` 里的**固定句式锚点**。
+ *
+ * ## 为什么要有这一对常量（2026-11-19 实踩）
+ *
+ * 旧实现要求那一行**以「每轮…结尾」开头**：
+ *     /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m
+ * 我把注入改成「脚本在前、回执在后」的句式后，行首变成「脚本执行成功**之后**」，
+ * 四个读取点**全部静默返回空串** —— 整套收尾语检测无声关闭，
+ * 而日志里只有 `heartbeat: null`，看不出是「没配」还是「解析挂了」。
+ *
+ * 所以改成语义锚点：只要那行里含「才允许在回复最后一行输出」，
+ * 就取它后面第一个冒号之后、到「这句是」之前的内容当收尾语。
+ *
+ * ⚠️ 起点/终点都**不要带 markdown 修饰**（`**` 之类）——
+ *    用户随手删一个星号就会让解析落空，而落空是静默的。
+ */
+const HEARTBEAT_START = '才允许在回复最后一行输出'
+const HEARTBEAT_END = '这句是'
+/** 未命中任何锚点时的常见原因，供诊断区分「没配」与「格式坏了」。 */
+const HEARTBEAT_LEGACY_RE = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m
+
+/**
+ * 从 `policy.md` 全文里解出收尾语那一行与纯句子。
+ *
+ * 返回 `{ found, raw, value }`：
+ *   · `found=false`  → 没有收尾语行（`value=''`）
+ *   · `found=true` 且 `value=''` → **行在、但截不出句子**（格式坏了，必须诊断）
+ *
+ * ## 为什么返回对象而不是裸字符串
+ *
+ * 旧四个实现都返回 `''`，调用方**无法区分**「用户清空了收尾语」与
+ * 「解析失败」。这正是今天那次静默失效的根源。多给一个 `found` 字段，
+ * 让调用方能对第二种情况打日志。
+ */
+function parseHeartbeatFromPolicy(text) {
+  const src = String(text ?? '').replace(/\r\n?/g, '\n')
+  const lines = src.split('\n')
+
+  // ① 新句式：含固定起点短语的那一行
+  let idx = lines.findIndex((line) => line.includes(HEARTBEAT_START))
+  let isLegacy = false
+  // ② 兼容旧句式：「每轮…结尾」开头（模板尚未迁移的老用户）
+  if (idx === -1) {
+    idx = lines.findIndex((line) => HEARTBEAT_LEGACY_RE.test(line))
+    isLegacy = idx !== -1
+  }
+  if (idx === -1) return { found: false, raw: '', value: '' }
+
+  const raw = lines[idx]
+
+  // 旧句式保留原有切法：「第一个冒号之后，再切掉两种执行说明」
+  if (isLegacy) {
+    const m = raw.match(/[：:]\s*(.+)$/)
+    if (!m) return { found: true, raw, value: '' }
+    let rest = m[1].trim()
+    rest = rest.split(/这是会话的[「"]?心跳/)[0]
+    rest = rest.split(/用来确认本轮执行完整/)[0]
+    return { found: true, raw, value: rest.trim().replace(/[。.]\s*$/, '') }
+  }
+
+  // 新句式：起点之后找第一个冒号，取到终点之前
+  const afterStart = raw.slice(raw.indexOf(HEARTBEAT_START) + HEARTBEAT_START.length)
+  const colonAt = afterStart.search(/[：:]/)
+  if (colonAt === -1) return { found: true, raw, value: '' }
+  let rest = afterStart.slice(colonAt + 1)
+  const endAt = rest.indexOf(HEARTBEAT_END)
+  if (endAt !== -1) rest = rest.slice(0, endAt)
+  // ⚠️ 2026-11-19：**保留句末标点**。
+  //
+  // 这里一度写成 `.replace(/[。！？!?…．.]$/, '')`（照抄旧实现），实测立刻出问题：
+  // `isHeartbeatLast()` 用 `text.trimEnd().endsWith(heartbeat)` 判断「末行是不是收尾语」，
+  // 而正文末行是「大肥鱼是漂亮老婆**！**」——去掉感叹号后 endsWith 恒为 false，
+  // 「末行判定」这一路直接失效（`includes` 那路因为前缀匹配还能过，所以更要命：
+  //  它俩结论不一致，但都不会报错）。
+  //
+  // 结论：解析出来的必须是**能字符级对齐正文原样**的串，标点不能动。
+  return { found: true, raw, value: rest.trim() }
+}
+
+/**
+ * 生成收尾语那一行的完整文本（写入时用）。
+ *
+ * 与 `parseHeartbeatFromPolicy` **互为逆运算**：写进去的必须能被读出来。
+ * 这条约束今天被违反过一次（写入仍用旧句式、读取已换新锚点），
+ * 所以两者放在相邻位置，改一个时不可能看不见另一个。
+ */
+function buildHeartbeatLine(sentence) {
+  return (
+    `- 脚本执行成功**之后**，才允许在回复最后一行输出：${sentence} ` +
+    `这句是**执行回执**，不是执行本身；没先跑脚本就不许输出它。` +
+    `放在最后一行，不用解释、不用变形。`
+  )
+}
+
+/**
+ * 定位收尾语那一行的**块级正则**（含它的缩进续行，不含空行与标题）。
+ *
+ * 与 `buildHeartbeatLine`/`parseHeartbeatFromPolicy` 同一套锚点：
+ * 新句式优先，旧句式兜底。`(?:\n[ \t]+[^\n]*)*` 只吃缩进续行 ——
+ * 这段历史见 `writeHeartbeat` 里那两版被否的写法，别改回去。
+ *
+ * ⚠️ **必须写成字面量正则，不能用 `new RegExp` 动态拼接。**
+ *
+ * 原因：`selfcheck-policy-sync.mjs` 有 20 处断言靠正则从**源码文本**里抓
+ * 「blockRe 的等号定义」再 `eval` 出来跑真实行为（场景7/8/9 全靠它）。
+ * 写成动态拼接后它抓到 0 处，**整个场景静默失效**（2026-11-19 实测：
+ * 「场景7：源码里能找到 blockRe 定义 — 找到 0 处，实际 0 行」）。
+ *
+ * ⚠️⚠️ 另一个坑：**注释里也别写出那个抓取模式本身**。
+ * 第一次修的时候我在注释里原样引用了抓取正则，结果它先命中了注释、
+ * 抓到一串 `/…/m` —— 测试报「匹配旧格式 false / 匹配新格式 false」，
+ * 看起来像正则写错，实际是**注释把抓取器骗了**。
+ *
+ * 那套自检的设计意图是「测的是生产代码，不是抄一份」，值得保留；
+ * 所以这里牺牲一点表达力，把两个锚点**字面量写死**。
+ * 改锚点时：`HEARTBEAT_START` / `HEARTBEAT_END` 与下面两条正则必须同步。
+ */
+// ⚠️ 正则体内**不能出现 `|`** —— 两个自检脚本会从源码文本里抓这两个函数
+// 返回的字面量再 eval 执行，`|` 会把抓取边界切断（2026-11-19 实测）。
+// 所以「新句式 / 旧句式」不用 alternation，改成两条独立正则、取「先命中者」。
+/**
+ * 新句式（2026-11-19 起的主力）：行内含「才允许在回复最后一行输出」。
+ */
+function heartbeatBlockReNew() {
+  return /^[ \t]*-[^\n]*才允许在回复最后一行输出[^\n]*(?:\n[ \t]+[^\n]*)*\n?/m
+}
+
+/**
+ * 旧句式（模板尚未迁移的老用户）：以「每轮…结尾」开头那一条。
+ */
+function heartbeatBlockRe() {
+  return /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*(?:\n[ \t]+[^\n]*)*\n?/m
+}
+
+/**
+ * 取当前 `policy.md` 该用的那条块级正则：新句式优先，旧句式兜底。
+ *
+ * 为什么拆成两条而不是一条带 `|`：见上面 `heartbeatBlockReNew` 的说明。
+ */
+function pickHeartbeatBlockRe(text) {
+  const src = String(text ?? '')
+  return src.includes(HEARTBEAT_START) ? heartbeatBlockReNew() : heartbeatBlockRe()
+}
+
+/** 是否存在收尾语行（新句式或旧句式都算）。 */
+function hasHeartbeatLine(text) {
+  const src = String(text ?? '').replace(/\r\n?/g, '\n')
+  return src.split('\n').some(
+    (line) => line.includes(HEARTBEAT_START) || HEARTBEAT_LEGACY_RE.test(line),
+  )
+}
+
+/**
+ * 定位 `## 给模型的规则` 小节，返回**该段最后一条 `- ` 规则之后**的插入位置。
+ *
+ * ## 为什么需要它（2026-11-20 用户实报）
+ *
+ * 原来 `writeHeartbeat` / `restoreHeartbeat` 在「文件里没有收尾语行」时，
+ * 用 `const anchor = /^(#{1,2}\s*.*给模型的规则[^\n]*\n)/m` 把新行**插到标题正下方**，
+ * 也就是**第 2 行**。于是「删掉收尾语 → 再填一遍」不幂等：
+ *
+ *     初始（用户实例）          删除后              重新填入后
+ *     1 ## 给模型的规则         1 ## 给模型的规则    1 ## 给模型的规则
+ *     2 - 必须执行 log.ps1      2 - 必须执行         2 - 收尾语   ← 挤进来了
+ *     3 - 收尾语                3 （空）            3 - 必须执行 ← 被挤到第 3 行
+ *
+ * ## 用户定死的格式（2026-11-20）
+ *
+ *   **第 1 行必须是 `## 给模型的规则`，
+ *     第 2 行必须是「- **每轮必须无条件执行** `& ...log.ps1 ...`」那条。**
+ *   无论发生什么（初始化覆盖、删收尾语重建、GUI 反复改），这两行都不许动。
+ *
+ * 所以插入点改成「该段最后一条 `- ` 规则的末尾」—— 新行排在末尾，
+ * 永远够不到第 2 行。
+ *
+ * @returns {{ insertAt: number } | null} 字符偏移；找不到标题时返回 null
+ */
+function locateRulesSection(text) {
+  const raw = String(text ?? '')
+
+  // ⚠️ 关键：**不能在归一化后的文本上算偏移。**
+  //
+  // 第一版写成 `src.replace(/\r\n?/g, '\n')` 再按 `\n` 切行、累加长度求偏移，
+  // 于是偏移是**相对 LF 版本文本**的字节位置；而调用方拿它去切**原始（可能是
+  // CRLF）文本** —— 每经过一个 `\r` 就少算 1 个字符，偏移越往后越偏。
+  //
+  // 实测（2026-11-20，本机 policy.md 是 CRLF）：
+  //   第 3 行起偏移 应为 127，归一化算出来是 126 —— 插入点落在句子中间，
+  //   写出来变成「…不许套模板\n。\n」这种断句。
+  //
+  // 正确做法：**在原始文本上按 `\r?\n` 切行时保留行尾长度**，
+  // 或者干脆用 `split` 后的原始长度累加。这里选后者：
+  // 用带捕获的 split 拿到每行 + 它自己的换行符长度。
+  const parts = raw.split(/(\r\n|\n|\r)/)
+  // parts = [line0, sep0, line1, sep1, ...]
+  const lines = []
+  const seps = []
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) lines.push(parts[i])
+    else seps.push(parts[i])
+  }
+
+  // 1) 找标题行
+  let head = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (/^#{1,2}\s*.*给模型的规则/.test(lines[i])) {
+      head = i
+      break
+    }
+  }
+  if (head < 0) return null
+
+  // 2) 找小节结束（下一个 `#`/`##` 标题）；没有就是文件末尾
+  let end = lines.length
+  for (let i = head + 1; i < lines.length; i++) {
+    if (/^#{1,2}\s/.test(lines[i])) {
+      end = i
+      break
+    }
+  }
+
+  // 3) 该段里**最后一条** `- ` 规则；插入点 = 它以及缩进续行之后
+  let lastRule = -1
+  for (let i = head + 1; i < end; i++) {
+    if (/^[ \t]*-[ \t]+\S/.test(lines[i])) lastRule = i
+  }
+
+  let insertLine
+  if (lastRule >= 0) {
+    insertLine = lastRule + 1
+    while (insertLine < end && /^[ \t]+\S/.test(lines[insertLine])) insertLine++
+  } else {
+    // 该段一条规则都没有 —— 退回标题下一行（此时不存在「挤走第 2 行」的风险）
+    insertLine = head + 1
+  }
+
+  // 4) 原始文本里的字符偏移 = 前 insertLine 行的内容 + 它们各自的换行符
+  let offset = 0
+  for (let i = 0; i < insertLine && i < lines.length; i++) {
+    offset += lines[i].length
+    if (i < seps.length) offset += seps[i].length
+  }
+  return { insertAt: Math.min(offset, raw.length), eol: seps[0] ?? '\n' }
+}
+
 // ---------------------------------------------------------------- 模板
 
-const POLICY_TEMPLATE = `# 记忆规则
+const POLICY_TEMPLATE = `## 给模型的规则
+- **每轮必须无条件执行** \`& .\\.dsh-fatfishdream-memory\\log.ps1 "<本轮一句话结论>"\`：不跳轮、不加判断、不等用户要求。括号里那句必须概括**本轮用户提出的具体问题**，不许套模板。
 
-## 给模型的规则
-
-
-每轮遵守的行为约定。这一节会被注入所有项目的每一轮上下文。
-
-- **写记忆只能用 HTTP 接口**：\`POST $env:DSH_WEB_URL/api/dsh-memory/log\`
-  （参数见本文件末尾「流水必须带 topic 和 summary」）。
-  **不要往回复正文里写任何标记** —— 标记一进正文，界面就会闪一下。
-  绝不要用 \`write\` / \`edit\` / pwsh 去碰 \`memory.db\` ——
-  那不是被拒绝，而是**损坏数据库**。
-  **项目规则与用户画像由用户在 GUI 手工维护，模型不要写**（标记已移除）。
+## 简单用法
+- 绝不要用 \`write\` / \`edit\` / pwsh 去碰 \`memory.db\`,会损坏数据库。
+- **项目规则与用户画像由用户在 GUI 手工维护，模型不要写**。
 - **查记忆**：用 pwsh 请求本机接口，\`scope\` 必带（不传会返回 400）；
-  先加 \`&summary=1\` 看摘要，确认相关再取全文（按 id 取单条：\`entry?id=<id>&table=<table>\`，table 用摘要里的字段）。
-  完整查法（必查场景、端口、跨项目、不去重）见本文件末尾「怎么查记忆」。
-
+- 先加 \`&summary=1\` 看摘要，确认相关再取全文（按 id 取单条：\`entry?id=<id>&table=<table>\`，table 用摘要里的字段）。
+- 完整查法（必查场景、端口、跨项目、不去重）见本文件末尾「怎么查记忆」。
 
 ## 强制录入：用户的情绪表达（不可关闭）
 - 用户在对话里表达情绪时，插件自动把原话写入 emotion 表，不依赖模型判断。
@@ -1290,9 +1786,12 @@ const POLICY_TEMPLATE = `# 记忆规则
 - 代码和 git 已经记录的内容。
 
 ## 怎么写（流水）
-- 一条 = 一个结论，一行。
-- 3~5 行，一行一个要点，不写解释。
+- 一条 = 一个结论，一行。**正文 ≤150 字、最多 5 行**，一行一个要点，不写解释。
 - 同一件事改写旧条，不要新增重复条。
+
+> ⚠️ **旧版这里写「3~5 行」，已废弃**（2026-11-18 统一）。
+> 原因见「流水要短」那节：2026-11-16 实测，写成「3~5 行」时我连续十几轮
+> 写到 400~900 字 —— **含糊的规则等于没有规则**，所以改成可执行的数字上限。
 
 ## 存储位置
 - 记忆优先放在**非系统盘**（Windows 上 D 盘优先，其余按剩余空间选）；
@@ -1305,10 +1804,25 @@ const POLICY_TEMPLATE = `# 记忆规则
 
 > **这一节不注入。** 需要写记忆时再来读这里。
 > 注入里只保留了「不做就会出错」的几条动作；topic 分类、写法细节在这。
+>
+> **注入的到底是哪一段**（别靠感觉）：从含「给模型的规则」字样的 \`#\` 或 \`##\` 标题行起，
+> 到**下一个同级标题为止**（当前就是 \`## 强制录入：用户的情绪表达\` 之前）。
+> 判定逻辑见 \`index.js\` 的 \`policyTextSync()\`：用 \`/^#{1,2}\\s*.*给模型的规则/\` 定位起点，
+> 用 \`/^#{1,2}\\s/\` 判终点。
+> **改别的小节不会影响注入，改这一段才会每轮生效。**
 
-### 写入：本机 HTTP 接口（主通道）
+### 写入：工作区脚本（主通道，2026-11-18 起）
 
-**唯一正常路径。** 用 pwsh 发一次 POST：
+**正常路径就一行命令**，在工作区根目录执行：
+
+\`\`\`powershell
+& .\\.dsh-fatfishdream-memory\\log.ps1 "一句话结论"
+\`\`\`
+
+\`cwd\` / \`sessionId\` / JSON 编码 / POST 方法 / Content-Type 全部固化在脚本里；
+\`topic\` 与 \`summary\` 服务端会补（见下节）。**不要自己拼参数。**
+
+**脚本不存在时**（新工作区首轮可能还没生成）才退回长命令：
 
 \`\`\`powershell
 Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
@@ -1323,15 +1837,18 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
   } | ConvertTo-Json)
 \`\`\`
 
+脚本由插件在**该工作区第一次对话时**自动生成，判据是 \`log.ps1\` 是否存在
+（删了整个目录，下次对话会重建）。
+
 | 参数 | 约束 |
 |---|---|
 | \`text\` | **必填**，为空返回 400 |
-| \`topic\` | 13 个分类之一（下方清单）。不带或写错会被拒收置空，该条不进「记忆索引」 |
-| \`summary\` | 一句话说清这条讲了什么，**≤35 字**；超出会截断 |
+| \`topic\` | **可省** —— 不传自动补「开发日志」。**但传了就必须是 14 类之一**，写错返回 400（\`可省 ≠ 可以乱写\`） |
+| \`summary\` | **可省** —— 不传从正文截取（去 markdown 记号 + 35 字截断）；传了超长也会截断 |
 | \`keywords\` | 检索用技术名词，全角竖线 \`｜\` 分隔（**不要用逗号**）；抽不出就写 \`无\` |
 | \`scope\` | 可省。省略时按 \`cwd\` 解析成项目名 |
 | \`cwd\` | **目录必须真实存在**，否则 400（防止写错路径凭空造出假工作区） |
-| \`sessionId\` | 建议传。不传则「本轮已写流水」不计入，连续未写提醒会误报 |
+| \`sessionId\` | 脚本自动带。**手写命令时不传**：流水照样写进去，但「本轮已写」不会被计入 |
 
 只接受 \`POST\`（写流水有副作用，GET 可能被浏览器预取重复触发）。
 
@@ -1339,24 +1856,29 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
 不擦就永久占屏，擦就先显示后消失（闪）。换成 HTTP 后正文干净，两个问题一起消失，
 而且标记不再留在会话上下文里（一条长标记约 300~600 token，按 10 轮算是几千 token 的纯开销）。
 
-### 流水必须带 topic 和 summary
+### topic 与 summary 都是可省的（2026-11-18 修正）
 
-- **topic**：13 个分类之一（下方清单）。不带 topic 的流水不会进「记忆索引」，等于对以后的自己隐形。
-- **summary**（2026-11-14 起）：一句话说清这条讲了什么，≤35 字。
-  不写摘要的流水，检索时只能靠正文前 80 字截断兜底，经常截在句子中间、丢掉技术名词。
-- **keywords**（2026-11-14 起）：检索用的技术名词，用全角竖线 \`｜\` 分隔（**不要用逗号**，
-  逗号是中文正文的常用标点）。抽不出名词就写 \`无\`，不要硬凑 —— 硬凑只会污染检索。
+> ⚠️ **旧版这里写的是「流水必须带 topic 和 summary」，与代码不符。**
+> 实际行为（\`index.js\` 的 \`/log\` 路由）：\`const topicFinal = topic ?? '开发日志'\`，
+> \`summary\` 不传则由 \`summary-derived\` 从正文截取。**两者都能省。**
 
-**分类只用这 13 个**（别自创，否则索引会碎）：
+- **topic** 不传 → 补「开发日志」。**传了但不在 14 类**才 400 ——
+  静默改掉调用方的错误 topic 才是真的坏事。
+- **summary** 不传 → 从正文前部截取。但它仍是**检索与注入都依赖**的字段，
+  自己写一句 ≤35 字的说清楚更好；截取经常落在句子中间、丢掉技术名词。
+- **keywords** 不传就空着。抽不出名词写 \`无\`，不要硬凑 —— 硬凑只会污染检索。
+
+**分类只用这 14 个**（别自创，否则索引会碎）：
 
 \`\`\`
 开发日志 / 技术讨论 / 构建/编译 / 注入/预算 / 插件/装载 / 路径/沙箱 /
-格式/编码 / 文档/行号 / 情绪判据 / 用户画像 / 数据清理 / GUI/界面 / Git
+格式/编码 / 文档/行号 / 情绪判据 / 用户画像 / 数据清理 / GUI/界面 / Git / 闲聊
 \`\`\`
 
-**开发日志 vs 技术讨论**（最容易混）：
+**三类最容易混的怎么分**：
 - 开发日志 = 做了某事、有过程与验证（改了代码、跑了测试、踩了坑并解决）
 - 技术讨论 = 还在权衡、没落成改动（用户提问、方案比较、认知澄清）
+- **闲聊 = 纯陪伴 / 情感互动，没有技术内容**（打招呼、撒娇、晚安、问我累不累）
 
 ### 兜底通道：正文标记
 
@@ -1398,6 +1920,18 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
 
 **每轮都记，不跳轮。** 不加判断条件 —— 任何判据都会变成省略的理由
 （实测三种判据都导致漏记：只记技术价值 → 闲聊永远不满足，当天漏 12+ 轮）。
+
+> ⚠️ **2026-11-18 现状：这条要求目前没有自动兜底。**
+>
+> 原先靠 \`writeFailStreak\` 阈值 1 + \`steer\` 把模型拉回来补记，但 \`steer\` 会让本轮
+> **不关闭、多跑一步**（用户侧表现为「打嗝」约 8 秒）。已用常量
+> \`WRITE_FAIL_NUDGE_ENABLED = false\` 临时关闭。
+>
+> **也就是说：漏记之后不会被提醒、不会自动补。** 只能靠人工看流水。
+> 恢复方法：把那个常量改回 \`true\`（代码与三次文案迭代的注释全部保留）。
+>
+> 这条写在文档里是为了让下一个人知道**「要求还在、保障没了」** ——
+> 别看到「每轮都记」就以为有机制兜着。
 
 写什么：**对话本身就是有意义的事情，必须记录**。
 
@@ -1473,6 +2007,7 @@ Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" \`
 - 不要用 grep / read / pwsh 直连 \`memory.db\`：它是 SQLite 二进制，
   grep 只会得到乱码，直连又容易误写成写操作。
 - **真查过还是一无所获，才说「这段我没记住」**；不要没查就说，也不要猜、不要编。
+
 `
 
 // ---------------------------------------------------------------- 情绪分析
@@ -2197,22 +2732,16 @@ export function createStore(config) {
   /**
    * 从 policy.md 文本里提取「每轮收尾语」，返回纯句子（不含执行说明）。
    *
-   * 与 apply() 里的 readHeartbeat 逻辑一致，但**这里必须自包含一份**：
-   * syncPolicyOnce 在 createStore 闭包内，拿不到 apply() 里的 readHeartbeat。
-   * 2026-11-16 实测：覆盖 policy.md 时收尾语随旧文件一起丢失，所以覆盖前
-   * 用它把收尾语读出来、覆盖后再写回。
+   * ⚠️ 2026-11-19：**改为调用模块级的 `parseHeartbeatFromPolicy`**。
+   * 原来这里是第 1/4 份自包含实现（原因见下），四份副本各写一套正则，
+   * 我改注入句式时四份同时失配、全部静默返回空串。
+   * 「自包含」在当时是必要的（syncPolicyOnce 在 createStore 闭包内，
+   * 拿不到 apply() 里的 readHeartbeat），但**不必连解析逻辑一起复制** ——
+   * 模块级函数本来就两个闭包都看得见。
    */
   function extractHeartbeat(text) {
     try {
-      const line = text.match(/^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m)
-      if (!line) return ''
-      let rest = line[0]
-      const m = rest.match(/[：:]\s*(.+)$/)
-      if (!m) return ''
-      rest = m[1].trim()
-      rest = rest.split(/这是会话的[「"]?心跳/)[0]
-      rest = rest.split(/用来确认本轮执行完整/)[0]
-      return rest.trim().replace(/[。.]\s*$/, '')
+      return parseHeartbeatFromPolicy(text).value
     } catch {
       return ''
     }
@@ -2238,14 +2767,14 @@ export function createStore(config) {
   async function restoreHeartbeat(text) {
     const current = await readIfExists(paths.policy)
     if (current === undefined) return false
-    const lineRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m
-    const hasLine = lineRe.test(current)
+    // ⚠️ 2026-11-19：改用共享锚点（原来是 4 份副本中的第 3 份）。
+    // 读写必须同一套定位 —— 否则会出现「读得出来、写不回去」。
+    const hasLine = hasHeartbeatLine(current)
     // ⚠️ 与 writeHeartbeat 保持完全一致：只跟踪「缩进续行」，不碰空行和标题。
     // 中间经过两次修正（吞标题 → 留孤儿续行），最终形态见 writeHeartbeat 的注释。
-    const blockRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*(?:\n[ \t]+[^\n]*)*\n?/m
+    const blockRe = pickHeartbeatBlockRe(current)
     const sentence = /[。！？!?…．.]$/.test(text) ? text : `${text}。`
-    const newLine = `- 每轮回复的结尾，加固定一句：${sentence} ` +
-      `这是会话的「心跳」，用来确认本轮执行完整。放在最后一行，不用解释、不用变形。`
+    const newLine = buildHeartbeatLine(sentence)
     let updated
     if (hasLine) {
       // ⚠️ 2026-11-17 修：**必须用函数形式做 replacement**。
@@ -2262,12 +2791,42 @@ export function createStore(config) {
       // 函数形式的返回值**不做 $ 展开**，这是唯一正确的写法。
       updated = current.replace(blockRe, () => `${newLine}\n`)
     } else {
-      const anchor = /^(#{1,2}\s*.*给模型的规则[^\n]*\n)/m
-      // 这里故意**保留** `$1`：那是我们有意的捕获组回填，不是用户输入。
-      // 但 newLine 必须走函数形式，所以在匹配成功时用 replace(anchor, (...args) => ...)。
-      updated = anchor.test(current)
-        ? current.replace(anchor, (_m, heading) => `${heading}\n${newLine}\n`)
-        : `${current.trimEnd()}\n\n${newLine}\n`
+      // ⚠️ 2026-11-20：**不许插到「给模型的规则」标题下第一行。**
+      //
+      // ## 原来的写法（已废弃）
+      //
+      //     const anchor = /^(#{1,2}\s*.*给模型的规则[^\n]*\n)/m
+      //     updated = current.replace(anchor, (_m, heading) => `${heading}\n${newLine}\n`)
+      //
+      // 它插在标题正下方 = 第 2 行。于是「删掉收尾语 → 再填一遍」不幂等：
+      //
+      //   初始（用户实例）          删除后              重新填入后
+      //   1 ## 给模型的规则         1 ## 给模型的规则    1 ## 给模型的规则
+      //   2 - 必须执行 log.ps1      2 - 必须执行         2 - 收尾语   ← 挤进来了
+      //   3 - 收尾语                3 （空）            3 - 必须执行 ← 被挤到第 3 行
+      //
+      // 用户 2026-11-20 实报：「手动删除收尾语再重新填进去，
+      // 『每轮必须无条件执行』就会变成第三行」。
+      //
+      // ## 硬性格式（用户 2026-11-20 定）
+      //
+      //   **第 1 行固定 `## 给模型的规则`，第 2 行固定「每轮必须无条件执行」那条。**
+      //   无论发生什么（初始化覆盖、删收尾语重建、GUI 反复改），这两行都不许动。
+      //
+      // 所以这里改成：**插在该段最后一条 `- ` 规则的后面**，
+      // 让第 2 行那条永远留在原地。找不到任何规则行时才退回标题下。
+      const seg = locateRulesSection(current)
+      if (seg) {
+        const before = current.slice(0, seg.insertAt)
+        const after = current.slice(seg.insertAt)
+        // ⚠️ 用**文件自己的换行符**（`seg.eol`），不要硬写 `\n`。
+        //    本机 policy.md 是 CRLF；混进孤立 LF 会让文件变成混合换行，
+        //    后续按 `\r?\n` 切行的代码仍然能读，但 diff/编辑器会显示异常。
+        updated = `${before}${newLine}${seg.eol}${after}`
+      } else {
+        // 连「给模型的规则」标题都找不到 —— 退回文件末尾（不动任何已有行）
+        updated = `${current.trimEnd()}\n\n${newLine}\n`
+      }
     }
     await atomicWrite(paths.policy, updated)
     return true
@@ -3029,8 +3588,47 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
+  /**
+   * 诊断日志的时间戳：**本地时间，无后缀**（2026-11-18 改）。
+   *
+   * 格式与 `db-store.mjs` 的 `nowIso()` 逐字一致：
+   *   `2026-11-18T21:08:12.375`
+   *
+   * ## 为什么不用 `toISOString()`
+   *
+   * `toISOString()` 按规范**永远输出 UTC**，与机器时区无关。原来就用了它，
+   * 于是产生一处**同一天里能看见的错位**：
+   *
+   *   · 文件名 `localDay()` 是**本地日期**（getFullYear/getMonth/getDate）
+   *   · 行首时间戳却是 **UTC**
+   *
+   * 本地每天 00:00–08:00（UTC+8）这 8 小时里，UTC 还停在**前一天**，
+   * 所以 `2026-11-19.log` 里会整片出现 `2026-11-18T…Z` —— 文件名说 19 号、
+   * 每行内容说 18 号。任何人按「行首日期 = 文件名的日期」核对都会对不上。
+   *
+   * 用户 2026-11-18 定调：「写入流水的时候日志时间就和北京时间不一致」
+   * 不能接受，两者必须统一。而 `memory.db` 的 `ts` 早已统一为本地时间
+   * （见 db-store.mjs 的 nowIso 注释，2026-11-14），只剩诊断日志这一处没跟上。
+   *
+   * ## 为什么不用「存 UTC、显示再 +8」
+   *
+   * 那要求**每一处读取都记得转换**，漏一处就差 8 小时，而且不报错。
+   * 本机单用户、单时区，直接记本地时间没有歧义（与 nowIso 同一取舍）。
+   *
+   * ⚠️ 改这个格式**必须同步改** `_dbpreview/selfcheck-log-alive.mjs` 的 `TS_RE`：
+   *    它原来硬要求末尾带 `Z`，只改这一处会让正则匹配不上、
+   *    进而把「解析不到时间戳」误报成「进程已死」。
+   */
+  const diagTimestamp = (date = new Date()) => {
+    const p = (n, w = 2) => String(n).padStart(w, '0')
+    return (
+      `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}` +
+      `T${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}.${p(date.getMilliseconds(), 3)}`
+    )
+  }
+
   const diag = (stage, detail) => {
-    const line = `${new Date().toISOString()} [${stage}] ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`
+    const line = `${diagTimestamp()} [${stage}] ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`
     appendDiag(line)
   }
 
@@ -3357,7 +3955,31 @@ export function apply(ctx, rawConfig = {}) {
           ? `## 全局规则\n⚠️ 超预算已截断（${used}/${b} 字节），其余仍在 policy.md，不要重复补写。`
           : `## 全局规则<!-- 用量 ${used}/${b} 字节 -->`,
       )
-      parts.push(policy.text.trim())
+      // ★ 2026-11-19 实验：给「写流水」那一行加递增序号，强制它每轮 cache miss。
+      //
+      // ## 为什么做这个实验
+      //
+      // 实测（2026-11-19，433 个 step）：84.8% 的 step miss < 2000 token，
+      // 说明注入段**一直命中缓存**。而 `policy.md` 那条「立即执行 log.ps1」
+      // 也在命中区里 —— 模型拿到的是「算好的旧状态」，不是每轮重新读一遍。
+      //
+      // 用户假设：**规则是 cache miss 时才真正"新鲜"**，命中时它只是背景。
+      // 本实验让那一行每轮字节都不同（追加不可见分隔符 + 递增序号），
+      // 使它必然未命中，从而可以观察「写了流水」的概率是否变化。
+      //
+      // ## 成本（实测口径，不是估算）
+      //
+      // 本会话 433 step，若每 step 多 2000 miss → +866,000 tokens
+      // → 按 1 元/M 计 **约 0.87 元**。这是上限，实际更低。
+      //
+      // ## 怎么关掉
+      //
+      // 把 `POLICY_INJECT_SEQ` 改成 `false` 即可（下面所有逻辑原样保留）。
+      const seqText =
+        POLICY_INJECT_SEQ && injectSeqEnabled()
+          ? appendInjectSeq(policy.text.trim(), nextInjectSeq())
+          : policy.text.trim()
+      parts.push(seqText)
     }
 
     // 项目段
@@ -3441,7 +4063,10 @@ export function apply(ctx, rawConfig = {}) {
           //     - summary=1 两段式、不去重、查不到就说没记住
           //   自检：_dbpreview/verify-injection-consistency.mjs 与
           //         _dbpreview/selfcheck-injection-wording.mjs 断言了上面这些词。
-          '## 写记忆：用 HTTP 接口，不要写进正文（2026-11-16 起）',
+          // ⚠️ 2026-11-18：标题改成「一行脚本」。下面正文早已改成脚本优先，
+          //    标题却还写着「用 HTTP 接口」—— 标题与正文不一致会让人（和模型）
+          //    只读标题就以为要手拼参数。**改正文时必须连标题一起改。**
+          '## 写流水：一行命令（2026-11-18 起）',
           // ★ 2026-11-16 大改：写入通道从「正文标记」换成「pwsh POST」。
           //
           // 用户定调：「占屏和闪，是同一件事的两种状态」。
@@ -3480,11 +4105,37 @@ export function apply(ctx, rawConfig = {}) {
           //    · cwd —— 不传会按进程 cwd 解析 scope，实测会写到 `desktop` 这种错项目里；
           //    · sessionId —— 不传流水照样写进去，但 writeFailStreak 会认为「本轮没写」，
           //      连续 2 轮后误报。两者都是**静默**出错，所以宁可命令行长一点。
-          `**写流水**（一个动作，不是纪律）：回复用户之前调用一次 →` +
-            `pwsh 里 \`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='本轮正文';cwd=(Get-Location).Path;sessionId=$env:DSH_SESSION_ID} | ConvertTo-Json)\`。` +
-            `topic 与 summary 可省 —— 服务端会补默认 topic、并从正文截取摘要。` +
-            `**省掉 cwd 会写错项目，省掉 sessionId 会被误判成没写**，这两个必带。` +
-            `写什么：**对话本身就是有意义的事情**。正文 ≤150 字（最多 5 行）。`,
+          // ★ 2026-11-18：**改成「一行脚本」，长命令降为兜底**。
+          //
+          // ## 为什么改（有对照组，不是感觉）
+          //
+          // 用户配置的「每轮收尾语」—— 一句固定文字 —— 从未漏过一次
+          // （用户原话：「收尾语设定后 在程序正常的情况下 我没见过一次遗漏的」）。
+          // 而同一套注入里的「写流水」实测漏 58%。
+          //
+          // 差别不在意愿，在**决策数量**：
+          //   收尾语 = 0 个决策（文字固定）
+          //   写流水 = 6 个决策（想内容 / 压 150 字 / 选 topic / 写 summary /
+          //                      拼 JSON / 记住两个必填参数）
+          //
+          // 脚本把这六个压成**一个**：括号里说一句什么。
+          // `cwd` / `sessionId` / JSON 编码 / POST 方法 / Content-Type
+          // 全部固化在脚本里（见 `WORKSPACE_LOG_PS1`）。
+          //
+          // ## 为什么保留长命令
+          //
+          // 脚本是懒创建的：只有该工作区发生过一次会话、且 `agent/created`
+          // 跑过之后才有。新工作区的**第一轮**可能还看不到它。
+          // 所以长命令必须留着 —— 但明确标注为「没有脚本时才用」，
+          // 避免模型在两条路之间犹豫（犹豫也是一种决策成本）。
+          `**写流水**（一个动作）：回复用户之前调用一次 → ` +
+            `pwsh 里执行 \`& .\\.dsh-fatfishdream-memory\\log.ps1 "一句话结论"\`。` +
+            `括号里那句是**唯一要想的事**（正文 ≤150 字，最多 5 行）；` +
+            `cwd / sessionId / topic / summary 全部由脚本和服务端补，不用你操心。` +
+            `**脚本不存在时**（新工作区首次对话可能还没生成）才退回长命令：` +
+            `\`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType 'application/json' -Body (@{text='本轮正文';cwd=(Get-Location).Path;sessionId=$env:DSH_SESSION_ID} | ConvertTo-Json)\`` +
+            `（**省掉 cwd 会写错项目，省掉 sessionId 会被误判成没写**，这两个必带）。` +
+            `写什么：**对话本身就是有意义的事情**。`,
           // ★ 2026-11-17 17:14：**注入轻量化**（用户定「只做兜底，注入可以更轻」）。
           //
           // ## 删掉了什么
@@ -3528,7 +4179,7 @@ export function apply(ctx, rawConfig = {}) {
           //
           // 注意：走 HTTP 通道后这条对主路径不再适用（正文里没有标记了），
           // 但它仍是**退化路径**的约束，所以保留在上一行里，不再单占一行。
-          'topic 必须是 13 类之一（写错会被拒收）；summary、topic 必带。只写流水 —— 规则与画像由用户在 GUI 维护，**不要写**。',
+          'topic 必须是 14 类之一（写错会被拒收）；summary、topic 必带。只写流水 —— 规则与画像由用户在 GUI 维护，**不要写**。',
           '**绝不能** write / edit / pwsh 碰 memory.db —— 会损坏数据库（走上面的接口）。',
           // ★ 2026-11-16 用户纠正：「用户不是非要在做工作的时候才来找你说话，
           // 有时候就仅仅是想要闲聊」。
@@ -3800,6 +4451,28 @@ export function apply(ctx, rawConfig = {}) {
   const TOPIC_WHITELIST = [
     '开发日志', '技术讨论', '构建/编译', '注入/预算', '插件/装载', '路径/沙箱',
     '格式/编码', '文档/行号', '情绪判据', '用户画像', '数据清理', 'GUI/界面', 'Git',
+    // ★ 2026-11-20 新增第 14 类（用户要求）。
+    //
+    // ## 为什么需要它
+    //
+    // 原来的 13 类里，**纯陪伴 / 情感互动轮没有归属**：
+    // 「开发日志」要求「做了某事、有过程与验证」，「技术讨论」要求「在权衡方案」——
+    // 而「用户说抱抱」、「晚安」、「我饿了」这类轮次两者都不沾。
+    //
+    // 实测（2026-11-20 查库）：这类轮次的流水被硬塞进「开发日志」，
+    // 内容形如「用户撒娇喊老婆，本轮不推进任何工作」。**分类与内容不符**，
+    // 让「记忆索引」里「开发日志」的计数虚高，也让按类检索失真。
+    //
+    // ## 为什么不是「留空」
+    //
+    // `topic` 留空时该条**不进「记忆索引」**（`routeTable` 过滤 `topic IS NOT NULL`），
+    // 于是这类轮次在索引里彻底隐形 —— 那和漏记没区别。
+    // 给一个能明确表示「没有技术内容」的分类，比留空更诚实。
+    //
+    // ⚠️ 新增分类必须同步四处（见 `_dbpreview/selfcheck-topic-clean.mjs` 的断言）：
+    //    ① 本数组 ② `POLICY_TEMPLATE` 里的清单与计数 ③ `usageLines` 的「14 类」文案
+    //    ④ 两个 README + 维护手册。漏掉 ③ 会让每轮注入说错数字。
+    '闲聊',
   ]
   function sanitizeTopic(raw) {
     if (typeof raw !== 'string') return null
@@ -4071,6 +4744,34 @@ export function apply(ctx, rawConfig = {}) {
               heartbeatLast: isHeartbeatLast(text, hbText),
             })
           }
+
+          // ---- 按轮攒收尾语快照，等 turn/end 时判定（2026-11-18）----
+          //
+          // 这里只**收集**，不判断、不告警、不干预 —— 判定放在 `turn/end`
+          // 监听器里做，因为那里才是「代码侧确认的正式结束标记」。
+          //
+          // 为什么收 `archiveText` 而不是 `text`：`archive` 里存的是剥离后的
+          // 正文（C1-A `stripHeartbeatFromToolStep` 会把补记步骤的收尾语剥掉）。
+          // 若这里用剥离前的 `text`，判定结果会和「用户实际看到/库里实际存的」
+          // 不一致 —— 那正是 `AGENTS.md` 记过的「两个口径混用」那类坑。
+          // 上面 `archive-assistant` 的 `heartbeat` 字段仍用剥离前的 `text`：
+          // 它记的是「模型原样输出了什么」，是另一个用途，两者都对，但不能混。
+          if (session !== undefined && session !== null && Number.isInteger(payload.turn)) {
+            try {
+              const sKey = session.id === undefined ? null : String(session.id)
+              if (sKey !== null) {
+                const k = turnHeartbeatKey(sKey, payload.turn)
+                const rec = turnHeartbeats.get(k) ?? { count: 0, messages: 0, withoutHeartbeat: 0 }
+                const strippedCount = countHeartbeat(archiveText, hbText)
+                rec.messages += 1
+                rec.count += strippedCount ?? 0
+                if (strippedCount === 0) rec.withoutHeartbeat += 1
+                turnHeartbeats.set(k, rec)
+              }
+            } catch {
+              // 快照失败只影响观测，绝不影响归档
+            }
+          }
         } catch (e) {
           diag('archive-write-failed', { role: 'assistant', message: String(e?.message ?? e) })
         }
@@ -4293,20 +4994,22 @@ export function apply(ctx, rawConfig = {}) {
   function readHeartbeat() {
     try {
       const text = readFileSync(store.paths.policy, 'utf8')
-      // 匹配那一行，取出「加固定一句：」之后的部分
-      const line = text.match(/^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m)
-      if (!line) return ''
-      let rest = line[0]
-      // 切掉前缀，只留句子
-      const m = rest.match(/[：:]\s*(.+)$/)
-      if (!m) return ''
-      rest = m[1].trim()
-      // 切掉尾部的执行说明。它总是以「这是会话的『心跳』」或「用来确认」开头，
-      // 也可能用户手写过别的写法 —— 这里只认这两种稳定特征，其余保留。
-      rest = rest.split(/这是会话的[「"]?心跳/)[0]
-      rest = rest.split(/用来确认本轮执行完整/)[0]
-      return rest.trim().replace(/[。.]\s*$/, '')
-    } catch {
+      // ⚠️ 2026-11-19：改为共享解析器（原来是 4 份副本中的第 2 份）。
+      // 详见 `parseHeartbeatFromPolicy` 的注释。
+      const parsed = parseHeartbeatFromPolicy(text)
+      if (!parsed.found) return ''
+      if (parsed.value === '') {
+        // 行在、但截不出句子 —— 这是**格式坏了**，不是「用户没配」。
+        // 旧实现两者都返回 ''，于是这里静默了整整一天。
+        diag('heartbeat-parse-failed', {
+          reason: 'line-found-but-empty',
+          preview: parsed.raw.slice(0, 120),
+        })
+        return ''
+      }
+      return parsed.value
+    } catch (error) {
+      diag('heartbeat-parse-failed', { reason: String(error?.message ?? error) })
       return ''
     }
   }
@@ -4372,8 +5075,8 @@ export function apply(ctx, rawConfig = {}) {
       }
     }
 
-    const lineRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m
-    const hasLine = lineRe.test(current)
+    // ⚠️ 2026-11-19：改用共享锚点（原来是 4 份副本中的第 4 份）。
+    const hasLine = hasHeartbeatLine(current)
 
     let updated
     // 匹配「收尾语那一行 + 它的**缩进续行**」，不碰空行、不碰标题。
@@ -4392,33 +5095,95 @@ export function apply(ctx, rawConfig = {}) {
     // 正确形态是只跟踪「以空格/tab 开头的续行」：`(?:\n[ \t]+[^\n]*)*\n?`
     //   - 匹配折行续行 ✅（不留孤儿）
     //   - 不匹配空行 → 标题安全 ✅
-    const blockRe = /^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*(?:\n[ \t]+[^\n]*)*\n?/m
+    //
+    // 2026-11-19：正则体本身挪进 `heartbeatBlockRe()`，与读写锚点同源。
+    const blockRe = pickHeartbeatBlockRe(current)
 
     if (text === '') {
       if (!hasLine) return ''
-      updated = current.replace(blockRe, '')
+      // ⚠️ 2026-11-19：**两条正则各删一次**，不能靠 `pickHeartbeatBlockRe` 二选一。
+      //
+      // 起因（子代理实测复现）：`pickHeartbeatBlockRe` 只看文件里**含不含**新锚点，
+      // 含就只用新正则。于是当 `policy.md` 里**旧句式和新句式各留一行**时
+      // （手工迁移了一半 / 从备份粘回一行），删除只命中新那句：
+      //
+      //     删除后仍含旧句 = true    ← 接口却返回 `''`（表示已删）
+      //     hasHeartbeatLine ⇒ true  ← `readHeartbeat` 下次又读得出来
+      //
+      // 后果：GUI 点「清空收尾语」→ 提示成功 → 刷新后还在。**静默不彻底。**
+      //
+      // 两条正则都保持「只吃行 + 缩进续行」的形态，对不命中的正则 `replace` 无副作用，
+      // 所以不会破坏「不吞标题 / 不留孤儿续行」那两条防线。
+      updated = current.replace(heartbeatBlockReNew(), '').replace(heartbeatBlockRe(), '')
     } else {
-      // 用户在 GUI 里只输入那句话本身；执行说明由这里补全，
-      // 不要求用户维护「这是会话的心跳…」那半段。
-      // 但如果用户自己写了完整句子（已经含说明），就别重复追加。
-      const alreadyFull = /这是会话的[「"]?心跳|用来确认本轮执行完整/.test(text)
-      // 句末已有标点就不再补句号，避免出现「任务！。」这种双标点
+      // 用户在 GUI 里只输入那句话本身；执行说明由这里补全。
+      //
+      // ⚠️ 2026-11-19：写入格式必须与 `parseHeartbeatFromPolicy` 的锚点同源 ——
+      //    原来这里仍写老句式「每轮回复的结尾，加固定一句：…」，
+      //    而读取已换成新锚点，**写进去就读不出来**（互为逆运算这条被违反）。
+      //    现在统一走 `buildHeartbeatLine`。
+      //
+      // 句末标点：用户输入通常不带叹号，这里统一补一个，让回执读起来完整。
       const endsWithPunct = /[。！？!?…．.]$/.test(text)
       const sentence = endsWithPunct ? text : `${text}。`
-      const newLine = alreadyFull
-        ? `- 每轮回复的结尾，加固定一句：${text}`
-        : `- 每轮回复的结尾，加固定一句：${sentence} ` +
-          `这是会话的「心跳」，用来确认本轮执行完整。放在最后一行，不用解释、不用变形。`
+      const newLine = buildHeartbeatLine(sentence)
       if (hasLine) {
         // ⚠️ 2026-11-17 修：同 restoreHeartbeat —— 必须用函数形式。
         // replacement 字符串里的 `$&` / `` $` `` / `$'` 会展开，
         // 用户写一个 `$` 就能把整份 policy.md 的结构改坏。见那段的长注释。
         updated = current.replace(blockRe, () => `${newLine}\n`)
       } else {
-        const anchor = /^(#{1,2}\s*.*给模型的规则[^\n]*\n)/m
-        updated = anchor.test(current)
-          ? current.replace(anchor, (_m, heading) => `${heading}\n${newLine}\n`)
-          : `${current.trimEnd()}\n\n${newLine}\n`
+        // ⚠️ 2026-11-18 修：这里原来是 `${heading}\n${newLine}\n` ——
+        //    那个额外的 `\n` 是**净增**的换行，会让空行在反复操作里累积。
+        //
+        // ## 实测（用户 2026-11-18 报，随即 node 复现）
+        //
+        // 用户在 GUI 里反复「删掉收尾语 → 再写一遍」，发现收尾语下方
+        // 的空行越来越多、policy.md 行号逐步下移。
+        //
+        // 复现（模拟 4 轮 删除→加回）：
+        //   起始空行 1 → 1→2、2→3、3→3、4→4（现行，累积）
+        //   修后      → 1、1、1、1（稳定）
+        //
+        // ## 为什么是净增
+        //
+        //   删除走 `blockRe.replace(x, '')` —— 它吞「行 + 缩进续行 + 一个换行」，
+        //   **不吞行前面的空行**（那个空行属于上一条目，不能动）。
+        //   加回走 anchor 分支时又插一个 `\n`，于是一删一加净 +1。
+        //
+        // ## 为什么不能改 `blockRe` 去吞前置空行
+        //
+        //   那个正则上面有 2026-11-16 两次事故的长注释（吞标题、留孤儿续行），
+        //   而前置空行属于**前一条规则**的边界，吞掉会破坏别人的排版。
+        //   用户 2026-11-18 明确：「只能吞掉后面的换行」。
+        //
+        // `heading` 的正则已经以 `\n` 结尾，所以直接拼 `newLine` 即可。
+        //
+        // ⚠️ 2026-11-20：**不许插到「给模型的规则」标题下第一行。**
+        //    原来是 `anchor` 插到标题正下方 = 第 2 行，于是
+        //    「删掉收尾语 → 再填一遍」不幂等：
+        //
+        //      初始（用户实例）          删除后              重新填入后
+        //      1 ## 给模型的规则         1 ## 给模型的规则    1 ## 给模型的规则
+        //      2 - 必须执行 log.ps1      2 - 必须执行         2 - 收尾语   ← 挤进来
+        //      3 - 收尾语                3 （空）            3 - 必须执行 ← 被挤走
+        //
+        //    用户 2026-11-20 实报：「手动删除收尾语再重新填进去，
+        //    『每轮必须无条件执行』就会变成第三行」。
+        //
+        //    **硬性格式（用户定）：第 1 行 `## 给模型的规则`、
+        //      第 2 行「每轮必须无条件执行」那条 —— 任何操作都不许动这两行。**
+        //
+        //    所以改成插在「该段最后一条 `- ` 规则之后」，永远够不到第 2 行。
+        const seg = locateRulesSection(current)
+        if (seg) {
+          const before = current.slice(0, seg.insertAt)
+          const after = current.slice(seg.insertAt)
+          // ⚠️ 同 restoreHeartbeat：用文件自己的换行符，不硬写 `\n`
+          updated = `${before}${newLine}${seg.eol}${after}`
+        } else {
+          updated = `${current.trimEnd()}\n\n${newLine}\n`
+        }
       }
     }
 
@@ -4478,6 +5243,45 @@ export function apply(ctx, rawConfig = {}) {
         sessionId: sid,
         seq: event.seq ?? null,
       })
+
+      // ---- 收尾语按轮判定（2026-11-18）----
+      //
+      // `turn/end` 是**代码侧确认的「本轮正式结束」标记** —— 用户 2026-11-17
+      // 为此定调：「这轮对话是否完成，我们两个都决定不了，而是代码侧决定的。」
+      //
+      // 所以收尾语的对错在这里判，而不是靠模型猜「我这条算不算结束」：
+      //   · count === 0        → 整轮一条都没有（模型猜「还没结束」，猜到轮也没结束）
+      //   · count >  1         → 一轮出现多条（模型把一次回答切成几段，每段都当结尾）
+      //   · count === 1 且不在末条 → 加了但后面还有消息（收尾语位置不对）
+      //
+      // ⚠️ **本段只观测，不改任何行为**：
+      //    不写库、不 steer、不剥离、不动 archive。理由与 turn/end 首次接入时一致
+      //    （「当前阶段：只诊断，不做任何事」），先把真实分布拿到手，再决定怎么治。
+      //    绝不能在没有数据支撑的情况下直接动手 —— 那是文案三版失败的老路。
+      //
+      // ⚠️ 快照必须在**判定后立刻删**，否则长会话里 Map 会一直涨。
+      if (sid !== null && Number.isInteger(turn)) {
+        const key = turnHeartbeatKey(sid, turn)
+        const rec = turnHeartbeats.get(key)
+        turnHeartbeats.delete(key)
+        if (rec !== undefined && rec.messages > 0) {
+          const verdict =
+            rec.count === 0 ? 'missing' : rec.count > 1 ? 'duplicated' : 'ok'
+          diag('heartbeat-turn-verdict', {
+            turn,
+            verdict,
+            count: rec.count,
+            messages: rec.messages,
+            withoutHeartbeat: rec.withoutHeartbeat,
+          })
+        }
+        // 防御性清理：万一某轮没有 turn/end（崩溃/中断），快照不能永久滞留。
+        // 只在超过 500 条时裁掉最旧的 —— 正常路径下每条都会被 turn/end 删掉。
+        if (turnHeartbeats.size > 500) {
+          const oldest = turnHeartbeats.keys().next().value
+          turnHeartbeats.delete(oldest)
+        }
+      }
     } catch (error) {
       // 绝不能因为观测代码让主流程出错
       logger.warn?.(`[dsh-memory] turn/end 观测失败：${error?.message ?? error}`)
@@ -4847,6 +5651,38 @@ export function apply(ctx, rawConfig = {}) {
   const logRouteHits = new Map()
 
   /**
+   * sessionId → 本轮各条 assistant 消息的收尾语快照（2026-11-18）。
+   *
+   * ## 为什么需要它
+   *
+   * 收尾语规则是「每轮回复的结尾加一句」。但**模型看不见「轮」的边界** ——
+   * 它只能猜「我这条算不算结束」。实测两种失败形态都来自这个猜测：
+   *   · 猜错成「结束了」但后面还在输出 → 一轮出现多条收尾语（打嗝）
+   *   · 猜「还没结束」→ 整轮一条都没有
+   *
+   * 用户 2026-11-17 定调过（见 `turn/end` 监听器那段注释）：
+   * **「这轮对话是否完成，我们两个都决定不了，而是代码侧决定的。」**
+   *
+   * 所以这里把「每条消息带不带收尾语」按轮攒起来，等 `turn/end` 那一刻
+   * （代码侧确认的正式结束标记）再一次性判定。
+   *
+   * ## 为什么按 `sessionId|turn` 分键
+   *
+   * 同一个工作区可以有多个会话并发，`turn` 号在不同会话里会重复
+   * （2026-11-18 实测：今天 11 个会话共 143 次 turn-end）。
+   * 只按 turn 分键会把别的会话的消息算进本轮 —— C4 分键问题同源。
+   *
+   * ## 只存必要字段
+   *
+   * 不存正文（正文已在 `archive` 里），只存「这条带几处、末行是不是」。
+   * 轮次结束时整条记录删掉，不跨轮累积。
+   */
+  const turnHeartbeats = new Map()
+
+  /** `sessionId|turn` → 该轮的收尾语快照 { count, messages } */
+  const turnHeartbeatKey = (sessionKey, turn) => `${sessionKey}|${turn}`
+
+  /**
    * sessionId → 连续「写入失败」的轮数。
    *
    * ## 为什么单独一个 Map（2026-11-16）
@@ -4905,6 +5741,21 @@ export function apply(ctx, rawConfig = {}) {
    * 原为 2，再往前是 4。取值理由见上面 `writeFailStreak` 的注释。
    */
   const WRITE_FAIL_STREAK_LIMIT = 1
+
+  /**
+   * 「本轮没写流水就 steer 提醒补记」这条兜底通道的总开关（2026-11-18）。
+   *
+   * **当前为 `false`** —— 用户决定先关掉试用，不是删除。
+   * 关闭理由、代价、恢复前该确认什么，全部写在 `turn-stopping` 里调用点的注释中。
+   *
+   * 为什么做成常量而不是直接删代码：
+   *   1. 删掉就回不来，而这条兜底历史上确实兜住过绝大多数轮次；
+   *   2. 下面那三次文案迭代的血泪注释要留着 —— 删了等于把教训一起扔掉；
+   *   3. 改回 `true` 只动一个字符，恢复成本最低。
+   *
+   * ⚠️ 关闭期间**漏记没有兜底**，只能靠人工看流水。
+   */
+  const WRITE_FAIL_NUDGE_ENABLED = false
 
   /**
    * 本轮是否已经 steer 过 —— 防无限循环的闸门。
@@ -5258,7 +6109,28 @@ export function apply(ctx, rawConfig = {}) {
       // ⚠️ 用 delete 而不是 set(0)：删掉才是真正的「这一轮结束」，
       //    留下一个 0 会让 has() 判据下次误以为已经打过点。
       turnStartedAt.delete(sessionKey)
-      logRouteHits.delete(sessionKey)
+      // ★ 2026-11-20 修：`logRouteHits` 的清理**移出这里**，交给 `turn/end`。
+      //
+      // ## 原来的 bug（实测 17/17 次）
+      //
+      // 这里原来写的是 `logRouteHits.delete(sessionKey)`，而 `turn-stopping`
+      // 是 **serial、先于** `turn/end` 执行。于是 `turn/end` 里补记的判据
+      //
+      //     const routeHits = logRouteHits.get(sid) ?? 0
+      //
+      // **永远读到 undefined → 恒为 0**。实测证据：
+      //   · 全部日志里 17 次 `backfill-check`，`routeHits` 分布是 `0 → 17 次`，
+      //     一次都没出现过非 0；
+      //   · 17 组同轮对照，`write-streak-check` **全部**早于 `backfill-check`。
+      //
+      // 后果不只是「少一道保险」：`wroteCount > 0 || routeHits > 0` 实际退化成
+      // `wroteCount > 0`。而 `turnLogWrites` 在 `turn-stopping` 里也会被重置，
+      // 所以「本轮调过 /log 但没被认账」这种形态（传错 sid / 被 topic 白名单拒）
+      // 会被判成「没写」→ **重复补一条已经写过的轮次**。
+      //
+      // 为什么不能简单删掉这一行：不清理会长住（Map 无限增长），
+      // 而且下一轮会读到上一轮的计数（`logRouteHits` 是按 sid 的，不按 turn）。
+      // 所以是**移位置**，不是**删逻辑** —— 见 `turn/end` 里那段清理。
 
       // ---- 写操作提醒已取消（2026-11-13）----
       //
@@ -5274,8 +6146,40 @@ export function apply(ctx, rawConfig = {}) {
       // 所以改成两件事：
       //   1. 把「什么时候该记」写进注入，让模型有据可依（见 finishInjection）
       //   2. 这里只留一行诊断日志，不再打断对话；漏记时事后可追溯
-      if (record !== undefined && record.writes > 0 && !record.wroteMemory) {
-        diag('turn-未记流水', { writes: record.writes, note: '有写操作但未写记忆（仅记录，不打扰）' })
+      // ⚠️ 2026-11-20 修：判据从 `wroteMemory` 改为「本轮到底写没写流水」。
+      //
+      // ## 原判据为什么恒真（实测复现）
+      //
+      // 原来是 `record.writes > 0 && !record.wroteMemory`。而 `wroteMemory`
+      // 只在 `tools/result` 的 `file_path` 落在 **`store.root` 里面**时才置位
+      // （见上面 L5644 附近那段）。可 2026-11-18 之后写流水走的是
+      // 工作区脚本 `.dsh-fatfishdream-memory/log.ps1`，它位于 `D:\workspace\...`，
+      // 而 `store.root` 是 `D:\dsh-fatfishdream-memory` —— **永远不在同一棵树**。
+      //
+      // 于是 `wroteMemory` 恒为 false → 只要本轮动过文件就必报「未记流水」。
+      // 实测 2026-11-20 当天 6 条全部假阳性（01:19 / 01:20 / 01:26 / 01:41 /
+      // 02:08 / 02:13），其中 02:08 那条在**7 秒前刚成功写入 id=1078**。
+      // 准确率 0% —— 这条诊断不但没用，还在污染「漏记率」这个数字。
+      //
+      // ## 新判据
+      //
+      // 两道条件都要满足才算「没写」：
+      //   ① `record.wroteLog !== true`  —— `/log` 路由没被认账过
+      //   ② `logRouteHits === 0`        —— 连尝试都没有
+      //
+      // 之所以两个都要：`wroteLog` 要求 `sessionId` 正确，若模型 POST 时
+      // 漏传/传错 sid，服务端会「宁可漏计数」而不置位；这时 `logRouteHits`
+      // 仍会涨（它是按请求计数的）。**两者不一致恰恰说明是计数器问题而非没写**,
+      // 那正是源码里那条断点注释想要区分的情形。
+      //
+      // 判据本身由 `_dbpreview/selfcheck-write-miss-crosscheck.mjs` 的第 ② 段守着。
+      if (
+        record !== undefined &&
+        record.writes > 0 &&
+        record.wroteLog !== true &&
+        (logRouteHits.get(sessionKey) ?? 0) === 0
+      ) {
+        diag('turn-未记流水', { writes: record.writes, note: '有写操作但未写流水（仅记录，不打扰）' })
       }
 
       // ---- 连续未写流水提醒（2026-11-16 v2，用户要求兜底）----
@@ -5337,6 +6241,32 @@ export function apply(ctx, rawConfig = {}) {
       // 看漏记到底集中在哪一类 —— 现在只能猜。
       //
       // ⚠️ 全部取自已有变量或廉价计算，不新增 I/O、不写 memory.db。
+      //
+      // ★★ 统计陷阱（2026-11-18 实踩，看到这行请先读完再动统计）★★
+      //
+      // 下面这行 diag **没有 sessionId 字段**，而 `turn` 是**每个会话各自
+      // 从 1 数起**的。同一天 11 个会话并发时，同一个 turn 号会出现 4~6 次：
+      //
+      //     实测 turn=1 出现 4 次（22:41 / 02:10 / 03:33 / 05:59，四个会话）
+      //     实测 turn=4 出现 5 次，其中两次 wroteThisTurn 相反
+      //     → 同 turn 号多次出现 58 组，其中结果互相矛盾 52 组
+      //
+      // 后果：**任何按 turn 号聚合历史的做法都会串账，而且不报错** ——
+      // 算出来的是一个看起来成立、实际把几个会话混在一起的数字。
+      //
+      // 实证代价：交接单曾写下「全天 62/88 = 70% 漏记率」，事后复核发现
+      // 88 与「不同 turn 号个数 89」几乎重合 → 那个分母就是按 turn 号去重的。
+      // 按 (sessionId, turn) 正确配对后是 57.6%（129/224）；只按 streak-check
+      // 全量是 59.7%（194/325）。**三个数都不是 70%**，62 这个分子至今
+      // 复现不出来。（以上是 2026-11-18 当天的快照，别当常量用。）
+      //
+      // ⚠️ 别把这个陷阱写成一条「统计时要小心」的规矩 —— 没用的：
+      //    AGENTS.md 里「必须按 user-message → turn-stopping 切轮」早就写着，
+      //    照样被违反。**缺陷在数据层，不在记性层。**
+      //    `sessionKey` 在本回调开头就已算好、就在当前作用域里，
+      //    只是没被 emit 出来。要治就把它加进下面的 diag ——
+      //    让错口径**根本算不出来**，而不是指望下一个人记得小心。
+      //    （本次刻意没加：只写注释，补字段要单独授权。）
       diag('write-streak-check', {
         streak: failStreak,
         wroteThisTurn,
@@ -5354,6 +6284,20 @@ export function apply(ctx, rawConfig = {}) {
         // 以前这个字段被丢掉了，只能靠 streak 数轮次。
         turn: bpTurn,
         turnWrites: bpTurnWrites,
+        // ⚠️ 2026-11-20 修：**必须有 sessionId**。
+        //
+        // 上面的长注释（「统计陷阱」那段）已经写明：`turn` 是**每个会话各自
+        // 从 1 数起**的，同一天多会话并发时同一个 turn 号会出现 4~6 次。
+        // 没有 sessionId，任何按 turn 号聚合历史的做法都会**串账且不报错** ——
+        // 算出来的是一个看起来成立、实际把几个会话混在一起的数字。
+        //
+        // 当时只写了注释没加字段（「补字段要单独授权」）。2026-11-20 实盘
+        // 复核漏记率时立刻撞上：按 turn 聚合的算法把 4 个 11 毫秒的临时会话
+        // 也算成了漏记轮次，覆盖率被稀释成 60%。
+        //
+        // 教训与源码里那句一致：**缺陷在数据层，不在记性层**。
+        // 让错口径根本算不出来，而不是指望下一个人记得小心。
+        sessionId: sessionKey,
       })
       // ---- 兜底提醒（2026-11-17 16:26 改为阈值 1 + 防无限循环）----
       //
@@ -5372,7 +6316,32 @@ export function apply(ctx, rawConfig = {}) {
       // 第二次仍没写也认 —— **宁可漏一次，也不能循环**。
       const guardKey = `${FATFISH_STEER_GUARD_KEY}:${sessionKey}`
       const alreadyNudgedThisTurn = Number.isInteger(bpTurn) && fatfishSteerGuard.get(guardKey) === bpTurn
-      if (failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn) {
+      // ★★★ 2026-11-18 18:2x：兜底补记**已临时关闭**（用户决定，不是删除）★★★
+      //
+      // ## 为什么关
+      //
+      // 现在有了工作区短命令脚本（`.dsh-fatfishdream-memory/log.ps1`），
+      // 写流水从「手拼六个参数」压成「敲一行」，漏记的主要成因（决策太多）被消掉。
+      // 而这条兜底的代价一直很实在：
+      //
+      //   · `steer` 会让本轮**不关闭、多跑一步** → 用户侧表现为「打嗝」8.4 秒
+      //   · 补记那一步会留下一条 1 字节的 `✔` 消息（今天本会话 14 条）
+      //   · 它的判据（`turnActivity.wroteLog`）与「我直接 POST」是两套口径，
+      //     实测 turn 43 / 44 明明写过了仍然照发提醒 —— **它一直在误判**
+      //
+      // ## 关掉之后会怎样（用户已知情并接受）
+      //
+      // 漏记**不再有兜底**。用户原话：「先用着，我会随时去看流水。」
+      // 也就是说：这一段时间靠人工巡检，不靠自动提醒。
+      //
+      // ## 为什么用常量开关而不是删代码
+      //
+      // 删掉就回不来了，而这条兜底是有真实价值的（历史上兜住过 77/79 轮）。
+      // 留常量 = 一行改回 true 即可恢复，且下面所有注释与逻辑原样保留 ——
+      // 那些注释记录了三次失败的文案迭代，删了等于把教训一起扔掉。
+      //
+      // ⚠️ 恢复前先确认：脚本是否已在各工作区铺开、`wroteThisTurn` 的误判是否已修。
+      if (WRITE_FAIL_NUDGE_ENABLED && failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn) {
         if (Number.isInteger(bpTurn)) fatfishSteerGuard.set(guardKey, bpTurn)
         const delivered = safePushMessage(
           agent,
@@ -5492,8 +6461,65 @@ export function apply(ctx, rawConfig = {}) {
     }
   })
 
-  // ---- 会话建立：登记项目 + 隔天整理提醒 ----
+  // ---- 会话建立：落工作区脚本 + 登记项目 + 隔天整理提醒 ----
   safeOn('agent/created', async ({ agent, source }) => {
+    // ---- 工作区短命令脚本（2026-11-18）----
+    //
+    // ## 解决什么问题
+    //
+    // 写流水要模型自己发一条六参数的 pwsh POST。实测漏记率 58%
+    // （2026-11-18 一天 58 个有结算轮次，主动写 7 个）。
+    //
+    // 对照实验：用户配置的「每轮收尾语」—— 一句固定文字，**从未漏过**
+    // （用户原话：「收尾语设定后 在程序正常的情况下 我没见过一次遗漏的」）。
+    //
+    // 差别不在意愿，在**决策数量**：收尾语 0 个决策，写流水 6 个
+    // （想内容 / 压 150 字 / 选 topic / 写 summary / 拼 JSON / 带两个必填参数）。
+    //
+    // 对策：把命令固化成脚本，调用只剩一个决策 —— 说一句什么。
+    //
+    // ## 为什么放在 agent/created
+    //
+    // 宿主契约原文（cordis Event `agent/created`）：
+    //   「Listeners run in order and **awaited before creation resolves**.
+    //     AgentLoop **holds queued input until all listeners finish**.」
+    // 也就是说**用户的第一条消息要等这里跑完才放行** —— 不存在
+    // 「模型已经开口、脚本还没落」的窗口，所以首轮流水不会漏。
+    //
+    // ## 为什么不过滤 source
+    //
+    // `source` 有四种（startup / resume / clear / compact）。只在 startup 落，
+    // 则「装插件之前就建过、之后只是恢复」的工作区永远拿不到脚本。
+    // 判据是 `log.ps1` 是否存在，**天然幂等**，四种都跑不会重复干活。
+    //
+    // ## 为什么判 log.ps1 而不是判目录
+    //
+    // 判目录的话，「目录建了、文件没写成」会永久缺文件且永不补建。
+    // 判脚本只多一次 stat，但能自愈。
+    //
+    // ## 为什么必须整段包 try 且不 rethrow
+    //
+    // 同一条契约：「A **throw or rejection fails creation** and skips later
+    // listeners.」—— 这里抛错会让**整个会话创建失败、会话打不开**。
+    // 建文件夹失败属于「优化没生效」，绝不能升级成「会话开不了」。
+    try {
+      const scriptCreated = await ensureWorkspaceScripts(agent?.session?.header?.cwd)
+      // 成功也要记一条（2026-11-18）。
+      //
+      // 为什么不只在失败时记：失败有 `workspace-script-failed`、成功却悄无声息，
+      // 等于「只看得见坏的那一半」。这一天收工时我就是靠文件时间戳 + SHA 比对
+      // 反推出它跑过 —— 日志本该让我直接看到。
+      //
+      // 为什么只记「真的新建了」这一种：第二次进来就跳过是**正常路径**，
+      // 每轮都记会把日志冲成噪音（参考 `write-streak-check` 那类高频字段的教训）。
+      if (scriptCreated) {
+        diag('workspace-script-installed', { cwd: agent?.session?.header?.cwd })
+      }
+    } catch (error) {
+      diag('workspace-script-failed', { message: String(error?.message ?? error) })
+    }
+
+    // 以下保持原样：登记项目与「隔天整理」提醒只在 startup 跑。
     if (source !== 'startup') return
     try {
       const resolved = await store.registerProject(agent?.session?.header?.cwd)
@@ -6158,7 +7184,25 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 400, {
                 ok: false,
                 error:
-                  `topic 不在允许的 13 类里：${JSON.stringify(topicRaw.slice(0, 40))}。` +
+                  // ★ 2026-11-20 21:05（本地凌晨）：**计数也必须从白名单生成。**
+                  //
+                  // 2026-11-17 把「清单」改成 `TOPIC_WHITELIST.join()` 之后，
+                  // 清单确实再没漂过 —— 但**「13 类」这个数字仍是手写的**，
+                  // 于是 2026-11-20 加第 14 类「闲聊」时，提示变成了：
+                  //
+                  //     topic 不在允许的 13 类里：… 请改用其中之一（…14 个词… / 闲聊）
+                  //
+                  // **一句话里先说 13、后面列了 14 个。** 照旧是「提示自相矛盾」，
+                  // 只是从「清单漂移」换成了「计数漂移」——
+                  // 同一条错误信息的两个部分，一个已改成动态、一个还留在手写。
+                  //
+                  // 发现者又是 SoftTest 工作区（它照着提示实测 E3 用例）。
+                  // **这是该 bug 第二次由测试方发现，而不是作者。**
+                  // 作者一直用默认 topic，永远不会触发这条提示。
+                  //
+                  // 修法：`${TOPIC_WHITELIST.length}`，与清单同源。
+                  // 判据：改白名单后这条提示必须自动跟着变，不许再出现手写数字。
+                  `topic 不在允许的 ${TOPIC_WHITELIST.length} 类里：${JSON.stringify(topicRaw.slice(0, 40))}。` +
                   // ★ 2026-11-17 18:40：**清单从白名单生成，不再手写。**
                   //
                   // ## 这是一次真实的「错误提示把人引向死路」
@@ -6299,7 +7343,40 @@ export function apply(ctx, rawConfig = {}) {
             //    模型 POST 时若传错（或没传），这里记不上 —— 那是**预期的**
             //    「宁可漏计数」，由 `sid !== ''` 守卫住。
             const sid = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
-            if (sid !== '') {
+            // ★ 2026-11-20：**补记自己发起的写入，不能算进主会话的轮次计数。**
+            //
+            // ## 为什么这件事非拦不可
+            //
+            // 补记（`runBackfillTask`）复用这条路由，而它 POST 的 `sessionId`
+            // 就是**主会话的 sid**（`task.sessionId`）。若照常计数，会串两处：
+            //
+            //   ① `turnActivity[sid].wroteLog = true`
+            //      → 下一轮 `turn-stopping` 读到 `wroteThisTurn === true`
+            //      → `writeFailStreak` 被清零，**真实漏记被静默抹掉**。
+            //   ② `turnLogWrites[sid]` 在补记落库那一刻 +1
+            //      → 若这发生在**下一轮进行中**（补记本身要 5~30 秒），
+            //        下一轮 `turn/end` 的 `backfill-check` 就会读到 `wroteCount = 1`
+            //      → 判成「这轮写了」→ **真实漏记不再入队**。
+            //
+            // 也就是说：补记越成功，越会把**下一轮**的漏记判据毒掉，
+            // 而这一切**没有任何症状** —— 正是硬约束 15 说的那类数据丢失。
+            //
+            // ## 为什么旧方案没有这个问题
+            //
+            // 子代理版是让子代理自己跑 `log.ps1`，POST 里的 sid 是**子会话的 sid**，
+            // 天然落在另一个键上，所以碰不到主会话的计数。
+            // 换成 prepareCall 直连后 sid 变成主会话的 —— 这是重构**引入**的，
+            // 不是原来就有的。迁移时没跟过来，只能在这里补。
+            //
+            // ## 拦的是计数，不是写入
+            //
+            // `mem-写流水` / `log-written` 两行诊断**照常写**（它要可审计），
+            // 库里那条也照常落 —— 只跳过「按会话记账」这一步。
+            const fromBackfill = body.backfill === true
+            if (sid !== '' && fromBackfill) {
+              diag('log-from-backfill', { sid, id: r.id, note: '补记写入，不参与轮次计数' })
+            }
+            if (sid !== '' && !fromBackfill) {
               const rec = turnActivity.get(sid) ?? { writes: 0, wroteMemory: false, wroteLog: false }
               rec.wroteLog = true
               turnActivity.set(sid, rec)
@@ -6334,7 +7411,10 @@ export function apply(ctx, rawConfig = {}) {
             // 这样重记从「完全不可见」变成「有据可查」，且零数据损失。
             let turnOfLog = null
             let turnWrites = null
-            if (sid !== '') {
+            // ⚠️ 补记写入同样**不许**推进 `turnLogWrites`（见上面 `fromBackfill` 那段）：
+            //    它是 `backfill-check` 判「本轮写没写」的第二个量，
+            //    被补记推高就等于把下一轮的真实漏记判成「已写」。
+            if (sid !== '' && !fromBackfill) {
               const known = currentTurn.get(sid)
               if (Number.isInteger(known)) {
                 turnOfLog = known
@@ -6352,6 +7432,87 @@ export function apply(ctx, rawConfig = {}) {
                 }
               }
             }
+
+            // ★ 2026-11-21：**收尾语混进流水正文**要留痕。
+            //
+            // ## 为什么需要它
+            //
+            // 用户实报：ForzaOverlay 那边的流水 `id=1331` 正文里含「大肥鱼是漂亮老婆」，
+            // 而那正是 policy.md 里的**收尾语**。查证结果是**合法的引用**
+            // （正文在概括「用户夸了这句」这件事），不是污染。
+            //
+            // **但当时分不出真假** —— 因为「提到收尾语」和「把收尾语当正文抄进去」
+            // 在检索结果里长得一模一样。这类「看起来成立、实际需要人判断」的形态，
+            // 正是本项目反复栽跟头的地方（`wroteMemory` 假阳性、`routeHits` 恒 0）。
+            //
+            // ## 它做什么 / 不做什么
+            //
+            // **只记录，不拦截、不改写。** 理由：
+            //   · 拦了会丢真实内容（引用收尾语有时是正当的）
+            //   · 改了就是替调用方做决定，而流水正文是它的原文
+            // 写一行 `log-heartbeat-in-text`，带上**命中次数**与**是否在末行**，
+            // 让事后一眼能分出「引用」与「污染」：
+            //   · 出现在中间 → 多半是引用（`id=1331` 就是这种）
+            //   · 出现在**末行** → 高度可疑，那是「收尾语被当成结尾写进去了」
+            //
+            // ⚠️ 复用现成的 `isHeartbeatLast` / `countHeartbeat`，不另写一套判据 ——
+            //    本项目 2026-11-20 记过：同一语义写两份判据，改了一处另一处就漂了。
+            try {
+              const hb = readHeartbeat()
+              const hits = countHeartbeat(text, hb)
+              if (typeof hits === 'number' && hits > 0) {
+                diag('log-heartbeat-in-text', {
+                  id: r.id,
+                  scope: r.project,
+                  sid: sid !== '' ? sid : null,
+                  hits,
+                  // `true` = 收尾语在**正文末行** → 重点排查
+                  // `false` = 在中间 → 多半是引用（ForzaOverlay id=1331 那种）
+                  last: isHeartbeatLast(text, hb) === true,
+                })
+              }
+            } catch {
+              // 观测代码绝不能影响写入本身
+            }
+
+            // ★ 2026-11-19：**一条流水 = 一条可对账的凭据**（用户定调：
+            //   「一条流水对应多条记录，也不用改很多，多落一条 log 就可以」）。
+            //
+            // ## 为什么要在 `mem-写流水` 之外再落一条
+            //
+            // 原来写入成功只有 `mem-写流水` 一行，而它**既没有 id 也没有 sessionId**：
+            //     {"project":"...","topic":"...","summary":"...","db":true,"via":"http"}
+            // 于是「日志侧 vs 库侧」只能靠 summary 文本对齐 —— 而 summary 是
+            // **截断到 35 字**的，两条不同流水完全可能截出一模一样的摘要。
+            // 那种对账在「碰巧一致」时看起来成立，出问题时却证明不了任何事。
+            //
+            // ## 这一行补的是什么
+            //
+            // 把「库里的行长什么样」原样带上：`id`（join 键）、`scope`、`ts`、
+            // `bytes`、以及**是哪个会话哪一轮**（`sid` / `turn` / `turnWrites`）。
+            // 有了这些，任何人 grep 一次就能把三侧对上：
+            //     请求（turnWrites） ←→ 日志（本行） ←→ 库（id + /entries）
+            //
+            // ## 为什么不改上面那行、只加一行
+            //
+            // `mem-写流水` 被 `selfcheck-log-alive` 的源码断言和一条变异用例
+            // （`meta-mutation-test` 的「删掉 mem-写流水诊断」）盯着，**动它等于动防线**。
+            // 新增一行独立事件名，零回归风险，也保留了原来那行的历史口径。
+            //
+            // ⚠️ `sid` 可能为空（调用方没传 sessionId）。那不是缺字段，而是
+            //    事实 —— 空字符串就说明这次写入无法归到任何一轮，对账时应当被看见。
+            diag('log-written', {
+              id: r.id,
+              scope: r.project,
+              bytes: r.bytes,
+              sid: sid !== '' ? sid : null,
+              turn: turnOfLog,
+              turnWrites,
+              // 与 `mem-写流水` 的 `via` 同值；留着是为了让两行能独立解析，
+              // 不必假设「另一行一定存在」。
+              via: 'http',
+            })
+
             json(res, 200, {
               ok: true,
               id: r.id,
@@ -6508,7 +7669,7 @@ export function apply(ctx, rawConfig = {}) {
         //
         // 为什么需要单独接口（2026-11-13）：历史遗留 156 条无 topic，
         // 它们不进「记忆索引」等于对模型隐形。补标签必须走插件 ——
-        // 硬约束 6 明令禁止模型用 write/pwsh 直碰 memory.db。
+        // 硬约束 5 明令禁止模型用 write/pwsh 直碰 memory.db。
         // 与 entry/update 分开，是因为后者会把 review 标成 'edited'，
         // 那会把「机器补标签」误记成「用户改过内容」。
         kind: 'exact',
@@ -7245,4 +8406,728 @@ export function apply(ctx, rawConfig = {}) {
   // 挂在 effect 上，插件卸载/热重载时自动清理 ——
   // 否则每重载一次就多一个定时器，一天能堆出几十个。
   ctx.effect(() => () => clearInterval(timer), 'dsh-memory: heartbeat')
+
+  // ---- 只读能力探针：侧边栏补记能不能做（2026-11-20）----
+  //
+  // ## 要回答的问题
+  //
+  // 用户要的是「漏记时在另一个选项卡里补记，还是我自己写，不占用主对话」。
+  // 这需要插件能起一个**真正的 agent 会话**（不是裸调模型），因为它必须
+  // 自己有手（能调 log.ps1），不能只吐一段文本。
+  //
+  // ## 为什么先探再写
+  //
+  // 本会话已经在这上面栽过三次：先推测「这版禁止」，读了源码发现是
+  // 「禁止修改、允许克隆重派」；先推测「子代理被关了」，实际是那个配置项
+  // 属于 reasoning-distill 自己的规则。**不先拿到现场就动手，等于重犯。**
+  //
+  // ## 本探针只做三件事，全部只读
+  //
+  //   ① 服务在不在（agentLoop / sessions / llm / subagents / webServer）
+  //   ② 关键方法是不是函数（createAgent / create / listProviders）
+  //   ③ `llm.listProviders()` 的**实际返回值** —— 这条最重要：
+  //      本机 provider 名是 `workbuddy`（见 dsh-connect-workbuddy 的
+  //      `ctx.llm.registerAdapter(["workbuddy"], ...)`），但「服务存在」
+  //      不等于「有 adapter」，必须实读。
+  //
+  // **不建会话、不调模型、不写库。** 建会话那一步等这份结果出来再单独探。
+  //
+  // 排法：`setTimeout` 延后到自检之后，与心跳同一时机，
+  // 避免在 apply 同步阶段去读还没就绪的服务。
+  const probeSidebar = setTimeout(() => {
+    try {
+      const pick = (key) => {
+        try {
+          const svc = ctx.get(key)
+          return svc === undefined || svc === null
+            ? { present: false }
+            : { present: true, methods: Object.getOwnPropertyNames(Object.getPrototypeOf(svc)).filter((k) => k !== 'constructor').slice(0, 12) }
+        } catch (e) {
+          return { present: false, error: String(e?.message ?? e) }
+        }
+      }
+      const agentLoop = ctx.get('agentLoop')
+      const llm = ctx.get('llm')
+      let providers = null
+      let providersError = null
+      try {
+        providers = typeof llm?.listProviders === 'function' ? llm.listProviders() : null
+      } catch (e) {
+        providersError = String(e?.message ?? e)
+      }
+      diag('sidebar-probe', {
+        agentLoop: pick('agentLoop'),
+        sessions: pick('sessions'),
+        llm: pick('llm'),
+        subagents: pick('subagents'),
+        // 判据：这几个为 true 才说明「起会话」这条路物理上存在
+        canCreateAgent: typeof agentLoop?.createAgent === 'function',
+        canCreateSession: typeof ctx.get('sessions')?.create === 'function',
+        canFork: typeof ctx.get('sessions')?.fork === 'function',
+        llmProviders: Array.isArray(providers) ? providers.map((p) => p?.id ?? p) : providers,
+        llmProvidersError: providersError,
+      })
+    } catch (e) {
+      // 探针自己坏了不能影响插件
+      diag('sidebar-probe-error', { message: String(e?.message ?? e) })
+    }
+  }, 1200)
+  probeSidebar.unref?.()
+  ctx.effect(() => () => clearTimeout(probeSidebar), 'dsh-memory: sidebar probe')
+
+  // ================================================================
+  // 漏记补写（backfill）—— 2026-11-20，prepareCall 版
+  // ================================================================
+  //
+  // ## 它解决什么
+  //
+  // 漏记是这个插件唯一的失效方式，而且**没有任何症状**：
+  // 日志干净、界面正常、health 全绿，只是那段记忆不存在。
+  // 所以硬约束 15 定：影响记流水的缺陷按**数据丢失**对待。
+  //
+  // ## 为什么不用子代理（第一版是子代理，已废弃）
+  //
+  // 第一版用 `subagents.startActivation({provider:'spawn'})` 起子代理，
+  // 让它自己跑 `log.ps1`。实跑过两次（id=1241/1242），能用。
+  // 但那段代码 266 行实代码里，**130 行在解决子代理的附带问题**：
+  //
+  //   · 名额上限（`maxActiveSubagents` 本机 8，满了抛 ACTIVATION_LIMIT_REACHED）
+  //   · 防递归（子会话的 turn/end 会再触发补记 → 必须维护 childId 集合）
+  //   · 引号转义（拼 `log.ps1 "正文"`，正文里有 `"` 就炸）
+  //   · dispose 泄漏（漏调会吃掉名额）
+  //
+  // 换成 `llm.prepareCall()` 直连模型后，**这四类问题一个都不存在**。
+  // 代价是"落库动作由代码执行"而不是子代理自己跑脚本 ——
+  // 用户已确认可接受：**内容仍由模型产出，代码只负责把文本 POST 进库**。
+  //
+  // ⚠️ **2026-11-20 用户定调：这条路封了，不要再回头。**
+  //   原话：「如果目前这套生效 我们就不再考虑子代理了 那真不是个好办法」。
+  //
+  //   判据不是「子代理跑不通」—— 它跑通过 6 次（id=1241…1248）。判据是**成本结构**：
+  //     · 一次补记要占 5~11 秒（prepareCall 版实测 1.9 秒）；
+  //     · 与用户正常委派**共用同一个 8 格名额池**（`rootPool(parent)` 按 parent 分池），
+  //       补记一多就会把用户自己的委派挤掉，抛 ACTIVATION_LIMIT_REACHED；
+  //     · 130/266 行代码在解决子代理自带的副作用，维护成本长期挂在账上；
+  //     · 引号转义那条尤其脆 —— 正文里出现一个 `"` 就炸，而流水正文是不可控的。
+  //
+  //   所以判断标准回到用户那句：「**省的不是代码量 是长期的维护成本**」。
+  //   补记已经跑通且更便宜，就没有理由再养一条更贵的路。
+  //
+  //   顺带一条对**别处**也成立的结论（2026-11-20 排查时发现）：
+  //   `D:\workspace\dsh-soul-main` 的 `src/host-runner.js` 用的是**嵌套
+  //   `request: { parent, prompt, ... }` 写法**，而交接单 §2.2 说扁平 spec 才对。
+  //   两说必有一错，**但已不重要** —— 本插件不再用子代理，
+  //   这条分歧不该再花时间验。留在这里只为让下一个人别重复排查。
+  //
+  // ## 为什么是 prepareCall 而不是 ctx.llm.stream()
+  //
+  // `prepareCall` 会：
+  //   · 绑定 adapter 注册（HMR 期间不会串到另一个 adapter 的能力）
+  //   · 调 `resolveCallConfig` 填入 maxTokens / reasoningEffort 的默认值并校验
+  //   · 用同一个 `modelInfo` 贯穿能力查询与分派
+  //
+  // 而且拿 `agentDefaultModel.currentSelection()` 就能**继承用户当前选的模型**，
+  // 不用自己配 provider/model。
+  //
+  // ## 两条来自源码的硬约束（dsh-llm/lib/index.js）
+  //
+  //   ① L2360-2362：一次 prepared call **只能 stream 一次**，
+  //      否则抛 `INVALID_PREPARED_CALL`。所以每次补记都要重新 prepare。
+  //   ② L416 `callConfigEquals` 只比 6 个字段：
+  //      provider / model / reasoningEffort / temperature / maxTokens / stop。
+  //      **不比较 messages 和 system** —— 所以可以
+  //      `stream({ ...handle.config, messages, system })`，
+  //      这也是 dsh-memory-tiers 的用法（已在本机源码核对）。
+  //
+  // ## 判据：怎么知道"本轮写没写"
+  //
+  // 不看 `record.writes`（那是"动过文件"，不是"写了流水"），
+  // 看两处真实写入痕迹：
+  //   · `turnLogWrites`：标记通道 / HTTP 通道成功写入后的计数
+  //   · `logRouteHits` ：`/api/dsh-memory/log` 被真正命中的次数
+  //
+  // ## 触发点：`session/event` 的 `turn/end`
+  //
+  // 不用 `agent/turn-stopping`：
+  //   · 那是 serial 事件，抛异常会中断本轮
+  //   · 那一刻**本轮还没提交**，`snapshotEvents()` 取不到完整的本轮
+
+  /** 单个补记调用的硬超时。实测一次摘要调用几秒级，30s 足够。 */
+  const BACKFILL_TIMEOUT_MS = 30000
+
+  /**
+   * POST 落库那一步的超时（2026-11-20 新增）。
+   *
+   * **它必须独立于 `BACKFILL_TIMEOUT_MS`**：那个只管模型调用，
+   * 而实测让补记永久停摆的正是 POST 没超时（详见 `pumpBackfill` 的 finally 注释）。
+   * 目标是本机 127.0.0.1 的一条 INSERT，10s 已经极宽松。
+   */
+  const BACKFILL_POST_TIMEOUT_MS = 10000
+
+  /** 已补过 / 正在补的 key（`${sid}:${turn}`），防重复。 */
+  const backfillDone = new Set()
+
+  /**
+   * `backfillDone` 的容量上限（2026-11-20 新增）。
+   *
+   * 原来它只增不减：每轮一个 key，进程常驻几天就是几千条，
+   * 而一旦满了就永不清理 —— 虽然内存影响小，但这属于
+   * 「有状态的容器没有边界」那类隐患，顺手加上。
+   * `Set` 保序，丢第一个就是丢最旧的。
+   */
+  const BACKFILL_DONE_LIMIT = 500
+
+  /** 正在跑的数量。并发上限 1 —— 不与用户正常对话抢模型配额。 */
+  let backfillBusy = false
+
+  /** 待补队列。上限 20，超了丢最旧并留痕。 */
+  const backfillQueue = []
+  const BACKFILL_QUEUE_LIMIT = 20
+
+  /**
+   * 从本轮事件里取 user 原话 / assistant 回复。
+   *
+   * ⚠️ **`user/message` 的 `data` 里没有 `turn` 字段**（恒 undefined）。
+   * 2026-11-20 在这个上面栽过：拿 `turn` 当判据，user 侧永远被过滤掉，
+   * 整轮判成「没有用户文本」。
+   *
+   * 正确做法：assistant 用 `turn` 过滤；user 退回到「最近一条」。
+   */
+  const collectTurnTexts = (session, turn) => {
+    const users = []
+    const assistants = []
+    try {
+      for (const ev of session.snapshotEvents() ?? []) {
+        const d = ev?.data
+        const t = (d?.message?.content ?? d?.content ?? [])
+          .filter((b) => b?.type === 'text')
+          .map((b) => b.text ?? '')
+          .join('\n')
+        if (t.trim() === '') continue
+        if (ev.type === 'user/message') {
+          // 只收「人说的」：插件注入的 runtime-context 不算
+          const kind = d?.source?.kind ?? d?.message?.source?.kind
+          if (kind === 'runtime-context') continue
+          users.push({ seq: ev.seq ?? 0, text: t })
+        } else if (ev.type === 'assistant/message') {
+          if (d?.turn !== turn) continue
+          assistants.push(t)
+        }
+      }
+    } catch {
+      return { userText: '', assistantText: '' }
+    }
+    users.sort((a, b) => a.seq - b.seq)
+    return {
+      userText: (users.length > 0 ? users[users.length - 1].text : '').slice(0, 3000),
+      assistantText: assistants.join('\n').slice(0, 6000),
+    }
+  }
+
+  /**
+   * 用一次 prepareCall 拿一段补记正文。
+   *
+   * @returns {Promise<{ok: boolean, text: string, detail: object}>}
+   */
+  const generateBackfillText = async (userText, assistantText) => {
+    const llm = ctx.get('llm')
+    if (typeof llm?.prepareCall !== 'function') {
+      return { ok: false, text: '', detail: { reason: 'no prepareCall' } }
+    }
+
+    // 继承用户当前选的模型 —— 用户换模型，补记跟着换
+    let selection = null
+    try {
+      const dm = ctx.get('agentDefaultModel')
+      if (typeof dm?.currentSelection === 'function') {
+        const sel = dm.currentSelection()
+        if (sel?.provider && sel?.model) selection = sel
+      }
+    } catch {
+      // 拿不到就走下面的兜底
+    }
+    if (selection === null) {
+      return { ok: false, text: '', detail: { reason: 'no model selection' } }
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      try {
+        controller.abort()
+      } catch {
+        // ignore
+      }
+    }, BACKFILL_TIMEOUT_MS)
+    timer.unref?.()
+
+    try {
+      const handle = await llm.prepareCall(
+        { provider: selection.provider, model: selection.model, maxTokens: 300 },
+        controller.signal,
+      )
+
+      const systemText =
+        '你在补记一条对话流水。只输出一句话，不超过 120 字。' +
+        '概括用户提出的具体问题 + 这一轮的结论。' +
+        '不要写「本轮完成了…」这类空话，不要加引号、不要加前缀、不要解释。'
+
+      const userText2 =
+        `用户说：\n${userText}\n\n我回复：\n${assistantText}\n\n` +
+        '用一句话写出这一轮的流水（只输出那一句）。'
+
+      let out = ''
+      let failure = null
+      // 注意：`callConfigEquals` 只比 6 个字段，messages/system 可以不同
+      for await (const chunk of handle.stream({
+        ...handle.config,
+        messages: [{ role: 'user', content: [{ type: 'text', text: userText2 }] }],
+        system: systemText,
+        // ★ 标记这次调用是插件发的，不是对话请求。
+        //   交接单 §5 那条判据（`options.purpose !== undefined` → 放行）
+        //   的出处就在这里：dsh-memory-tiers 用 `purpose: 'memory-tiers'`。
+        purpose: 'fatfish-backfill',
+        signal: controller.signal,
+      })) {
+        const t = chunk?.type
+        if (t === 'text-delta') out += chunk.text ?? ''
+        else if (t === 'error') {
+          failure = chunk
+          break
+        } else if (t === 'finish') {
+          if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') failure = chunk
+          break
+        }
+      }
+
+      if (failure !== null) {
+        return {
+          ok: false,
+          text: '',
+          detail: { reason: 'stream failure', kind: failure?.reason?.kind ?? null },
+        }
+      }
+      const cleaned = out.trim().replace(/^["'「」]|["'「」]$/g, '').trim()
+      if (cleaned === '') return { ok: false, text: '', detail: { reason: 'empty response' } }
+      return {
+        ok: true,
+        text: cleaned.slice(0, 300),
+        detail: { provider: selection.provider, model: selection.model },
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        text: '',
+        detail: {
+          reason: String(error?.message ?? error).slice(0, 200),
+          code: error?.code ?? null,
+        },
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * 解析本机 HTTP 根地址 —— 补记 POST 的目标。
+   *
+   * ## 为什么不能只读 `process.env.DSH_WEB_URL`（2026-11-20 实测）
+   *
+   * 插件跑在 **Host 主进程**里，而 `DSH_WEB_URL` 根本不是进程环境变量：
+   * 它由 `dsh-web-app` 注册进 **`shellEnv`**（变量名 `web-runtime`），
+   * 在**每次模型 shell 调用时**按 execution 现算并注入子进程。
+   * 服务契约原文（`cordis_inspect_query` → host/Service → shellEnv）：
+   *   「The namespace is rebuilt for every model shell call: ambient `DSH_*`
+   *    values are discarded by the executor, then the registry's current
+   *    snapshot is injected.」
+   *
+   * 于是同一条机器上出现分叉：
+   *   · `log.ps1`（子进程）里读得到 —— 每轮都在用，从没出过问题；
+   *   · 插件进程里读不到 —— 恒 `undefined`。
+   *
+   * 实测证据：prepareCall 版连跑 2 次，全部挂在 POST 阶段 ——
+   *   12:35:35 与 12:36:14 两条 `backfill-failed {"reason":"no DSH_WEB_URL"}`，
+   * 而**同一时刻**在 pwsh 里 `$env:DSH_WEB_URL` 是有值的。
+   * 也就是说：`generateBackfillText()` 那一步成功了（没报 `backfill-gen-failed`），
+   * 坏的只有「拿到根地址」这一件事。
+   *
+   * ## 回退顺序（与 DSH 自己算 `DSH_WEB_URL` 的口径同源）
+   *
+   *   ① `webApp.getAdvertisedUrl()` —— **和 `DSH_WEB_URL` 是同一个函数**。
+   *      asar 源码 `dsh-web-app/lib/index.js`：
+   *        const appRootUrl = () => publicUrl ?? ctx.webServer.getOrigin()
+   *        ctx.provide("webApp", { getAdvertisedUrl: appRootUrl })
+   *        shellEnv.register({ variables: { DSH_WEB_URL: … },
+   *                            resolve: () => ({ DSH_WEB_URL: appRootUrl() }) })
+   *      走它 = 拿到 shell 里那个值的**权威来源**，不是猜端口。
+   *      （`cordis_inspect_query` 对 `webApp` 的说明也写着
+   *        「The URL this GUI advertises, also used for `DSH_WEB_URL`」。）
+   *   ② `webServer.getOrigin()` —— 监听器自己的 origin（`http://127.0.0.1:<port>`）。
+   *      没有 web-app 层时仍能拿到；**listen 之前会抛**，那是「还没监听」，不是「拿不到」。
+   *   ③ `process.env.DSH_WEB_URL` —— 兜底。当前进程里没有，留着不占成本。
+   *
+   * 三个都拿不到才失败，且**必须把三个都试过这件事报出去**。
+   * 旧代码只留一句 `no DSH_WEB_URL`，下一个会话得从零查起 —— 本条就是那个代价。
+   *
+   * ## 为什么带两个默认参数（2026-11-20）
+   *
+   * `getService` / `env` 只是为了**让回归能注入假的服务表**。
+   * 默认值就是原来的 `ctx.get` 与 `process.env`，**生产行为一个字没变**。
+   *
+   * 不加参数时的老路：逻辑内联在 `apply` 闭包里、直接摸 `ctx` ——
+   * 于是测试只能「读源码比对字符串」，而那种断言在真正该失败时不会红
+   * （本项目记过：「断言在，被测的差异不在」）。
+   * 抽出两个入口之后，`selfcheck-backfill-*.mjs` 就能执行**同一份源码里的函数体**，
+   * 喂三层各自的假服务，逐层验证回退顺序。
+   */
+  const resolveLocalBaseUrl = (getService = (key) => ctx.get(key), env = process.env) => {
+    const tried = []
+    try {
+      const webApp = getService('webApp')
+      if (typeof webApp?.getAdvertisedUrl === 'function') {
+        const v = webApp.getAdvertisedUrl()
+        if (typeof v === 'string' && v !== '') {
+          return { ok: true, base: v.replace(/\/+$/, ''), from: 'webApp', tried }
+        }
+        tried.push('webApp:empty')
+      } else {
+        tried.push('webApp:missing')
+      }
+    } catch (error) {
+      tried.push(`webApp:${String(error?.message ?? error).slice(0, 80)}`)
+    }
+
+    try {
+      const webServer = getService('webServer')
+      if (typeof webServer?.getOrigin === 'function') {
+        const v = webServer.getOrigin()
+        if (typeof v === 'string' && v !== '') {
+          return { ok: true, base: v.replace(/\/+$/, ''), from: 'webServer', tried }
+        }
+        tried.push('webServer:empty')
+      } else {
+        tried.push('webServer:missing')
+      }
+    } catch (error) {
+      tried.push(`webServer:${String(error?.message ?? error).slice(0, 80)}`)
+    }
+
+    const envUrl = env.DSH_WEB_URL
+    if (typeof envUrl === 'string' && envUrl !== '') {
+      return { ok: true, base: envUrl.replace(/\/+$/, ''), from: 'env', tried }
+    }
+    tried.push('env:missing')
+    return { ok: false, base: '', from: null, tried }
+  }
+
+  /**
+   * 执行一条补记：拿文本 → POST 进库。
+   *
+   * 复用现有的 `/api/dsh-memory/log` 路由，而不是直接 `appendLog` ——
+   * 那条路由已经有 topic 白名单、cwd 校验、`wroteLog` 置位，
+   * 绕过它就等于再造一条语义可能分叉的写库路径。
+   */
+  const runBackfillTask = async (task) => {
+    const startedAt = Date.now()
+    const generated = await generateBackfillText(task.userText, task.assistantText)
+    if (!generated.ok) {
+      diag('backfill-gen-failed', { key: task.key, ...generated.detail })
+      // ★ 2026-11-20：模型那一步的失败要分「临时」与「永久」。
+      //
+      //   · 超时 / 流中断 / provider 抖 → **可重试**（隔一轮再来多半就好）
+      //   · 空回复 / 没有可用模型 / 根本没有 prepareCall → **不可重试**
+      //     （重试一万次结果一样，且会在日志里刷屏）
+      //
+      // 原来一律 `retryable: false`，于是「模型超时一次」= 这一轮永久丢。
+      const why = String(generated.detail?.reason ?? '')
+      const transient =
+        why === 'stream failure' || /timeout|aborted|ECONN|socket|network/i.test(why)
+      return { ok: false, retryable: transient, detail: generated.detail }
+    }
+
+    try {
+      const resolved = resolveLocalBaseUrl()
+      if (!resolved.ok) {
+        // 把「三个都试过了」写进日志：下一次看到这条，就知道该去查哪一层
+        diag('backfill-base-url-failed', { key: task.key, tried: resolved.tried })
+        return {
+          ok: false,
+          retryable: false,
+          detail: { reason: 'no base url', tried: resolved.tried },
+        }
+      }
+      const base = resolved.base
+      diag('backfill-base-url', { key: task.key, from: resolved.from, base })
+      // ★ 2026-11-20：**必须带 signal**。
+      //
+      // 原来这一行没有超时。服务端半开连接 / 路由挂住时 `fetch` 永不返回，
+      // 于是 `pumpBackfill` 的 `finally { backfillBusy = false }` 永不执行，
+      // **整个补记永久停摆** —— 后续每轮只有 `backfill-enqueued`，
+      // 既无 `backfill-done` 也无 `backfill-failed`，静默。
+      //
+      // `AbortSignal.timeout` 是 Node 18+ 内置，零依赖（硬约束：不加包）。
+      // 超时抛的是 `TimeoutError`，落到下面的 catch，
+      // 走 `retryable: true` 分支（服务端只是慢，内容没坏）。
+      const res = await fetch(`${base}/api/dsh-memory/log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(BACKFILL_POST_TIMEOUT_MS),
+        body: JSON.stringify({
+          text: generated.text,
+          cwd: task.cwd,
+          // ★ 2026-11-20：**显式传 scope，不依赖 cwd 反推**。
+          //
+          // ## 原来的 bug（已实测复现）
+          //
+          // `task.scope` 在 `turn/end` 那边算得好好的（`resolveProjectKey(cwd)`），
+          // 却**从没被这里读过** —— 只传了 `cwd`。
+          // 而 `/log` 那侧是：
+          //
+          //     const cwd = typeof body.cwd === 'string' ? body.cwd : process.cwd()
+          //
+          // `session?.header?.cwd` 为 null 时（子会话、或 header 还没落），
+          // `process.cwd()` 是 **DSH 主进程的工作目录**。
+          // 实测：传 `{"cwd":null}` 进去，服务端返回
+          //     scope = "desktop"   scopeFrom = "cwd"
+          // 于是**一条本该属于某项目的流水，静默写进了 desktop**。
+          //
+          // 这类错最坏的地方是它**不报错**：写入成功、id 都有、日志全绿，
+          // 只是它在另一个工作区的记忆里 —— 查的时候永远找不到。
+          //
+          // 判据：`/log` 支持显式 `scope`（L`let scope = typeof body.scope`），
+          // 有它就优先用它，不再走 cwd 分支。
+          scope: typeof task.scope === 'string' && task.scope !== '' ? task.scope : undefined,
+          sessionId: task.sessionId,
+          topic: task.topic,
+          // ★ 告诉 `/log`「这次写入是补记发的」，让它跳过按会话记账。
+          //   少这一位会毒掉**下一轮**的漏记判据（详见 `/log` 里 `fromBackfill` 那段）。
+          backfill: true,
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        diag('backfill-post-failed', { key: task.key, status: res.status, body: body.slice(0, 200) })
+        // ★ 2026-11-20：**5xx / 429 可重试，4xx 不可**。
+        //
+        // 4xx 是「请求本身错了」（topic 不在白名单、正文空、cwd 不是目录），
+        // 重试一百次结果一样 —— 那种必须放弃，否则会无限重试同一条坏数据。
+        // 5xx 与 429 是「服务端这会儿不行」，隔一轮再来多半就好。
+        const retryable = res.status >= 500 || res.status === 429
+        return { ok: false, retryable, detail: { status: res.status } }
+      }
+      const json = await res.json().catch(() => ({}))
+      return {
+        ok: json?.ok === true,
+        // 200 但 `ok !== true`：服务端明确说没写进去 → 不是临时故障，不重试
+        retryable: false,
+        detail: {
+          id: json?.id ?? null,
+          turn: json?.turn ?? null,
+          durationMs: Date.now() - startedAt,
+          text: generated.text.slice(0, 120),
+        },
+      }
+    } catch (error) {
+      // ★ 2026-11-20：**异常一律可重试**（原来说是 false，见 `releaseBackfillKey`）。
+      //
+      // 这里兜住的是：POST 超时（TimeoutError）、连接被拒、
+      // 服务端刚好在重启、DNS/端口抖动 —— 全是「隔一会儿再来就好」。
+      // 把它们判成不可重试，等于把「网络抖一下」升级成「这一轮永久丢」。
+      const name = error?.name ?? ''
+      return {
+        ok: false,
+        retryable: true,
+        detail: {
+          reason: String(error?.message ?? error).slice(0, 200),
+          errorName: name === '' ? null : name,
+        },
+      }
+    }
+  }
+
+  /**
+   * 把一条 key 从「已处理」集合里放出来，允许重试。
+   *
+   * ## 为什么需要它（2026-11-20）
+   *
+   * `backfillDone` 原来只有 `add` / `has`，**没有 delete** ——
+   * 而所有失败分支都写死 `retryable: false`，于是：
+   * **一条补记失败一次，那一轮就永久放弃**（进程活着期间再也不试）。
+   *
+   * 现实里最常失败的是「模型调用超时 / 网络抖一下 / 服务端刚重启路由还没注册」，
+   * 这些恰恰是重试一次就能好的。永久放弃等于把它们全当成数据丢失。
+   *
+   * ⚠️ 定义必须放在 `pumpBackfill` **之前**：它在 pump 的 catch 里被调用。
+   *    `const` 的 TDZ 是运行时才抛，`node --check` 查不出来（2026-11-18 实踩）。
+   */
+  const releaseBackfillKey = (key) => {
+    backfillDone.delete(key)
+  }
+
+  /**
+   * 给 `backfillDone` 加容量上限。
+   *
+   * 它原来随轮次无限增长（每轮一个 key，进程常驻好几天）。
+   * 现在超过 `BACKFILL_DONE_LIMIT` 就丢最旧的 —— `Set` 保序，第一个元素就是最旧的。
+   */
+  const trimBackfillDone = () => {
+    while (backfillDone.size > BACKFILL_DONE_LIMIT) {
+      const oldest = backfillDone.values().next().value
+      backfillDone.delete(oldest)
+    }
+  }
+
+  /** 串行泵：同一时刻只跑一条，避免和用户正常对话抢模型配额。 */
+  const pumpBackfill = async () => {
+    if (backfillBusy) return
+    if (backfillQueue.length === 0) return
+    backfillBusy = true
+    const task = backfillQueue.shift()
+    try {
+      const outcome = await runBackfillTask(task)
+      if (outcome.ok) diag('backfill-done', { key: task.key, ...outcome.detail })
+      else diag('backfill-failed', { key: task.key, ...outcome.detail })
+      // ③ 失败可重试：见下面 `backfillDone.delete` 那段
+      if (!outcome.ok && outcome.retryable === true) {
+        releaseBackfillKey(task.key)
+      }
+    } catch (error) {
+      diag('backfill-threw', {
+        key: task.key,
+        message: String(error?.message ?? error).slice(0, 200),
+      })
+      // 抛出来的（含 pump 自身的守卫超时）也允许重试
+      releaseBackfillKey(task.key)
+    } finally {
+      // ★ 2026-11-20：`backfillBusy` 必须无条件放开。
+      //
+      // 它原来也在 finally 里，但 `await runBackfillTask(task)` 里有两处
+      // **没有超时**的阻塞点，实测能让整个补记永久停摆：
+      //
+      //   · `fetch(...)` 没传 `signal`（本文件 L`backfill-post` 那段），
+      //     服务端半开连接 / 路由挂住就永不返回；
+      //   · `handle.stream()` 只被 `BACKFILL_TIMEOUT_MS` 的 abort 包着，
+      //     但 abort 只对**支持 signal 的 adapter** 有效。
+      //
+      // 复现（用一个永不 resolve 的 fetch 跑这段形状）：
+      //     3 秒后：backfillBusy = true   queue = 24
+      //     再调 pump：backfillBusy 仍是 true（已死锁）
+      //
+      // 表现是**静默的**：后续每轮只有 `backfill-enqueued`，
+      // 既没有 `backfill-done` 也没有 `backfill-failed`。
+      backfillBusy = false
+    }
+    if (backfillQueue.length > 0) {
+      const next = setTimeout(pumpBackfill, 0)
+      next.unref?.()
+    }
+  }
+
+  /** 入队一条。幂等。 */
+  const enqueueBackfill = (task) => {
+    if (backfillDone.has(task.key)) return false
+    if (backfillQueue.some((t) => t.key === task.key)) return false
+    backfillDone.add(task.key)
+    trimBackfillDone()
+    backfillQueue.push(task)
+    while (backfillQueue.length > BACKFILL_QUEUE_LIMIT) {
+      const dropped = backfillQueue.shift()
+      // 被挤掉的也该允许重来 —— 否则队列一满，最旧那条永久放弃。
+      releaseBackfillKey(dropped.key)
+      diag('backfill-dropped', { key: dropped.key, queueLength: backfillQueue.length })
+    }
+    return true
+  }
+
+  // ---- 接线：turn/end 触发 ----
+  safeOn('session/event', async (session, event) => {
+    try {
+      if (event?.type !== 'turn/end') return
+
+      const sid = session?.id === undefined ? null : String(session.id)
+      const rawTurn = event?.data?.turn
+      const turnIsInt = Number.isInteger(rawTurn)
+
+      // ★ **每一次 turn/end 都必须留痕**，哪怕后面要跳过。
+      //
+      // 2026-11-20 用户实测：最近 14 轮写了 5 轮、漏了 9 轮（64%），
+      // 而 `backfill-check` 只出现 4 次 —— 大部分漏记轮次**根本没走到检查这步**。
+      // 三个 `return` 以前全都不留日志，「事件被挡掉」和「事件没来」长得一模一样。
+      // 所以这一行必须打在**所有判断之前**。
+      diag('turn-end-raw', {
+        sid: sid === null ? null : sid.slice(0, 12),
+        turn: rawTurn === undefined ? null : String(rawTurn),
+        turnType: typeof rawTurn,
+        turnIsInt,
+        seq: event?.seq ?? null,
+      })
+
+      if (sid === null) return
+
+      if (!turnIsInt) {
+        diag('turn-end-skip-noint-turn', {
+          sid: sid.slice(0, 12),
+          raw: rawTurn === undefined ? null : String(rawTurn),
+          turnType: typeof rawTurn,
+        })
+        return
+      }
+      const turn = rawTurn
+
+      // 本轮写没写 —— 两处真实写入痕迹
+      const settled = turnLogWrites.get(sid)
+      const wroteCount =
+        settled !== undefined && settled.turn === turn ? Number(settled.writes) || 0 : 0
+      const routeHits = logRouteHits.get(sid) ?? 0
+
+      diag('backfill-check', { turn, wroteCount, routeHits, sid: sid.slice(0, 12) })
+
+      // ★ 2026-11-20：`logRouteHits` 的清理**移到这里**（原来在 `turn-stopping`）。
+      //
+      // 顺序必须是「先读、后清」，而 `turn/end` 是能读到本轮计数的最晚时点 ——
+      // `turn-stopping` 早于它，在那边删就等于让这里永远读 0（实测 17/17）。
+      //
+      // 清理放在**所有 return 之前**（所以放在这里、不放各分支里）：
+      // 否则「本轮写了」那条 return 会把计数留给下一轮，
+      // 下一轮就会被误判成「写过」→ 真实漏记不入队。
+      logRouteHits.delete(sid)
+
+      if (wroteCount > 0 || routeHits > 0) {
+        return
+      }
+
+      // 没有 user 文本的轮次不补（纯工具步 / 空的）
+      const { userText, assistantText } = collectTurnTexts(session, turn)
+      if (userText.trim() === '') {
+        diag('backfill-skip', { turn, reason: 'no user text' })
+        return
+      }
+
+      const scope = store.resolveProjectKey(session?.header?.cwd ?? null, readStateSync(store))?.scope ?? null
+      const task = {
+        key: `${sid}:${turn}`,
+        sessionId: sid,
+        turn,
+        scope,
+        cwd: session?.header?.cwd ?? null,
+        topic: '开发日志',
+        userText,
+        assistantText,
+        enqueuedAt: Date.now(),
+      }
+      const added = enqueueBackfill(task)
+      diag('backfill-enqueued', {
+        key: task.key,
+        added,
+        queueLength: backfillQueue.length,
+        busy: backfillBusy,
+      })
+      if (added) {
+        const kick = setTimeout(pumpBackfill, 0)
+        kick.unref?.()
+      }
+    } catch (error) {
+      // 补记坏了绝不能影响会话
+      logger.warn?.(`[dsh-memory] 补记判定失败：${error?.message ?? error}`)
+    }
+  })
 }

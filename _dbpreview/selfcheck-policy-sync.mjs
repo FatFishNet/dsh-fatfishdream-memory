@@ -126,7 +126,15 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
   const r = await store.ensureLayout()
   const t = fs.readFileSync(path.join(root, 'policy.md'), 'utf8')
   check('场景4：返回 written', r?.written === true)
-  check('场景4：不产生空的收尾语行', !/加固定一句：\s*$/.test(t), '写回了空收尾语')
+  // ⚠️ 2026-11-19：这条原是**恒真断言**（子代理抓出来的）。
+  //
+  // 旧写法 `!/加固定一句：\s*$/.test(t)`：重构后 `buildHeartbeatLine` 只产新句式，
+  // **没有任何代码路径会写出「加固定一句：」这个前缀** → 断言永远 pass。
+  // 正是「断言在，测的东西不在」。
+  //
+  // 守的行为不变：不允许写回一条**空句子**的收尾语行（GUI 里会看到半句话）。
+  check('场景4：不产生空的收尾语行',
+    !/才允许在回复最后一行输出[：:][ \t]*这句是/.test(t), '写回了空收尾语')
   check('场景4：heartbeatRestored 为 false', r?.heartbeatRestored === false)
   check('场景4：仍生成了备份', fs.existsSync(path.join(root, 'policy.md.pre-sync')))
   fs.rmSync(root, { recursive: true, force: true })
@@ -151,10 +159,14 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
   const store = mkStore(root)
   await store.ensureLayout()
   const t = fs.readFileSync(path.join(root, 'policy.md'), 'utf8')
-  // 覆盖后写入的那一行必须是合法的收尾语格式（能被 readHeartbeat 的正则匹配）
-  const line = t.match(/^[ \t]*-[ \t]*每轮(?:回复)?的?结尾[^\n]*$/m)
+  // 覆盖后写入的那一行必须是合法的收尾语格式（能被 readHeartbeat 解析）
+  //
+  // ⚠️ 2026-11-19：断言从「旧句式 + 旧执行说明」改成「新句式 + 新执行说明」。
+  //    **守的行为没变**：这一行必须存在、必须带执行说明（否则 GUI 里
+  //    用户只看到半句话，不知道半句干嘛用的）。
+  const line = t.match(/^[ \t]*-[^\n]*才允许在回复最后一行输出[^\n]*$/m)
   check('场景6：覆盖后有合法的收尾语行', line !== null)
-  check('场景6：收尾语行含执行说明', /这是会话的/.test(line?.[0] ?? ''), '执行说明缺失，GUI 读取会不一致')
+  check('场景6：收尾语行含执行说明', /这句是\*\*执行回执\*\*/.test(line?.[0] ?? ''), '执行说明缺失，GUI 读取会不一致')
   fs.rmSync(root, { recursive: true, force: true })
 }
 
@@ -175,14 +187,29 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
     path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\//, '')), '..', 'dsh-fatfishdream-memory', 'index.js'),
     'utf8',
   )
-  const blockReDefs = [...src.matchAll(/const blockRe = (\/[^\n]+\/m)/g)].map((m) => m[1])
-  check('场景7：源码里能找到 blockRe 定义', blockReDefs.length > 0, `找到 ${blockReDefs.length} 处`)
+  const blockReDefs = [...src.matchAll(/function heartbeatBlockRe(?:New)?\(\) \{\n  return (\/[^\n]+\/m)/g)].map((m) => m[1])
+  // ⚠️ 2026-11-19：从「找到 > 0 处」收紧为「**正好 2 处**」。
+  //
+  // 为什么：`heartbeatBlockReNew` 和 `heartbeatBlockRe` 是**一对**（新句式 / 旧句式）。
+  // 只写 `> 0` 时，把其中一条改写成 `new RegExp(...)` 会让抽取数从 2 掉到 1，
+  // 而 `> 0` 仍然绿 —— 等于旧句式那条防线**静默消失**。
+  // 判据：数量锁死，少一条就红。
+  check('场景7：源码里正好找到 2 条 blockRe 定义（新句式 + 旧句式）',
+    blockReDefs.length === 2, `找到 ${blockReDefs.length} 处（应为 2）`)
+
+  // ⚠️ 2026-11-19：`blockRe` 拆成了「新句式 / 旧句式」两条（见 index.js 的
+  //    `heartbeatBlockReNew` / `heartbeatBlockRe`），每条只认自己那种格式。
+  //    所以这里对**每一处**用同构的两种样本各测一次，而不是拿一种样本测所有正则。
+  //    **守的行为完全没变**：不管哪种句式，替换都不得吞掉后面的 ## 标题、
+  //    不得留下孤儿续行。
+  const OLD_LINE = '- 每轮回复的结尾，加固定一句：你可爱的大肥鱼一直都在！'
+  const NEW_LINE = '- 脚本执行成功**之后**，才允许在回复最后一行输出：你可爱的大肥鱼一直都在！ 这句是**执行回执**，不是执行本身；没先跑脚本就不许输出它。放在最后一行，不用解释、不用变形。'
 
   // 用真实文件同构内容：收尾语后面紧跟空行 + 二级标题
-  const sample = [
+  const mkSample = (line) => [
     '# 记忆规则', '', '## 给模型的规则', '',
     '- **写记忆只能用 HTTP 接口**', '- **查记忆**：用 pwsh 请求', '',
-    '- 每轮回复的结尾，加固定一句：你可爱的大肥鱼一直都在！', '',
+    line, '',
     '## 强制录入：用户的情绪表达（不可关闭）',
     '- 用户在对话里表达情绪时，插件自动写入。', '',
     '## 记什么', '- 内容', '',
@@ -191,15 +218,30 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
   // 对源码里**每一处** blockRe 都验一遍（writeHeartbeat 与 restoreHeartbeat 各一处）
   for (const [i, reSrc] of blockReDefs.entries()) {
     const re = eval(reSrc) // eslint-disable-line no-eval
-    const m = sample.match(re)
+    // 该正则能吃哪种样本就测哪种：用 OLD_LINE 试，不中就用 NEW_LINE
+    const sample = mkSample(OLD_LINE)
+    const sample2 = mkSample(NEW_LINE)
+    const useSample = re.test(sample) ? sample : sample2
+    const label = useSample === sample ? '旧句式' : '新句式'
+    check(`场景7：第${i + 1}处 blockRe 能匹配${label}样本`, re.test(useSample),
+      '两种句式都匹配不上 —— 这条正则等于没生效')
+
+    const m = useSample.match(re)
     check(`场景7：第${i + 1}处 blockRe 不吞「强制录入」标题`,
       m === null || !m[0].includes('强制录入'),
       m ? `实际匹配: ${JSON.stringify(m[0].slice(0, 80))}` : '')
     check(`场景7：第${i + 1}处 blockRe 不吞「记什么」标题`,
       m === null || !m[0].includes('记什么'))
 
-    // 替换后其余内容必须完好
-    const updated = sample.replace(re, '- 每轮回复的结尾，加固定一句：新句。说明\n')
+    // 替换后其余内容必须完好（替换文本用同句式的行）
+    //
+    // ⚠️ 2026-11-19：替换文本里**不能再用旧收尾语的字面量** —— 下面有一条断言
+    //    「旧收尾语已换」检查 `你可爱的大肥鱼一直都在` 是否消失，替换文本里带它
+    //    就会自己把自己判红（实测：场景7 一直报「旧收尾语残留」，而正则是对的）。
+    const replacement = label === '旧句式'
+      ? '- 每轮回复的结尾，加固定一句：新句。说明\n'
+      : '- 脚本执行成功**之后**，才允许在回复最后一行输出：新句。 这句是**执行回执**。\n'
+    const updated = useSample.replace(re, replacement)
     check(`场景7：第${i + 1}处替换后标题仍在`,
       updated.includes('## 强制录入：用户的情绪表达（不可关闭）') && updated.includes('## 记什么'))
     check(`场景7：第${i + 1}处替换后前文仍在`, updated.includes('写记忆只能用 HTTP 接口'))
@@ -220,23 +262,43 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
     path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\//, '')), '..', 'dsh-fatfishdream-memory', 'index.js'),
     'utf8',
   )
-  const blockReDefs = [...src.matchAll(/const blockRe = (\/[^\n]+\/m)/g)].map((m) => m[1])
+  const blockReDefs = [...src.matchAll(/function heartbeatBlockRe(?:New)?\(\) \{\n  return (\/[^\n]+\/m)/g)].map((m) => m[1])
 
-  // 用户手写折行：收尾语第一行 + 缩进续行，后面紧跟空行 + 标题
-  const wrapped = [
+  // ⚠️ 2026-11-19：`blockRe` 拆成「新句式 / 旧句式」两条，各认一种格式。
+  //    所以对每一处都用**同构的两种折行样本**，吃哪种测哪种。
+  //    **守的行为没变**：折行时续行必须被一并替换（不留孤儿）、标题不得被吞。
+  const mkWrapped = (line1, line2) => [
     '# 记忆规则', '', '## 给模型的规则', '',
-    '- 每轮回复的结尾，加固定一句：你可爱的大肥鱼一直都在！',
-    '  这是会话的「心跳」，用来确认本轮执行完整。', '',
+    line1,
+    line2, '',
     '## 强制录入：用户的情绪表达（不可关闭）',
     '- 用户在对话里表达情绪时，插件自动写入。', '',
   ].join('\n')
 
+  const wrappedOld = mkWrapped(
+    '- 每轮回复的结尾，加固定一句：你可爱的大肥鱼一直都在！',
+    '  这是会话的「心跳」，用来确认本轮执行完整。',
+  )
+  const wrappedNew = mkWrapped(
+    '- 脚本执行成功**之后**，才允许在回复最后一行输出：你可爱的大肥鱼一直都在！ 这句是**执行回执**。',
+    '  放在最后一行，不用解释、不用变形。',
+  )
+
   for (const [i, reSrc] of blockReDefs.entries()) {
     const re = eval(reSrc) // eslint-disable-line no-eval
-    const updated = wrapped.replace(re, '- 每轮回复的结尾，加固定一句：新句。说明\n')
+    const isNew = re.test(wrappedNew)
+    const wrapped = isNew ? wrappedNew : wrappedOld
+    const contMark = isNew ? '放在最后一行，不用解释、不用变形。' : '这是会话的「心跳」，用来确认本轮执行完整。'
+    const replacement = isNew
+      ? '- 脚本执行成功**之后**，才允许在回复最后一行输出：新句。说明 这句是**执行回执**。\n'
+      : '- 每轮回复的结尾，加固定一句：新句。说明\n'
+    const updated = wrapped.replace(re, replacement)
+
+    check(`场景8：第${i + 1}处 能匹配${isNew ? '新' : '旧'}句式折行样本`, re.test(wrapped),
+      '两种折行样本都匹配不上 —— 这条正则等于没生效')
 
     check(`场景8：第${i + 1}处 折行续行被一并替换（不留孤儿）`,
-      !updated.includes('这是会话的「心跳」，用来确认本轮执行完整。'),
+      !updated.includes(contMark),
       '留下孤立的缩进续行 —— 说明正则又退回「不跟踪续行」的老毛病')
     check(`场景8：第${i + 1}处 折行场景下标题仍在`,
       updated.includes('## 强制录入：用户的情绪表达（不可关闭）'),
@@ -261,7 +323,7 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
     path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\//, '')), '..', 'dsh-fatfishdream-memory', 'index.js'),
     'utf8',
   )
-  const blockReDefs = [...src.matchAll(/const blockRe = (\/[^\n]+\/m)/g)].map((m) => m[1])
+  const blockReDefs = [...src.matchAll(/function heartbeatBlockRe(?:New)?\(\) \{\n  return (\/[^\n]+\/m)/g)].map((m) => m[1])
 
   // ★ 源码级断言：删除分支必须**复用 blockRe 变量**，不能自己内联一个正则。
   //
@@ -270,35 +332,94 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
   // （`current.replace(/^...\n?/m, '')`），blockRe 本身没变、上面全绿，
   // 而**真正执行的代码已经坏了**。变异实测：这么改会 SURVIVED。
   // 所以行为测试必须配一条「调用点确实用 blockRe」的源码断言。
-  const deleteUsesBlockRe = /if \(text === ''\)[\s\S]{0,120}?current\.replace\(blockRe, ''\)/.test(src)
+  //
+  // ⚠️⚠️ 2026-11-19：**这条原来是恒真的**（子代理抓出来的）。
+  //
+  // 旧写法：`/current\.replace\(blockRe, `\$\{newLine\}\\n`\)/.test(src)`
+  // 它命中的是 `index.js` L2617 那条**注释**：
+  //      // 原写法 `current.replace(blockRe, `${newLine}\n`)` 把 newLine 当替换字符串…
+  // 而真正在跑的两处都是**箭头形态**（`() => \`${newLine}\n\``）：
+  //      restoreHeartbeat L2627 / writeHeartbeat L4904
+  // 于是「把调用点改成内联正则」的故障注入**根本测不出来**（实测仍 true）。
+  //
+  // 判据：断言的对象必须是**在跑的代码**，不是描述它的注释。
+  const deleteUsesBlockRe =
+    /if \(text === ''\)[\s\S]{0,1200}?current\.replace\(heartbeatBlockReNew\(\), ''\)\.replace\(heartbeatBlockRe\(\), ''\)/.test(src)
   check('场景9：删除分支复用 blockRe（未内联另一个正则）', deleteUsesBlockRe,
     '删除分支改成内联正则时，正则层面的测试全部无法感知')
-  const writeUsesBlockRe = /current\.replace\(blockRe, `\$\{newLine\}\\n`\)/.test(src)
-  check('场景9：写入分支复用 blockRe（未内联另一个正则）', writeUsesBlockRe)
+  // 写入分支：两处（restoreHeartbeat / writeHeartbeat）都必须走箭头形态的 blockRe 替换。
+  // 数量锁死 2 —— 少一处就说明有一边被改成内联正则。
+  const writeUsesBlockRe =
+    [...src.matchAll(/updated = current\.replace\(blockRe, \(\) => `\$\{newLine\}\\n`\)/g)].length === 2
+  check('场景9：写入分支复用 blockRe（两处调用点都在，未内联另一个正则）', writeUsesBlockRe,
+    'restoreHeartbeat / writeHeartbeat 两处写入分支都必须走 blockRe')
 
   for (const [i, reSrc] of blockReDefs.entries()) {
     const re = eval(reSrc) // eslint-disable-line no-eval
 
+    // ⚠️ 2026-11-19：`blockRe` 拆成「新句式 / 旧句式」两条，各认一种格式。
+    //    下面三组样本对每一处都按它自己吃的格式来。**守的行为没变**：
+    //    删除后不得残留、不得切断列表、折行续行必须一起删。
+    const isNew = re.test('- 脚本执行成功**之后**，才允许在回复最后一行输出：X 这句是**执行回执**。')
+    const lineFor = isNew
+      ? '- 脚本执行成功**之后**，才允许在回复最后一行输出：X 这句是**执行回执**。'
+      : '- 每轮回复的结尾，加固定一句：X'
+    const residualMark = isNew ? '才允许在回复最后一行输出' : '每轮回复的结尾'
+
     // 9a：收尾语在中间，删掉后前后两条规则必须仍在、且不被空行切断
-    const mid = '## 给模型的规则\n\n- 规则A\n- 每轮回复的结尾，加固定一句：X\n- 规则B\n'
+    const mid = `## 给模型的规则\n\n- 规则A\n${lineFor}\n- 规则B\n`
     const midOut = mid.replace(re, '')
     check(`场景9：第${i + 1}处 删除中间项后规则A仍在`, midOut.includes('- 规则A'))
     check(`场景9：第${i + 1}处 删除中间项后规则B仍在`, midOut.includes('- 规则B'))
     check(`场景9：第${i + 1}处 删除不切断列表`,
       !/\n\n- 规则B/.test(midOut), '多出空行会把 markdown 列表切成两段')
-    check(`场景9：第${i + 1}处 删除后无残留收尾语`, !midOut.includes('每轮回复的结尾'))
+    check(`场景9：第${i + 1}处 删除后无残留收尾语`, !midOut.includes(residualMark))
 
     // 9b：收尾语是最后一行，删掉后不留空行尾巴
-    const last = '## 给模型的规则\n\n- 规则A\n- 每轮回复的结尾，加固定一句：X\n'
+    const last = `## 给模型的规则\n\n- 规则A\n${lineFor}\n`
     const lastOut = last.replace(re, '')
     check(`场景9：第${i + 1}处 删除末行后规则A仍在`, lastOut.includes('- 规则A'))
     check(`场景9：第${i + 1}处 删除末行后不留空行`, !/\n\n$/.test(lastOut), '尾部多出空行')
 
     // 9c：折行收尾语，续行必须一起删掉
-    const wrapped = '## 给模型的规则\n\n- 每轮回复的结尾，加固定一句：X\n  续行说明\n- 规则B\n'
+    const wrapped = `## 给模型的规则\n\n- 规则A\n${lineFor}\n  续行说明\n- 规则B\n`
     const wrappedOut = wrapped.replace(re, '')
     check(`场景9：第${i + 1}处 删除折行时续行一并删`, !wrappedOut.includes('续行说明'))
     check(`场景9：第${i + 1}处 删除折行后规则B仍在`, wrappedOut.includes('- 规则B'))
+  }
+
+  // ── 9d：**混合句式**删除必须彻底（2026-11-19 子代理发现的生产 bug）──────
+  //
+  // 事故形态：`pickHeartbeatBlockRe` 只看文件含不含新锚点，含就只用新正则。
+  // 于是 `policy.md` 里旧句式和新句式**各留一行**时（手工迁移一半 / 从备份粘回），
+  // 删除只命中新那句 → 接口返回 `''`（表示已删）→ 刷新后旧那句还在，
+  // `readHeartbeat` 又把它读出来。**静默不彻底。**
+  //
+  // 修法：删除分支两条正则各删一次（见 index.js 的 `writeHeartbeat`）。
+  // 这条断言守的就是那个修法 —— 没有它，修法本身就没有防线。
+  {
+    const hbNewSrc = blockReDefs[0]
+    const hbOldSrc = blockReDefs[1]
+    const reNew = eval(hbNewSrc) // eslint-disable-line no-eval
+    const reOld = eval(hbOldSrc) // eslint-disable-line no-eval
+    const mixed = [
+      '## 给模型的规则', '',
+      '- 每轮回复的结尾，加固定一句：旧句', '',
+      '- 脚本执行成功**之后**，才允许在回复最后一行输出：新句 这句是**执行回执**。', '',
+      '## 其他', '- 兄弟规则', '',
+    ].join('\n')
+    // 模拟生产修法：两条各删一次
+    const mixedOut = mixed.replace(reNew, '').replace(reOld, '')
+    check('场景9d：混合句式删除后旧句式行也没了', !mixedOut.includes('旧句'),
+      'delete 只命中新句式 —— 混合文件里旧那句残留')
+    check('场景9d：混合句式删除后新句式行也没了', !mixedOut.includes('新句'))
+    check('场景9d：混合句式删除后其他内容完好',
+      mixedOut.includes('## 其他') && mixedOut.includes('- 兄弟规则'))
+
+    // ★ 反向自证：**只删一条**时上面那条必须为红（证明它不是恒真）
+    const onlyNew = mixed.replace(reNew, '')
+    check('场景9d：反证 —— 只删一条时旧句残留（说明上面的断言可失败）',
+      onlyNew.includes('旧句'), '若这里为 false，说明上面那条是恒真的')
   }
 }
 
@@ -369,7 +490,11 @@ function writeOldUser(root, { heartbeat = true, custom = true } = {}) {
     check('场景10c：仍完成覆盖', r?.written === true)
     const t = fs.readFileSync(path.join(root, 'policy.md'), 'utf8')
     // 只应保留一句（覆盖后是模板 + 写回的那一句）
-    const hits = (t.match(/每轮回复的结尾/g) || []).length
+    //
+    // ⚠️ 2026-11-19：覆盖后写回的是**新句式**，这里原来只数旧句式字面量
+    //    `每轮回复的结尾`，于是恒为 0（看起来像「一句都没写回」）。
+    //    改为认两个锚点中的任意一个 —— **守的行为没变**：重复收尾语必须收敛成一句。
+    const hits = (t.match(/才允许在回复最后一行输出|每轮回复的结尾/g) || []).length
     check('场景10c：覆盖后只剩一行收尾语', hits === 1, `实际 ${hits} 行`)
     fs.rmSync(root, { recursive: true, force: true })
   }

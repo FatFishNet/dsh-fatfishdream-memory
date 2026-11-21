@@ -150,6 +150,68 @@ const MUTATIONS = [
     from: 'export function segmentCjk(',
     to: 'export function segmentCjkBroken(',
   },
+  {
+    id: 'fts-query-control-char',
+    file: 'dsh-fatfishdream-memory/db-schema.mjs',
+    desc: 'buildMatchQuery 不清洗控制字符（q 含 %00 时 FTS5 报 unterminated string → 500）',
+    // 2026-11-19 加。实测形态：
+    //   GET /api/dsh-memory/search?q=a%00b → 500 {"error":"unterminated string"}
+    // 撤掉清洗行后 selfcheck-query-nul 的三层断言（纯函数 / 真实 FTS5 / 自证）
+    // 都必须变红，否则这条防线是空的。
+    from: "  const cleaned = String(query ?? '').replace(/[\\u0000-\\u001F\\u007F]/g, ' ')",
+    to: "  const cleaned = String(query ?? '')",
+  },
+  {
+    id: 'workspace-script-content-check',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'ensureWorkspaceScripts 退回「只看文件存在」，模板改动永不同步（版本漂流）',
+    // 2026-11-20 加。实测形态：2026-11-19 夜里 log.ps1 的新版本
+    // （带 turnWrites 输出）**一次都没跑起来** —— 三个工作区全停在 11-18 版。
+    //
+    // 撤掉内容比对后 selfcheck-workspace-script-sync 的 ③（版本漂流必须覆盖）
+    // 与 ⑥（自证）都必须变红。
+    from: "    const actual = createHash('sha256').update(current, 'utf8').digest('hex')",
+    to: '    const actual = wanted // mutated: 永远认为内容一致',
+  },
+  {
+    id: 'turn-miss-log-uses-wrotememory',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'turn-未记流水 退回用 wroteMemory 判据（log.ps1 在工作区 → 恒真 → 全假阳性）',
+    // 2026-11-20 加。实测形态：当天 6 条 turn-未记流水 全部假阳性，
+    // 其中 02:08 那条在 7 秒前刚成功写入 id=1078。
+    // 锚点带完整条件块（多行），确保唯一命中 turn-未记流水 这一处 ——
+    // 别的地方也有 `record.wroteLog !== true` 类似的写法。
+    from: "        record.wroteLog !== true &&\n        (logRouteHits.get(sessionKey) ?? 0) === 0",
+    to: "        !record.wroteMemory &&\n        (logRouteHits.get(sessionKey) ?? 0) === 0",
+  },
+  {
+    id: 'replace-file-no-rollback',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'replaceFile 去掉回滚（写新文件失败时原文件凭空消失）',
+    // 2026-11-20 加。这条路径**正常跑一万次都不会执行**（只有 Windows 上
+    // 目标文件被占用才走），却是用户 policy.md 的最后一道保险。
+    from: '      await rename(backupPath, targetPath)',
+    to: '      // mutated: 回滚被移除',
+  },
+  {
+    id: 'assert-schema-no-deep-recursion',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'assertSupportedSchema 不再递归进 properties（嵌套的坏 schema 漏过）',
+    // 2026-11-20 加。这个函数当前是死代码（硬约束 1 不注册工具），
+    // 但保留着 —— 换认 tools 的 adapter 时它就是现成的防线。
+    // 撤掉递归后 selfcheck-schema-assert-pointer 的 A③ 段必须变红。
+    from: '      assertSupportedSchema(child, `${path}.properties.${name}`)',
+    to: '      // mutated: 不再递归进 properties',
+  },
+  {
+    id: 'pointer-path-ignores-homedir',
+    file: 'dsh-fatfishdream-memory/index.js',
+    desc: 'pointerPath 写死路径、忽略 homedir（多用户/换机时指针位置错）',
+    // 2026-11-20 加。它错位的后果是静的：指针读不到 →
+    // 每次启动回退盘符探测 → 用户自定义记忆根**静默丢失**。
+    from: "    return join(homedir(), '.dsh', 'memory-root.json')",
+    to: "    return join('C:/fixed', '.dsh', 'memory-root.json')",
+  },
   // ---- 下面三个用于验证 selfcheck-pure-utils.mjs 是否真的有效 ----
   {
     id: 'parseJson-bom',
@@ -259,8 +321,21 @@ const MUTATIONS = [
     //
     // 这正是 AGENTS.md 里那条「发现 SURVIVED 先问『它改到的是我以为那处吗』，
     // 别急着补测试」——这一次问对了。
+    // ⚠️ 2026-11-18 第三次修：**注入改成「一行脚本优先、长命令兜底」后，锚点再次失配。**
+    //
+    // 这次的选择比前两次更细：命令本体仍然在注入里（作为兜底写法），但前面
+    // 多了一行 `& .\.dsh-fatfishdream-memory\log.ps1 "一句话结论"`。
+    //
+    // 要守的语义没变 —— **注入里必须有一份可执行命令，模型收到提醒照着就能调**。
+    // 所以变异仍然打在那条长的 `Invoke-RestMethod` 上，而不是打在脚本那行：
+    //   · 打脚本行 → 脚本不存在时仍有长命令可用，变异后行为**没有变化**，
+    //     真跑必然是 SURVIVED（而且是「设计错了」型 SURVIVED，不是盲区）
+    //   · 打长命令 → 脚本不在的新工作区就真的没有可执行写法了
+    //
+    // 这也是把「两种写法并存」写进注入的代价：多一条要守的路，就多一条变异。
+    // 记住判据：**变异要打的那一行，删掉之后行为必须真的变差。**
     from:
-      '            `pwsh 里 \\`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType \'application/json\' -Body (@{text=\'本轮正文\';cwd=(Get-Location).Path;sessionId=$env:DSH_SESSION_ID} | ConvertTo-Json)\\`。` +\n',
+      '            `\\`Invoke-RestMethod -Method Post "$env:DSH_WEB_URL/api/dsh-memory/log" -ContentType \'application/json\' -Body (@{text=\'本轮正文\';cwd=(Get-Location).Path;sessionId=$env:DSH_SESSION_ID} | ConvertTo-Json)\\`` +\n',
     to: '',
   },
   {
@@ -366,8 +441,15 @@ const MUTATIONS = [
     id: 'steer-guard-removed',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '拆掉防无限循环闸门（每轮都会 steer → 本轮永不关闭 → 烧 token）',
-    from: '      if (failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn) {',
-    to: '      if (failStreak >= WRITE_FAIL_STREAK_LIMIT) {',
+    // ⚠️ 2026-11-18：条件里多了总开关 `WRITE_FAIL_NUDGE_ENABLED &&`。
+    // 变异必须带上它，否则锚点失配 → SKIP → 这条防线**静默消失**。
+    // 这正是 AGENTS.md 记过的「变异的 SKIP 必须算失败」那个坑：
+    // 锚点失配时输出看起来一切正常，实际真正的防线一条都没被测。
+    //
+    // 变异语义保持不变：仍然只拆「闸门」这一半（`&& !alreadyNudgedThisTurn`），
+    // 不碰总开关 —— 否则测的就不是闸门了。
+    from: '      if (WRITE_FAIL_NUDGE_ENABLED && failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn) {',
+    to: '      if (WRITE_FAIL_NUDGE_ENABLED && failStreak >= WRITE_FAIL_STREAK_LIMIT) {',
   },
   // ---- 2026-11-16 v2：验证「忘写也要计数」这一半真的被守着 ----
   //
@@ -506,15 +588,19 @@ const MUTATIONS = [
     id: 'heartbeat-regex-eats-heading',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '收尾语正则退回「吞标题」版（保存一次就吞掉后面的 ## 标题）',
-    from: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*(?:\\n[ \\t]+[^\\n]*)*\\n?/m',
-    to: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*\\n(?:(?!^[ \\t]*-)[^\\n]*\\n?)*/m',
+    // ⚠️ 2026-11-19：正则体已从 `writeHeartbeat` 挪进模块级 `heartbeatBlockReNew`
+    // （新句式）与 `heartbeatBlockRe`（旧句式兜底）两个函数。
+    // 变异锚点跟到**新句式**那条 —— 它是当前生产主力（policy.md 用的是新句式）。
+    // **守的行为没变**：仍然必须只吃「行 + 缩进续行」。
+    from: '  return /^[ \\t]*-[^\\n]*才允许在回复最后一行输出[^\\n]*(?:\\n[ \\t]+[^\\n]*)*\\n?/m',
+    to: '  return /^[ \\t]*-[^\\n]*才允许在回复最后一行输出[^\\n]*\\n(?:(?!^[ \\t]*-)[^\\n]*\\n?)*/m',
   },
   {
     id: 'heartbeat-regex-orphan-continuation',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '收尾语正则退回「不跟踪续行」版（用户折行时留下孤儿续行）',
-    from: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*(?:\\n[ \\t]+[^\\n]*)*\\n?/m',
-    to: '    const blockRe = /^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*\\n?/m',
+    from: '  return /^[ \\t]*-[^\\n]*才允许在回复最后一行输出[^\\n]*(?:\\n[ \\t]+[^\\n]*)*\\n?/m',
+    to: '  return /^[ \\t]*-[^\\n]*才允许在回复最后一行输出[^\\n]*\\n?/m',
   },
   // ---- 2026-11-16：删除分支不得内联另一个正则 ----
   //
@@ -527,8 +613,11 @@ const MUTATIONS = [
     id: 'heartbeat-delete-inlines-regex',
     file: 'dsh-fatfishdream-memory/index.js',
     desc: '删除分支内联另一个正则（正则层测试全部无法感知）',
-    from: "      updated = current.replace(blockRe, '')",
-    to: "      updated = current.replace(/^[ \\t]*-[ \\t]*每轮(?:回复)?的?结尾[^\\n]*\\n?/m, '')",
+    // ⚠️ 2026-11-19：删除分支改成「两条正则各删一次」（修混合句式只删一半的 bug），
+    // 锚点跟着更新。**守的行为没变**：调用点必须走 heartbeatBlockRe* 函数，
+    // 不能自己内联一个字面量正则（那样正则层测试全瞎）。
+    from: "      updated = current.replace(heartbeatBlockReNew(), '').replace(heartbeatBlockRe(), '')",
+    to: "      updated = current.replace(/^[ \\t]*-[^\\n]*\\n?/m, '')",
   },
   // 注：2026-11-16 曾加过两条 `dup-guard-*` 变异，守的是「本轮已用 HTTP 写过
   // 则忽略正文标记」的防呆。该防呆已移除（它只能挡入库、挡不住渲染，

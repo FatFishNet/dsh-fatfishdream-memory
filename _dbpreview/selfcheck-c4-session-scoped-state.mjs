@@ -72,8 +72,21 @@ check('turnStartedAt 的写带 sessionKey', /turnStartedAt\.set\(sessionKey/.tes
 check('turnStartedAt 的读带 sessionKey', /turnStartedAt\.get\(sessionKey\)/.test(code))
 check('turnStartedAt 的清带 sessionKey', /turnStartedAt\.delete\(sessionKey\)/.test(code))
 check('logRouteHits 的增带 sessionKey', /logRouteHits\.set\(sid/.test(code) || /logRouteHits\.set\(sessionKey/.test(code))
-check('logRouteHits 的读带 sessionKey', /logRouteHits\.get\(sessionKey\)/.test(code))
-check('logRouteHits 的清带 sessionKey', /logRouteHits\.delete\(sessionKey\)/.test(code))
+check(
+  'logRouteHits 的读带 sessionKey',
+  /logRouteHits\.get\(sessionKey\)/.test(code) || /logRouteHits\.get\(sid\)/.test(code),
+)
+// ★ 2026-11-20 修：清理点从 `turn-stopping`（sessionKey）**搬到了 `turn/end`（sid）**。
+//
+// 为什么搬：`turn-stopping` 是 serial、先于 `turn/end` 执行，
+// 在那边删会让 `backfill-check` 恒读 0 —— 实测全部日志 17 次 `routeHits` 全是 0。
+// 所以这条断言不能再写死 `sessionKey`：它守的是「清理必须按会话分键」，
+// 而不是「清理必须发生在某个特定回调里」。
+// 两处都认，但**必须真的带键**（不带键就是回到串账的老 bug）。
+check(
+  'logRouteHits 的清带 sessionKey',
+  /logRouteHits\.delete\(sessionKey\)/.test(code) || /logRouteHits\.delete\(sid\)/.test(code),
+)
 
 console.log('\n=== 3. 行为隔离：两个会话交错时必须互不污染 ===')
 // 从源码抽出「打点 → 结算」这段逻辑，用两个会话交错跑

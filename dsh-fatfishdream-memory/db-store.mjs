@@ -391,11 +391,36 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
    */
   function routeTable(projectName) {
     const d = open()
+    // ⚠️ 2026-11-19 修（TODO 待办 M）：**rules 侧必须排除 `review='retracted'`**。
+    //
+    // ## 改了什么
+    //
+    // 原来 rules 与 logs 用的都是同一句 `WHERE status='active' AND topic IS NOT NULL`。
+    // 但这两张表的列**不一样**：
+    //   · `rules` 有 `review` 列（用户在 GUI 里可以「撤销」一条规则 → review='retracted'）
+    //   · `logs` **没有** `review` 列（流水不存在「撤销」这个动作）
+    //
+    // 所以只在 rules 那段加 `review IS NOT 'retracted'`，**logs 段原样不动**。
+    // 往 logs 上加这个条件会直接报 `no such column: review`。
+    //
+    // ## 为什么必须修
+    //
+    // 历史修复 `search()`（2026-11-17 第 L 条）加了同一个条件，理由是
+    // 「用户明确撤销的规则仍被当有效结论检索给模型」。`routeTable` 是**同一类通道**
+    // —— 它告诉模型「记忆里有哪些主题、各多少条」，撤销的规则仍然算在数字里，
+    // 等于**用户撤销了但索引还在替他数**。这是 L 的漏网之鱼。
+    //
+    // ## 判据
+    //
+    // 造一条 `review='retracted'` 的 rules 记录，`routeTable` 的计数**不应**包含它；
+    // 同时造一条 `status='deleted'` 的，也不应包含（原有行为，别改坏）。
     const rows = d
       .prepare(
         `SELECT topic, COUNT(*) n FROM (
            SELECT topic, scope FROM rules
-            WHERE status='active' AND topic IS NOT NULL AND (scope=? OR scope=?)
+            WHERE status='active' AND topic IS NOT NULL
+              AND review IS NOT 'retracted'
+              AND (scope=? OR scope=?)
            UNION ALL
            SELECT topic, scope FROM logs
             WHERE status='active' AND topic IS NOT NULL AND (scope=? OR scope=?)
@@ -756,7 +781,7 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
    * 为什么单独一个方法：2026-11-13 补历史遗留的空 topic 时，
    * 需要批量给 156 条打标签但**不能碰正文**（updateText 会同时标
    * review='edited'，那会污染「用户改过」的语义）。
-   * 也不走 `write`/`pwsh` 直改库 —— 那是硬约束 6 明令禁止的。
+   * 也不走 `write`/`pwsh` 直改库 —— 那是硬约束 5 明令禁止的。
    *
    * 安全性：只允许改 topic 这一列；topic 传 null/'' 视为清空。
    * 不做正则批量，调用方必须给明确的 id。

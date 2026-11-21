@@ -206,6 +206,19 @@ const hasLimitConst = INDEX_SRC.includes('WRITE_FAIL_STREAK_LIMIT = 1')
 const reminderChecksLimit = /failStreak >= WRITE_FAIL_STREAK_LIMIT/.test(INDEX_SRC)
 const reminderResetsOnDelivered = /if \(delivered\) \{[\s\S]*?writeFailStreak\.set\(sessionKey, 0\)/.test(INDEX_SRC)
 
+// ④b 总开关（2026-11-18 新增）：兜底通道可以被临时关掉，但必须显式记录。
+//
+// ## 为什么加这条
+//
+// 2026-11-18 用户决定先关掉兜底试用（改成短命令脚本 + 人工看流水）。
+// 关法是一个常量 `WRITE_FAIL_NUDGE_ENABLED = false`，不是删代码。
+//
+// 断言它「存在」而不是断言它「为 false」：这个值本来就是会变的开关，
+// 断言成固定值等于把「用户此刻的选择」钉进测试 —— 下次改回 true 就要改测试，
+// 而改测试的门槛一低，就会有人顺手把断言删掉。
+// 真正要守的是「开关还在、且是常量而不是埋进表达式」。
+const hasNudgeFlag = /const WRITE_FAIL_NUDGE_ENABLED = (true|false)\b/.test(INDEX_SRC)
+
 // ④ 防无限循环闸门（2026-11-17 16:26 新增，随阈值改 1 一起加）
 //
 // ## 为什么这条断言必须存在
@@ -226,7 +239,7 @@ const guardKeyNamespaced = /FATFISH_STEER_GUARD_KEY = `\$\{PLUGIN_SOURCE_KIND\}:
 //   ② steer 的 if 条件里带了 `!alreadyNudgedThisTurn`
 // 只查一半是不够的 —— 定义在但条件没用它，等于没闸门。
 const guardDefinedByTurn = /const alreadyNudgedThisTurn =[\s\S]{0,160}=== bpTurn/.test(INDEX_SRC)
-const guardUsedInCondition = /if \(failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn\)/.test(INDEX_SRC)
+const guardUsedInCondition = /if \(WRITE_FAIL_NUDGE_ENABLED && failStreak >= WRITE_FAIL_STREAK_LIMIT && !alreadyNudgedThisTurn\)/.test(INDEX_SRC)
 const guardBlocksRepeat = guardDefinedByTurn && guardUsedInCondition
 
 // ⚠️ `reminderUsesSafePush` 在下面 G 段才定义（它依赖 remindIdx），
@@ -243,6 +256,7 @@ for (const [label, ok, detail] of [
   ['有防无限循环闸门', hasSteerGuard, '缺它 → steer 会让本轮永不关闭'],
   ['闸门键带包名前缀', guardKeyNamespaced, '用大众名字会和别的插件撞（用户 2026-11-17 提醒）'],
   ['闸门按 turn 判重', guardBlocksRepeat, '缺它 → 同一轮反复 steer，就是那个无限循环'],
+  ['兜底总开关是显式常量', hasNudgeFlag, '缺它 → 临时关掉兜底这件事没有任何可核对痕迹'],
 ]) {
   // DEFERRED 占位不在这里判定，见 G 段末尾
   if (ok === DEFERRED) continue

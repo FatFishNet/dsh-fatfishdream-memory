@@ -20,7 +20,7 @@
 启动是否正常看有没有这一行：
 
 ```
-[health-check-verdict] 通过：9 项全部就位
+[health-check-verdict] 通过：10 项全部就位
 ```
 
 缺哪项它会直接点名，比「记忆不好用了」有用得多。
@@ -45,7 +45,7 @@
 
 3. **改了 `index.js` / `client.js` 的行数，必须重算 `docs/项目地图.md` 里的行号。**
    地图是绝对行号，插几行后面全漂。**准绳是四个脚本，不是一个**：
-   `verify-map-content`（带符号名的引用）+ `verify-map-forms`（9 种结构化形态）
+   `verify-map-content`（带符号名的引用）+ `verify-map-forms`（10 种结构化形态，A–J）
    + `verify-symbol-lines`（§3.1 裸数字表）+ `verify-map`（兜底判非空）。
    **只跑 `verify-map` 不够** —— 它只判「该行非空」，整片漂移也全绿。
 
@@ -74,7 +74,7 @@ foreach ($s in 'verify-functions','verify-map','verify-map-content','verify-map-
 ```
 
 > 更省事的是直接跑 `_dbpreview\run-all.mjs` —— 它是脚本清单的**唯一真相**
-> （当前 53 个），这份 14 个的清单只是「不依赖 DSH」的子集。
+> （当前 73 个），这份 14 个的清单只是「不依赖 DSH」的子集。
 
 **改了 UI（`client.js`）的话**：它是浏览器模块，
 禁用→启用插件**不会**重新加载它，必须**完整重启客户端**再看效果。
@@ -91,7 +91,7 @@ foreach ($s in 'verify-functions','verify-map','verify-map-content','verify-map-
 > 另外 4 个虽然会读环境变量，但缺环境时**自动跳过 HTTP 段并以 0 退出**：
 > `selfcheck-archive`（存储层 36 项照跑）、`selfcheck-breakdown`（存储层 18 项）、
 > `verify-injection-consistency`、`selfcheck-log-alive`。所以**硬依赖只有那 3 个**。
-> 脚本总数不写死 —— 唯一真相是 `run-all.mjs` 的 `SCRIPTS` 数组（当前 53 个）。
+> 脚本总数不写死 —— 唯一真相是 `run-all.mjs` 的 `SCRIPTS` 数组（当前 73 个）。
 
 ### 代码风格
 
@@ -119,7 +119,7 @@ dsh plugin --profile <你的profile> add "git+https://github.com/FatFishNet/dsh-
 dsh plugin --profile <你的profile> add <clone 路径>/dsh-fatfishdream-memory
 ```
 
-**运行要求**：Node ≥ 20（用 `node:sqlite`，不需要装任何数据库驱动）。
+**运行要求**：Node ≥ 22.5（`node:sqlite` 自该版本起内置；不需要装任何数据库驱动）。与 DSH 自带 runtime 一致（本机 v24）。
 
 ---
 

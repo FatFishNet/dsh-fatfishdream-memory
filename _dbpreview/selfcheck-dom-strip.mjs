@@ -11,9 +11,19 @@
 const MEM_STRIP_RE = /^[ \t]*<!--mem-(?:log|fact|note|fix)\b[^`]*?-->[ \t]*$/gm
 const MEM_PARTIAL_RE = /^[ \t]*<!--mem-(?:l(?:og)?|f(?:act|ix)?|n(?:ote)?)?[\s\S]*$/m
 
+/**
+ * 「假装是标记的命令式注释」—— 2026-11-21 用户实报后新增。
+ *
+ * 现场：另一个工作区把写记忆写成 `<!-- 记忆写入命令：…log.ps1 "正文" -->`，
+ * 既没进库（解析正则不认）也没被擦掉（擦除正则只认 `mem-*`），原样露在界面上。
+ */
+const MEM_COMMENT_LIKE_RE = /^[ \t]*<!--[ \t]+[^`\n]{2,}?-->[ \t]*$/gm
+
 /** 复刻 client.js 里的剥离逻辑 */
 function strip(src) {
   let after = src.replace(MEM_STRIP_RE, '')
+  // ★ 2026-11-21：与 client.js 同序 —— 完整标记 → 命令式注释 → 未闭合尾巴
+  after = after.replace(MEM_COMMENT_LIKE_RE, '')
   const partial = MEM_PARTIAL_RE.exec(after)
   if (partial) {
     after = after.slice(0, partial.index) + after.slice(partial.index + partial[0].length)
@@ -77,9 +87,21 @@ check(
 )
 
 check(
-  '非 mem 的 HTML 注释不动',
+  // ★ 2026-11-21 用户定案（方案 A）：**正文里的普通 HTML 注释也擦掉。**
+  //
+  // 原断言（2026-11-13 写的）是「非 mem 的 HTML 注释不动」，
+  // 而 ForzaOverlay 那种「命令式注释」要擦 —— 两者形态完全一样
+  // （`<!--` + 空格 + 中文 + `-->`，独占一行），**光看形态区分不开**。
+  //
+  // 用户选择「宁可一起擦」。判据：这个项目里**只有模型会写 `<!-- -->`**，
+  // 而它写这个只可能是两种意图 ——
+  //   ① 想触发标记（写法错了，擦掉正好）
+  //   ② 想写给人看的注释（HTML 注释渲染后本来就不显示，等于白写）
+  // **两种情况擦掉都不亏。**
+  // 代价也写清：从此「看不见的注释」这个概念在本插件里不存在。
+  '普通 HTML 注释也擦掉（2026-11-21 用户定案 A）',
   strip('<!-- 普通注释 -->'),
-  '<!-- 普通注释 -->',
+  '',
 )
 
 check(
@@ -228,6 +250,100 @@ console.log('\n=== 6. 收窄「打标记」的范围（2026-11-15 滚动条事�
   if (dedupesStyle) pass++
   else fail++
   console.log(`${dedupesStyle ? '✅' : '❌'} 注入样式前先查重（避免重载后堆积）`)
+}
+
+console.log('\n=== 5. 「命令式注释」擦除（2026-11-21 用户实报）===\n')
+
+// 现场原文（ForzaOverlay 工作区里实际露出来的那一行）
+const FIELD_CASE =
+  '<!-- 记忆写入命令：& .\\.dsh-fatfishdream-memory\\log.ps1 "用户撒娇捏小屁股" "闲聊" -->'
+
+check('现场形态：被擦掉', strip(FIELD_CASE), '')
+check(
+  '现场形态：前后正文保留',
+  strip('前一句\n' + FIELD_CASE + '\n后一句'),
+  '前一句\n\n后一句',
+)
+
+// 同类变体 —— 按**形态**判断，不绑死在 log.ps1 上
+check('变体：POST 接口写法', strip('<!-- 记忆：POST /api/dsh-memory/log -->'), '')
+check('变体：带制表符缩进', strip('\t<!-- 记一条流水 -->'), '')
+
+// ★ 四条反向守卫：宁可漏，不可误伤
+check(
+  '不误伤：讲解格式时写的行内代码',
+  strip('写法是 `<!-- 某某 -->` 这样'),
+  '写法是 `<!-- 某某 -->` 这样',
+)
+check('不误伤：普通正文', strip('这是一段普通的话，没有注释'), '这是一段普通的话，没有注释')
+check('不误伤：空壳注释', strip('<!---->'), '<!---->')
+check(
+  '不误伤：跨行的注释块（多行不在此规则内）',
+  strip('<!--\n记忆写入\n-->'),
+  '<!--\n记忆写入\n-->',
+)
+check(
+  '不误伤：真实 mem-log 标记仍由 MEM_STRIP_RE 处理',
+  strip('<!--mem-log topic=开发日志 summary=测试 -->'),
+  '',
+)
+
+// ★ 源码一致性：本脚本复刻了两条正则，必须与 client.js 逐字一致。
+//   不加这条的话，改了 client.js 它会静默测着旧规则
+//   （这正是 AGENTS.md 记的「断言在，被测的差异不在」）。
+{
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..')
+  const CLIENT = path.join(ROOT, 'dsh-fatfishdream-memory', 'client.js')
+  const src = fs.readFileSync(CLIENT, 'utf8')
+
+  check(
+    '源码一致性：client.js 里的 MEM_STRIP_RE 与本脚本相同',
+    src.includes('const MEM_STRIP_RE = /^[ \\t]*<!--mem-(?:log|fact|note|fix)\\b[^`]*?-->[ \\t]*$/gm'),
+    true,
+  )
+  check(
+    '源码一致性：client.js 里的 MEM_COMMENT_LIKE_RE 与本脚本相同',
+    src.includes('const MEM_COMMENT_LIKE_RE = /^[ \\t]*<!--[ \\t]+[^`\\n]{2,}?-->[ \\t]*$/gm'),
+    true,
+  )
+  // 接线核对：新正则必须**真的被用上**，不能只是定义了
+  check(
+    '接线：MEM_COMMENT_LIKE_RE 在 stripMemMarkers 里被 replace 调用',
+    /after\.replace\(MEM_COMMENT_LIKE_RE/.test(src),
+    true,
+  )
+
+  // ★★ 2026-11-21 血的教训：**「要不要处理」的判据也必须认注释形态。**
+  //
+  // 我第一版只改了 `acceptNode` 和擦除正则，**漏了 `hasMarker` / `COMPLETE_MARKER_HINT`**。
+  // 用户实测（DevTools）：擦除器装了、`首屏擦除 0 处`，而
+  // 正文里的 `<!-- 测试 -->` 照样露着 —— 因为 MutationObserver 收到新消息时
+  // **先问 `hasCompleteMarker(n)`**，它只认 `<!--mem-` → false → 根本不进擦除。
+  //
+  // 判据：这**四个**地方必须同时认两种形态，少一处就是「改了一端、另一端没接上」：
+  //   ① acceptNode 的候选筛  ② MEM_STRIP_RE  ③ MEM_COMMENT_LIKE_RE
+  //   ④ hasMarker  ⑤ COMPLETE_MARKER_HINT（这两个决定「要不要处理」）
+  {
+    // hasMarker 必须认 `<!-- ` 带空格
+    const hasMarkerSrc = (() => {
+      const at = src.indexOf('const hasMarker = (node) =>')
+      return at < 0 ? '' : src.slice(at, at + 900)
+    })()
+    check('hasMarker 认「命令式注释」形态（<!-- 带空格）',
+      hasMarkerSrc.includes("includes('<!-- ')"),
+      true)
+
+    // COMPLETE_MARKER_HINT 必须同时含 mem- 与 `<!-- `
+    const m = src.match(/const COMPLETE_MARKER_HINT = \/(.+?)\/([a-z]*)/)
+    check('能解析 COMPLETE_MARKER_HINT 正则', m !== null, true)
+    if (m) {
+      const body = m[1]
+      check('COMPLETE_MARKER_HINT 含 mem- 分支', body.includes('mem-'), true)
+      check('COMPLETE_MARKER_HINT 含「<!-- 」分支', body.includes('<!-- '), true)
+    }
+  }
 }
 
 console.log(`\n────────────────\n${pass} 通过 / ${fail} 失败`)

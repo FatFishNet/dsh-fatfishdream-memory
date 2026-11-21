@@ -219,7 +219,16 @@ trial(
 console.log('\n【④ 删锚点退回裸描述 → 必须红（盲区护栏）】')
 trial(
     `L${FTB?.n} 删掉 fn:findTableById 锚点`,
-    () => original.replace(new RegExp(`^(L${FTB.n})\\s{2,}fn:findTableById\\s*\\r?$`, 'm'), `$1  findTableById 定义`),
+    // ⚠️ 2026-11-18：正则里 `fn:findTableById\s*$` 改成 `fn:findTableById\b[\s\S]*?$`。
+    //
+    // 起因：这一行原来写成 `L4425  findTableById 定义`（没有 `fn:` 锚点，是盲区），
+    // 我给它补成 `L4425  fn:findTableById            定义` —— 补对了，
+    // 但这条故障注入的正则要求 `fn:findTableById` 后面**直接行尾**，
+    // 于是「带中文描述」这种合法写法它匹配不上 → 报「变异没匹配上任何内容」。
+    //
+    // 也就是说：**修好了文档，反而让守卫自己红了。** 守卫的锚点写得太窄。
+    // 现在允许锚点后面跟任意描述，只要 `fn:findTableById` 还在行首那一段里即可。
+    () => original.replace(new RegExp(`^(L${FTB.n})\\s{2,}fn:findTableById\\b[\\s\\S]*?$`, 'm'), `$1  findTableById 定义`),
     1,
 )
 

@@ -203,8 +203,29 @@ function isCommentLine(line) {
 }
 
 /**
- * 统计一个名字在源码里的「非定义、非注释」出现次数。
- * @returns {{defLine:number, refs:number}} 找不到定义时 defLine = -1
+ * 统计一个名字在源码里的「**外部**引用次数」（排除定义行、排除自身函数体内的自递归）。
+ *
+ * @returns {{defLine:number, refs:number, selfRefs:number}} 找不到定义时 defLine = -1
+ *
+ * ## 为什么要排除自递归（2026-11-20 补，实测漏检）
+ *
+ * 原实现只跳过**定义那一行**。于是 `assertSupportedSchema` 这种
+ * **在函数体内递归调用自己**的函数，会被算成 `refs = 2`（两处自递归），
+ * 从而被误判为「有人调用」，**躲过死代码检测**。
+ *
+ * 实测：`assertSupportedSchema` 在 index.js 里只有定义 + 两处自递归，
+ * **外部零调用点** —— 它是真死代码，而 `verify-functions` 一直报「无新增死代码」。
+ *
+ * 这正是 AGENTS.md 记过的「检测器本身有盲区，而且它不会告诉你」的又一形态。
+ *
+ * ## 怎么判「自递归」
+ *
+ * 从定义行的 `{` 开始做大括号配对，得到函数体范围 `[bodyStart, bodyEnd]`。
+ * 落在范围内的引用 = 自引用，不算「有人调用」。
+ *
+ * ⚠️ 只对 `function` 声明做这个判断；`const x = () => {}` 的箭头函数体边界
+ *    判起来要另一套逻辑（本项目目前没有死掉的箭头函数），先不覆盖 —— 
+ *    但**不要**因此以为箭头函数已被检查，下面会单独打印一行说明。
  */
 function usageOf(lines, name) {
   const defRe = new RegExp(`^\\s*(async\\s+)?(function|const|let)\\s+${name}\\b`)
@@ -212,17 +233,46 @@ function usageOf(lines, name) {
   for (let i = 0; i < lines.length; i++) {
     if (defRe.test(lines[i])) { defLine = i; break }
   }
-  if (defLine < 0) return { defLine: -1, refs: -1 }
+  if (defLine < 0) return { defLine: -1, refs: -1, selfRefs: 0 }
 
-  // 用单词边界统计，避免 reportBudgetX 之类被算进来
+  // 函数体范围：从定义行往后找第一个 `{`，然后大括号配对（按字符，跨行）
+  const bodyRange = (() => {
+    if (!/\bfunction\b/.test(lines[defLine])) return null
+    // 把定义行到文件末尾拼起来，按字符配对
+    const from = lines.slice(defLine).join('\n')
+    const openAt = from.indexOf('{')
+    if (openAt < 0) return null
+    let depth = 0
+    for (let i = openAt; i < from.length; i++) {
+      if (from[i] === '{') depth++
+      else if (from[i] === '}') {
+        depth--
+        if (depth === 0) {
+          // 把字符偏移换算回「相对于 defLine 的行号」
+          const beforeOpen = from.slice(0, openAt).split('\n').length - 1
+          const beforeClose = from.slice(0, i).split('\n').length - 1
+          return { startLine: defLine + beforeOpen, endLine: defLine + beforeClose }
+        }
+      }
+    }
+    return null
+  })()
+
   const wordRe = new RegExp(`\\b${name}\\b`)
   let refs = 0
+  let selfRefs = 0
   for (let i = 0; i < lines.length; i++) {
     if (i === defLine) continue
     if (isCommentLine(lines[i])) continue
-    if (wordRe.test(lines[i])) refs++
+    if (!wordRe.test(lines[i])) continue
+    // 落在自身函数体内 → 自递归，不算外部调用
+    if (bodyRange && i >= bodyRange.startLine && i <= bodyRange.endLine) {
+      selfRefs++
+      continue
+    }
+    refs++
   }
-  return { defLine: defLine + 1, refs }
+  return { defLine: defLine + 1, refs, selfRefs }
 }
 
 // 参与死代码检测的符号 —— **自动从源码里发现，不维护手工名单**。
@@ -291,22 +341,43 @@ console.log('\n=== C. 死代码检测（定义还在、但已无人调用）===\
 // 当前状态（2026-11-15）：**已清空**。
 //   原来登记的 10 个已在同日全部删除，删除时保留了各自的教训注释。
 const knownDead = new Set([
-  // 暂无。新增死代码时，先确认它真的没人调用，再决定「删」还是「登记在这里」。
+  // ── assertSupportedSchema（2026-11-20 登记）──
+  //
+  // **为什么留而不删**：它是「注册工具前的 schema 自检」，
+  // 而硬约束 1 让本插件**永久不注册任何工具**（`tools-none`，见 apply 里那条 diag）。
+  // 所以它从第一天起就没有调用点，是「工具路线」的遗留。
+  //
+  // **为什么现在才发现**：`usageOf` 原来只跳过定义行，而它在函数体内
+  // **递归调用自己两次** → 被算成「有人调用」→ 死代码检测一直漏掉它。
+  // 2026-11-20 修了 usageOf（排除自递归）之后它立刻暴露出来。
+  //
+  // 保留而不是删掉的理由：硬约束 1 是「当前 adapter 不认 tools 数组」的取舍，
+  // 不是 DSH 协议禁止（AGENTS.md 有明确注释）。哪天换成认 tools 的 adapter、
+  // 重新启用工具路线，这个校验器是当时写好的防线 —— 删了就得重写。
+  // 保留成本是 30 行，重写成本是一次事故。
+  //
+  // ⚠️ **它是死代码这件事本身要记住**：说明「为将来准备的代码」会一直躺在
+  // 死代码检测里，而检测器修好之前它一直显示「无新增死代码」。
+  'assertSupportedSchema',
 ])
 
 let deadNew = 0
 for (const [f, name] of deadCodeCandidates) {
-  const { defLine, refs } = usageOf(files[f], name)
+  const { defLine, refs, selfRefs } = usageOf(files[f], name)
   if (defLine < 0) {
     // A 段已经会因为「找不到」而报错，这里不重复计
     continue
   }
   if (refs === 0) {
     if (knownDead.has(name)) {
-      console.log(`  ☠️  ${name}（L${defLine}）无人调用 —— 已登记在白名单`)
+      const extra = selfRefs > 0 ? `（另含 ${selfRefs} 处自递归）` : ''
+      console.log(`  ☠️  ${name}（L${defLine}）无人调用${extra} —— 已登记在白名单`)
     } else {
       deadNew++
-      console.log(`  ❌ ${name}（L${defLine}）无人调用，且不在白名单里`)
+      const extra = selfRefs > 0
+        ? `（函数体内另有 ${selfRefs} 处自递归，但那不算「有人调用」）`
+        : ''
+      console.log(`  ❌ ${name}（L${defLine}）无人调用${extra}，且不在白名单里`)
       console.log(`     要么接回调用点，要么删掉；确认要暂时保留就加进 knownDead`)
     }
   }
@@ -315,6 +386,12 @@ for (const [f, name] of deadCodeCandidates) {
 if (deadNew === 0) {
   console.log(`  （${deadCodeCandidates.length} 个符号已检查，无新增死代码）`)
 }
+
+// ⚠️ 覆盖边界：本段**不检查** `const x = () => {}` 形式的箭头函数。
+// 原因见 usageOf 的注释（函数体边界要另一套逻辑）。
+// 把边界写出来，而不是让人以为「全查过了」—— 这是 AGENTS.md 里
+// 「校验脚本也有看不见的地方」那条要求的做法。
+console.log('  ℹ️ 覆盖边界：只检查 `function` 声明；`const x = () => {}` 形式不在本段范围内')
 
 console.log('\n源码规模:', Object.entries(totals).map(([k, v]) => `${k}=${v}`).join('  '))
 console.log(

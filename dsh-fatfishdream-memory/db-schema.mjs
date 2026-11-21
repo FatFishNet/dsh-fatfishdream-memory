@@ -45,9 +45,41 @@ export function segmentCjk(text) {
     .trim()
 }
 
-/** 查询词 → FTS5 MATCH 表达式（中文逐字 AND，英文保留整词） */
+/**
+ * 查询词 → FTS5 MATCH 表达式（中文逐字 AND，英文保留整词）。
+ *
+ * ## 为什么必须先剔除控制字符（2026-11-19 实测复现）
+ *
+ * FTS5 的 MATCH 表达式是**它自己的一套小语法**，解析器用 C 字符串，
+ * 于是 `\u0000` 被当成**字符串终止符**而不是普通字符：
+ *
+ *     '"a\u0000b"'            → SQLITE_ERROR: unterminated string
+ *     '"正常" AND "\u0000"'    → SQLITE_ERROR: unterminated string
+ *     '"词" AND "\u0001"'      → OK（其余 C0 控制符不触发）
+ *
+ * 后果：`GET /api/dsh-memory/search?q=a%00b` 直接 500，而不是返回 0 条。
+ * 实测（本机运行中的实例）：`{"ok":false,"error":"unterminated string"}`。
+ *
+ * 这不是「用户会手打 NUL」—— 是**任何能构造 URL 的东西**都能把这条路由打成 500，
+ * 而这条路由被 `/search`、`entries?q=`、`archive?q=` 三个入口共用，
+ * 修在这里一处就等于三个入口一起修好。
+ *
+ * ## 为什么整段 C0 都清掉，而不是只清 NUL
+ *
+ * 只清 `\u0000` 能治这一条，但下一个控制符引起的语法错还得再查一遍。
+ * C0 控制符（含 DEL）在检索语义里**没有任何价值**，统一换成空格最省心：
+ * 它既不会把两个词粘成一个（换空格会被 `segmentCjk` 的 `\s+` 折叠），
+ * 也不会让查询词凭空多出一个 token。
+ *
+ * ## 清完变成空串时返回 `null`
+ *
+ * 与「查询词本来就为空」走同一条路：调用方 `if (!q) return []` →
+ * 返回 0 条，而不是报错。**「查不到」和「查坏了」必须分开** —— 这条修复
+ * 之前两者都是 500，用户看到的是「搜索功能坏了」。
+ */
 export function buildMatchQuery(query) {
-  const segs = segmentCjk(query).split(' ').filter(Boolean)
+  const cleaned = String(query ?? '').replace(/[\u0000-\u001F\u007F]/g, ' ')
+  const segs = segmentCjk(cleaned).split(' ').filter(Boolean)
   if (segs.length === 0) return null
   return segs.map((s) => `"${s.replace(/"/g, '')}"`).join(' AND ')
 }

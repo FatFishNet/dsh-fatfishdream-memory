@@ -7,420 +7,245 @@
 
 ---
 
-## ★ 2026-11-21 当前待办（**从这里开始看**）
 
-> 11-20 那两节「已修」表仍然有效，保留在下面备查。
-> 这一节只列**现在还没做的**。
+## ★ 2026-11-24 当前待办（**从这里开始看**）
+
+> **这一节在 2026-11-24 被整段重写。** 上一版是 11-21 写的，四个问题：
 >
-> **⚠️ 2026-11-21 逐条核实过一遍**：下面这张表里的每一条都在源码里实测确认过
-> **仍然存在**。核实过程中**删掉了 2 条已被证伪的**（U 判断错误、T 已修好），
-> 详见下方「核实记录」。
+> 1. **行号大面积漂移** —— 源码改过，几乎每条的位置都对不上了；
+> 2. **有「描述失准」的条目** —— 例：`Z` 说「三处 ROLLBACK 都裸」，实际 `L765` 早就包了 `try`；
+> 3. **有新发现的问题没进表**（本次核实挖出来的）；
+> 4. **没有标明「哪条能立刻做、哪条要等决策」**，做起来无从下手。
 >
-> **1.4.0 已发版内容**（2026-11-21 升版）：⑦~⑮ 共 9 项修复/新增，
-> 详见 [`CHANGELOG.md`](../CHANGELOG.md) 的 1.4.0 区。
+> **本次核实方法**（可复核）：15 条各交一个子代理，**只读源码**逐条判定；
+> 然后我本人**亲手复验了 4 条最容易判错的**（`Z` / `W` / `X` / `N`）。
+> 每条都附「文件:行号 + 实际代码原文」，行号以**实测位置**为准，不作推断。
+>
+> ⚠️ **行号会再次漂移**。下次动手前若发现对不上，以 `Select-String` 实测为准，
+> 别把这张表当事实来源 —— 这是本项目反复踩过的坑。
 
-### 仍未做（2026-11-21 实测确认）
+### 核实结论总览（15 条：全部仍存在，0 条已修复，3 条描述失准）
 
-| # | 问题 | 在哪 | 为什么还没做 |
+| # | 一句话 | 实测位置 | 判定 |
 |---|---|---|---|
-| **D** | `writePointer` 用裸 `writeFileSync`（非原子）+ `catch {}` 吞一切错误 → 指针写坏了**静默换记忆根** | `index.js` L404 | 项目已有 `atomicWrite` 可复用；难点是「读失败也要留痕」 |
-| **G** | `readState` 解析失败静默 `return fallback` → 下次读-改-写把空 state **写实** | `index.js` L2872 / L2879 | 与 D 同一反模式，建议一起做 |
-| **Z** | 裸 `ROLLBACK` 未包 try → 原始错误被 ROLLBACK 的错误顶掉 | `db-store.mjs` **L765 / L999 / L1108**（L480 已包） | 照抄 L480 的写法即可 |
-| **J** | `serialize` 无重入保护，锁内再调会**永久死锁且无日志** | `index.js` | H / I 都要进锁，必须先做 J |
-| **H** | `ensureLayout` 读-改-写不在锁内，且调用点不 `await` | `index.js` | 依赖 J |
-| **I** | `/memory consolidate` 裸读-改-写 | `index.js` | 依赖 J |
-| **K** | 跨进程 `state.json` 完全无保护 | 全局 | 架构级，与 J 无关（J 只管进程内） |
-| **N** | `purgeByStatus` 依赖 contentless FTS 的 `'delete'`，值不匹配时静默失败 | `db-store.mjs` | 要验证 FTS5 的 delete 语义 |
-| **E** | `/heartbeat` POST 空 body 删收尾语且**无备份** | `index.js` | 要同改 GUI（API 语义变更） |
-| **F** | `policy.md.pre-sync` 只写不读，无恢复路径 | `index.js` | ★★★ 需产品决策 |
-| **W** | `dbCopied` 死变量 | `index.js` L2499 / L2540 | 删 2 行，或放进返回值 |
-| **X** | `rebindDbStore` 的 `catch` 够不到（`close()` 返回失败不抛错） | `index.js` L2969 | 读返回值判断 `r.ok === false` |
-| **Y** | 两处 `setTimeout` 未清理也未 `unref`，卸载后仍执行一次 | `index.js` L3057 / L6084 | 要接到已有 disposer 里 |
-| **S** | 擦除器：标记含反引号时**把消息后半段一起擦掉** | `client.js` `MEM_STRIP_RE` | ⚠️ **改前必读维护手册 §1**，且要完整重启客户端 |
-| **B** | 迁移窗口内仍往旧库写 → 切根后那几条**不在新库** | `index.js` | 依赖 D |
-
-### 核实记录（2026-11-21）
-
-| # | 原待办怎么说 | 实测结果 | 结论 |
-|---|---|---|---|
-| **U** | 「`store.recordEmotion` **不存在**，该分支是死代码」 | `db-store.mjs` L577 有定义、L1773 导出；`index.js` L5401 / L5418 **真实调用** | **❌ 判断错误** —— 它不是死代码，此条作废 |
-| **T** | 「勾『显示已停用』实际无效，后端要 `status=all`，前端从不发」 | 前端 `client.js` L828-829 已在勾选时传 `all`；后端 `index.js` L6951 `includeAll: q.get('status') === 'all'` | **✅ 已修** —— 两端都对上了 |
-| **V** | 「`enqueueAmbiguous` 无调用方」 | 源码剩 6 处命中，**全部是说明「当初为什么删它」的注释** | **✅ 已删**（旧标注正确） |
-
-> **这次核实的方法**：不读 TODO 自己怎么写的，只读**源码**。
-> 每条都 `Select-String` 定位到真实行号后再下判断 —— 因为待办清单记录的是
-> **某个时刻的认知**，不是当前事实（这条教训写在 `AGENTS.md` 里，
-> 起因就是 2026-11-17 拿过期 TODO 当了事实来源）。
-
-> **本版带出去的已知限制**（不修，但要让人知道）：
->
-> | 项 | 为什么留着 |
-> |---|---|
-> | `WRITE_FAIL_NUDGE_ENABLED = false` | 用户 2026-11-18 关的（`steer` 让本轮多跑约 8 秒）。**关闭期间漏记没有运行时报文** —— 现在由补记兜底，但**补记不通知任何人** |
-> | macOS / POSIX 未真机验证 | 只有假 `platform` + `path.posix` 复现（31 条回归），不含真机权限 / APFS / TCC |
-> | `archive` 只增不减 | 无保留期、无上限，实测膨胀约 6× |
-> | 打嗝修复暂缓 | 代码已写好但整段注释掉，等 GUI 选项（用户 2026-11-20 定） |
-
-
-### 已完成（2026-11-20，留档备查）
-
-| 项 | 内容 | 验证 |
-|---|---|---|
-| **Q** | `search?q=%00` → FTS5 `unterminated string` → 500 | `selfcheck-query-nul` 25 断言；实测三条 500 → 200 |
-| **漏记判据①** | `turn-未记流水` 从 `wroteMemory`（恒真）改为 `wroteLog`+`logRouteHits` | `selfcheck-write-miss-crosscheck` 26 断言；重启后假阳性停止 |
-| **漏记判据②** | `write-streak-check` 加 `sessionId` 字段 | 同上；运行时已见 `"sessionId":"session-205f..."` |
-| **漏记判据③** | 纯思考轮（`record===undefined`）也要计入 streak | 同上第 ④ 段 |
-| `log.ps1` 版本漂流 | 判据从 `exists()` 改为 sha256 内容比对 | `selfcheck-workspace-script-sync` 21 断言；用户实测删到一行后自动恢复 |
-| 死代码检测盲区 | `usageOf` 排除自递归，否则递归函数永不被判死 | `verify-functions` 抓到 `assertSupportedSchema` |
-| `已停用` 筛选失效 | 用户实报：勾选看不到停用条目。后端早好，前端漏传 `status=all` | `selfcheck-show-inactive-wire` 17 断言；实测 8 → 9 条 |
-| **覆盖空白补齐** | 4 个新回归脚本，顶层函数覆盖 **62/62** | `TOTAL=69`、变异 `47/47` 全 KILLED |
-
-### 已完成（2026-11-20 下午，补记链 —— 留档备查）
-
-> 上一张表是**上午**的。这张是**下午**的：补记（漏记自动补写）从子代理重写成
-> `prepareCall` 直连之后，整块代码**零回归覆盖**（`_dbpreview/` 里 `backfill`
-> 命中 0 处），用户提醒「不能完全排除还有隐性 bug」，于是逐条排查。
-
-**第一轮：上线跑不通**
-
-| 项 | 内容 | 验证 |
-|---|---|---|
-| 补记 POST 恒失败 | `backfill-failed {"reason":"no DSH_WEB_URL"}` 连挂 2 次。根因：`DSH_WEB_URL` 由 `shellEnv` **每次 shell 调用**注入，**不是进程环境变量**。改用三级回退 `webApp.getAdvertisedUrl()` → `webServer.getOrigin()` → env | 实测 `backfill-base-url {"from":"webApp"}`、1.9 秒落库 `id=1253` |
-
-**第二轮：隐性缺陷（六处，全部无症状）**
-
-| 项 | 内容 | 验证 |
-|---|---|---|
-| **判据①** `logRouteHits` 恒 0 | 清理写在 `turn-stopping`（serial 先跑），而读取在 `turn/end` → 恒读 0。实测 17/17 次全 0。**修法是把清理搬到 `turn/end`，不是删** | `selfcheck-backfill-hidden-bugs`；修复后首次实测 `routeHits=1` |
-| **判据②** POST 无超时 | `fetch` 没传 `signal` → `backfillBusy` 永不释放 → **整个补记永久停摆**（已复现：queue=24 全卡） | 同上；`AbortSignal.timeout(10s)` |
-| **判据③** 失败即永久放弃 | `backfillDone` 只有 `add`/`has` 没有 `delete` + 全写 `retryable:false` | 同上；`releaseBackfillKey` + `BACKFILL_DONE_LIMIT` |
-| **判据④** `retryable` 恒假字段 | 写了 5 处、读了 **0 处** | 同上；5xx/429/异常可重试 |
-| **判据⑤** 静默写错工作区 | `task.scope` 算了不用，只传 `cwd`；cwd 为 null 时 `/log` 回落 `process.cwd()` = 主进程目录。**实测传 `{"cwd":null}` → `scope="desktop"`** | 同上；POST 显式传 `scope`（探针脏数据已清） |
-| **判据⑥** 子代理 → prepareCall 引入的记账污染 | 子代理版 sid 是子会话的；换成主会话 sid 后，补记落库会毒掉**下一轮**漏记判据 | `selfcheck-backfill-accounting`（含反向守卫：正常写入必须照常记账） |
-
-**回归从 73 → 76**，三个补记脚本共 115 断言；6 处故障注入全部变红、
-还原后 sha256 逐字节一致。
-
-> ⚠️ **子代理方案已按用户决定封路**（2026-11-20）：
-> 「如果目前这套生效 我们就不再考虑子代理了 那真不是个好办法」。
-> 判据是**成本结构**（5~11 秒 vs 1.9 秒 / 共用 8 格名额池 / 130 行在处理副作用 /
-> 引号转义一碰流水正文就炸），不是「跑不通」。详见地图 §3.7。
-
-
-### ⏸ 打嗝修复 —— **暂缓，等 GUI 选项**（用户 2026-11-20 定）
-
-**当前状态**：修复代码**已写好但整段被注释掉**，只留只读探针。
-
-```js
-// index.js turn-stopping 内
-// ⚠️ 2026-11-18：**暂不执行修复**，等诊断结论。
-//    恢复做法：取消下面这段的注释，并删掉上面那段只读探针。
-// let fixed = 0
-// for (const item of plan) { … session.append(…replace…) … }
-diag('c1-hiccup-deferred', { turn, planned: plan.length, note: '只诊断，不写；等契约结论' })
-```
-
-**探针在跑**：每轮输出 `c1-hiccup-deferred`（计划修几条）与 `c1-diag-*`（surface 形状）。
-所以**数据一直在积累**，只是没有执行修复。
-
-**为什么暂缓（用户 2026-11-20）**：
-> 「打嗝功能暂缓加入 GUI 选项」
-
-即：这项要变成**用户可开关的 GUI 设置**，而不是硬编码成常开。
-在 GUI 选项做好之前，不打开修复。
-
-**做的时候要一起考虑**：
-
-| # | 事项 | 说明 |
-|---|---|---|
-| 1 | GUI 开关本身 | `client.js` 加一个复选框 + `index.js` 加配置读取；参考已有「收尾语」页签的做法 |
-| 2 | 契约矛盾未解 | `official-session.md` L361/L370 说 `assistant/message` **禁止**携带 `sourceEventSeqs`，而 L339 说 replace 的节点**必须**包含每个被遮蔽节点 —— **两条互斥**，按字面不可能成功。AGENTS.md 记过这条 |
-| 3 | 失败是静默的 | `catch` 只记 `c1-hiccup-error`，会话不中断。所以**诊断项必须无条件写**，不能只在成功时记 |
-| 4 | 开关默认值 | 建议默认**关**（`false`）—— 新功能先观察，且失败形态是静默的 |
-
-**判据（做完怎么算成功）**：
-- GUI 里能勾选，勾选后下一轮生效（不用重启插件）
-- 勾选后 `c1-hiccup-deferred` 消失、`c1-hiccup-fixed` 出现
-- 同轮收尾语数量从 2 降到 1（`heartbeat-turn-verdict` 的 `count` 不再 > 1）
-
-### 🥇 第一优先：静默 fallback 三兄弟（组 B）
-
-**为什么现在是第一优先**：11-20 那批修的都是「诊断/统计口径」，没碰这条。
-而这三条**会丢用户数据**，且失败是静默的。
-
-| # | 问题 | 位置 | 难度 |
-|---|---|---|---|
-| **D** | `writePointer` 非原子写 + `catch {}` 吞一切 → 指针坏了静默换记忆根 | `index.js` `writePointer` | ★★ |
-| **G** | `readState` 解析失败静默返回 fallback → 下次写回把空 state **写实** | `index.js` `readState` | ★★ |
-| **Z** | 裸 `ROLLBACK` 未包 try → 原始错误被顶掉 | `db-store.mjs` **L765 / L999 / L1108 三处仍裸**（L480 已包 try） | ★ |
-
-**D + G 一起做的理由**：同一反模式（「出错时假装没事」），测试可共用一套用例。
-**Z 照抄** `db-store.mjs` 里已有的一处正确写法（`try { d.exec('ROLLBACK') } catch {}`）。
-
-### 🥈 第二优先：`client.js` 两件（组 E）
-
-| # | 问题 | 说明 |
-|---|---|---|
-| ~~**R**~~ | ~~日期用 `toISOString()`（UTC）→ +08:00 下凌晨 0-8 点筛出昨天~~ | **✅ 2026-11-20 已修**（见下） |
-| **S** | 擦除器：标记含反引号时**把消息后半段一起擦掉** | ⚠️ **改前必读维护手册 §1** |
-
-> **R 已于 2026-11-20 修完**（用户实报「你还是把服务器时间和本地时间算成两天」）。
->
-> **改法**：`client.js` 新增 `localDayStr(date = new Date())`，与 `index.js` 的
-> `localDay()` **逐字同口径**（都只用 `getFullYear/getMonth/getDate`），
-> 三处调用点全部改走它：
->
-> | 位置 | 原来 | 现在 |
-> |---|---|---|
-> | 「今天」按钮 | `new Date().toISOString().slice(0,10)` | `localDayStr()` |
-> | 「近 7 天」from | `d.toISOString().slice(0,10)` | `localDayStr(d)` |
-> | 「近 7 天」to | `new Date().toISOString().slice(0,10)` | `localDayStr()` |
->
-> **实测（本地 05:23，UTC 还是前一天）**：
-> 「今天」→ `2026-11-19`（应为 11-20）；「近7天」from → `2026-11-12`（应为 11-13）。
-> 表现不是「差 8 小时」，是**点「今天」筛出昨天** —— 当天流水一条看不见，
-> 反而显示 11-19 的 520 条（11-20 实际 411 条）。
->
-> **为什么一直没被发现**：回归里**没有任何东西执行 `client.js`**（浏览器模块），
-> 而既有测试全在测后端 —— 后端 `nowIso()` / `localDay()` / `diagTimestamp()`
-> **早就是本地时间**，一直是对的。**后端对、断在前端**，与 T 项同型。
->
-> **守它的是** `selfcheck-client-local-date`（21 断言）。关键做法：
-> **假造一个「本地与 UTC 不同日」的时刻**再断言 —— 若拿当前时间跑，
-> 08:00 之后本地与 UTC 同一天，bug 与修复表现一样，断言会绿但什么都没证明。
-> 故障注入实测：改回 `toISOString` → **5 条同时变红**。
->
-> ⚠️ 改完**必须完整重启客户端**（禁用→启用不刷新浏览器代码）。
-
-⚠️ **S 仍在 `client.js`，改完必须完整重启客户端** —— 禁用→启用不刷新浏览器代码。
-
-> **T 已于 2026-11-20 修完**（用户实报「停用规则后勾选『显示已停用的』看不到」）。
-> 根因是**前后端接缝断了**：后端早改好（`includeAll`），前端只有「不勾」一支，
-> 勾选时不传 `status` → 后端回落 `active`。修法：勾选时显式传 `status=all`。
-> 守它的是 `selfcheck-show-inactive-wire`（17 断言）。
-> 实测：不带 status → 8 条；带 all → 9 条（多出 id=112「不要委派子智能体」那条 stale）。
-
-### 📝 备忘：两处「现在不坏、将来会坑」的静默行为（2026-11-20 记，暂不修）
-
-> **这两条都不是当前故障**，是「失败方式会误导人」+「未来改动的陷阱」。
-> 用户 2026-11-20 定：**只当备忘记着**，不进待办优先级。
-
-#### A. `entry/update` 收下 `topic` 却静默忽略
-
-**实测**（2026-11-20）：
-
-```
-POST /api/dsh-memory/entry/update
-{ id:1159, table:'logs', topic:'技术讨论' }
-→ HTTP 200
-→ 返回体 entry.topic 仍是「开发日志」
-```
-
-**原因**：该路由只处理 `text`（L6920）与 `review`（L6923），`topic` 根本不在其列。
-改 topic 有专门的 `/api/dsh-memory/entry/topic`（L7434，还支持批量）。
-
-**影响**：
-- **前端不受影响** —— `client.js:384` 唯一调用点只传 `{id, table, text}`，从不传 topic
-- 但**手工调 API 的人会被骗**：返回 200，字段却静默丢弃。不回读 `entry.topic` 校验就以为改成了
-- （我当天就是这么踩的：以为 topic 改好了，实际没动）
-
-**改法**（若要做）：返回体加 `ignored: ['topic']`，或在 400/提示里明确「改 topic 走 /entry/topic」。
-**难度 ★**，收益是「失败时能看出来」，不是功能缺失。
-
-#### B. `updateText` 的 topic / FTS 是**隐式**同步
-
-**现状正确**：`db-store.mjs` 的 `updateText`（L628）里，`sets` 只含
-`text` / `summary` / `review` / `updated`，**不含 `topic`** —— 所以 topic 自然保留。
-而 `syncFts`（L676-677）用的是**从库里读出的 `row.topic`**，与主表一致。
-
-**风险**：将来若有人给 `updateText` 加上改 topic 的能力（很自然，因为已有 `/entry/topic` 路由）：
-1. 在 `sets` 里加 `topic=?` ✅
-2. 但**忘了**把 `syncFts` 那行的 `topic: row.topic` 改成**新值**
-
-**后果**：主表是新的、FTS 索引是旧的，而且**不报错**：
-- 界面显示「技术讨论」✅
-- 按 `topic=技术讨论` 筛 → **查不到** ❌
-- 按 `topic=开发日志` 筛 → **反而能查到** ❌
-
-这正是「两处各写各的、接缝断了」的老形态（同 `selfcheck-show-inactive-wire` 那次）。
-
-**改法**（若要做）：加一条断言/守卫 ——「`sets` 含 `topic` 时，`syncFts` 必须传新值」。
-**难度 ★**，收益是「防止未来的改动踩坑」。
-
-> ⚠️ **写这两条备忘时的判据**：说「现在不坏」必须能指出**当前哪条路径让它不能坏**。
-> A 的依据是「前端只传 text」；B 的依据是「sets 里没有 topic」。
-> 说不出这个，就不是「暂时不坏」，而是「还没查到坏在哪」。
-
-### 🥉 第三优先：锁与时序（组 C，有硬顺序）
-
-```
-J → H → I     ← 顺序不能反
-```
-
-| # | 问题 | 为什么必须先修 J |
-|---|---|---|
-| **J** | `serialize` 无重入保护，锁内再调会**永久死锁且无日志** | H/I 都要进锁，改它们前没安全网 |
-| **H** | `ensureLayout` 读-改-写不在锁内，且调用点不 `await` | 依赖 J |
-| **I** | `/memory consolidate` 裸读-改-写 | 依赖 J |
-| **K** | 跨进程 `state.json` 完全无保护 | 架构级，与 J 无关 |
-
-### 零散（无依赖，随时可做）
-
-| # | 问题 | 难度 |
-|---|---|---|
-| **N** | `purgeByStatus` 依赖 contentless FTS 的 `'delete'`，值不匹配时静默失败 | ★★★ |
-| **E** | `/heartbeat` POST 空 body 删收尾语且无备份 | ★★ 要同改 GUI |
-| **F** | `policy.md.pre-sync` 只写不读，无恢复路径 | ★★★ 需产品决策 |
-| **U** | ~~`store.recordEmotion` 不存在，分支是死代码~~ **✅ 2026-11-21 核实：本条判断错误，已作废** | — |
-| **V** | ~~`enqueueAmbiguous` 无调用方~~ **✅ 2026-11-18 整条链路已删除** | ★★ 要决策 |
-| **W** | `dbCopied` 死变量 | ★ |
-| **X** | `rebindDbStore` 的 catch 够不到（`close()` 返回失败不抛错） | ★ |
-| `B` | 迁移窗口内写入进旧库 → 切根后那几条不在新库 | ★★★★ 依赖 D |
-
-### 不建议现在做的
-
-| 项 | 原因 |
-|---|---|
-| **组 G 跨平台 4 条** | **Windows 上结构上测不出来**，动手前先确认有 Mac |
-| `POINTER_FILE` 死常量 | 值 `'_root.json'` ≠ 实际的 `memory-root.json`，但**零引用、不影响行为**。改它没有收益，只是清理 |
-| 3 个闭包内函数未覆盖 | `normalizeHeartbeat` / `setRoot` / `stripParamTail` —— 都有真实调用路径，已被上游测试间接覆盖。单独测要 mock `apply()`，成本高于收益 |
-
-### 版本的现状（事实，不催）
-
-```
-版本号        1.4.0（已升）
-CHANGELOG     已记（1.4.0 区，⑦～⑮）
-git           未提交
-```
+| **Z** | 裸 `ROLLBACK` 未包 try | `db-store.mjs` **L999 / L1108** | ⚠️ **描述失准**（L765 已修，只剩这两处） |
+| **W** | `dbCopied` 死变量 | `index.js` **L3269 / L3310** | ✅ 仍存在（行号漂移） |
+| **Y** | 两处 `setTimeout` 未接 disposer | `index.js` **L3863 / L8358** | ✅ 仍存在（行号漂移） |
+| **X** | `rebindDbStore` 的 catch 够不到 | `index.js` **L3778** | ✅ 仍存在（行号漂移） |
+| **D** | `writePointer` 裸写 + 空 catch | `index.js` **L404-414** | ✅ 仍存在（位置未变） |
+| **G** | `readState` 解析失败静默 fallback | `index.js` **L2871 / L2876 / L2889-2891** | ✅ 仍存在（行号漂移） |
+| **F** | `policy.md.pre-sync` 只写不读 | `index.js` **L2603 / L2698** | ✅ 仍存在（行号漂移） |
+| **E** | `/heartbeat` 空 body 删收尾语且无备份 | `index.js` **L7634** / 写盘 **L5190** | ✅ 仍存在（方法白名单已修，主症未动） |
+| **J** | `serialize` 无重入保护 | `index.js` **L2620-2624** | ✅ 仍存在（无触发路径，属防未来） |
+| **H** | `ensureLayout` 读-改-写不在锁内 + 不 await | `index.js` **L2841**（定义）/ **L3799-3800**（调用） | ✅ 仍存在 |
+| **I** | `/memory consolidate` 裸读-改-写 | `index.js` **L6795-6797** | ✅ 仍存在 |
+| **K** | 跨进程 `state.json` 无保护 + `writeState` 公开导出 | 全局 | ✅ 仍存在（进程内已有锁，跨进程零保护） |
+| **N** | `purgeByStatus` 的 FTS 删除不可靠 | `db-schema.mjs` **L400-408** `removeFts` | ⚠️ **描述失准**（位置错，且不总是静默） |
+| **S** | 擦除器吞掉消息后半段 | `client.js` **L2066** `MEM_PARTIAL_RE` | ⚠️ **描述失准**（根因不是待办说的那个正则） |
+| **B** | 迁移窗口内写进旧库 | `index.js` **L3242 / L3306-3311 / L7323** | ✅ 仍存在（行号漂移） |
 
 ---
 
-> **为什么重排**：旧清单按「严重性 × 难度」分七档，但**没写清哪些 bug 互相牵连**。
-> 修一个时不知道另一个会不会被带坏、该不该先修。这一版按**依赖关系**重排。
+### 🔴 第一批：可立刻做（共 3 条，约 12 行，全是「照抄已有正确写法」）
 
-### 状态复核（2026-11-19 实测）
+> 这三条**零架构改动、零新依赖**，且每处都已有同文件内的正确样板可参照。
+> 建议一次做完，跑全量回归即可。
 
-| 项 | 复核方式 | 结论 |
-|---|---|---|
-| **M** | 读源码 + 临时库行为测试 + 变异测试 | **✅ 已修** |
-| **D** | 读 `writePointer` 源码 | ❌ 仍存在 |
-| **G** | 读 `readState` 源码 | ❌ 仍存在 |
-| T1 | 读源码（L5367/L5393 均注释） | ✅ 已加注记，无代码待改 |
-| P2#1 模板旧句 | grep `工作和闲聊都算数` | ✅ 已消失（模板替换时消掉） |
-| P2#3 「113 处引用」 | verify-map 实测 | ✅ 已改成真值（当时 114，**现为 112** —— 这个数随文档增删浮动，别写死） |
+#### Z · 两处裸 `ROLLBACK` 未包 try
 
-### 分组：按依赖关系
+- **位置**：`db-store.mjs` **L999**（`renameScope`）、**L1108**（`removeGlobalByRegex`）
+- **现状**（实测原文）：
+  ```js
+  // L998-1000
+  } catch (error) {
+    d.exec('ROLLBACK')
+    throw new Error(`迁移失败已回滚（数据未变）：${error?.message ?? error}`)
+  }
 
-> ## 📌 以下是**历史留档**（2026-11-18 ~ 11-19 的分类视角）
->
-> **不要从这里开始读。** 当前未做的条目已经汇总到文件最上方
-> 「★ 2026-11-21 当前待办」那张表里。
->
-> 保留这一节是因为它记了**依赖关系**（比如「H 和 I 都要先进锁，所以 J 必须先做」），
-> 那是上方汇总表里没有的信息。**两边的条目集合是一致的**，只是分组维度不同。
->
-> ⚠️ 本节的「已修/待做」标注停留在当时，**不代表现在**。
+  // L1107-1109
+  } catch (e) {
+    d.exec('ROLLBACK')
+    throw e
+  }
+  ```
+- **危害**：回滚本身再抛错时，**原始错误被顶掉**。L999 那句 `throw new Error(...)` 排在裸 ROLLBACK **之后**，ROLLBACK 一抛就永远走不到 —— 包装形同虚设。
+- **修法**：照抄同文件 **L765** 的现成写法
+  ```js
+  try { d.exec('ROLLBACK') } catch { /* 回滚失败别掩盖原始错误 */ }
+  ```
+- **⚠️ 校对**：待办原文说「L765 / L999 / L1108 三处仍裸」—— **L765 已经修好了**，只剩两处。
 
-#### 组 A · `routeTable` 检索口径 —— **M 已修，N 待做**
+#### W · `dbCopied` 死变量
 
-| # | 问题 | 状态 |
-|---|---|---|
-| **M** | `routeTable` 把 `review='retracted'` 的 rules 算进主题计数 | **✅ 2026-11-19 已修**，见下方验收记录 |
-| **N** | `purgeByStatus` 依赖 contentless FTS 的 `'delete'`，值不匹配时静默失败 | ❌ 待做 |
+- **位置**：`index.js` **L3269**（`let dbCopied = false`）、**L3310**（`dbCopied = true`）
+- **实测**：全文件 **2 次命中、读取 0 次**；`migrateRoot` 的 `return`（L3387-3400）里没有它。
+- **修法**（二选一）：
+  - ① 删掉这 2 行（最简单）；
+  - ② 加进 `return` 并在调用处读一次 —— **只加返回不加读取等于没修**。
+- ⚠️ 待办原行号 L2499/L2540 已漂移。
 
-**为什么同组**：都属于「检索/统计口径不一致」。但 **N 与 M 无代码耦合**，可独立做。
+#### Y · 两处 `setTimeout` 未清理、未 `unref`
 
-**M 的验收记录**（2026-11-19）：
-- 改法：`routeTable` 的 rules 子查询加 `AND review IS NOT 'retracted'`；**logs 段不动**（logs 表没有该列）
-- 行为测试：临时库造 3 条 rules（retracted / 正常 / deleted）+ 1 条 logs → 计数 = **2**（只算正常 + logs）
-- 变异测试：去掉过滤条件 → 计数变 **3** → 测试抓住
-- 回归：当时 `TOTAL=64 FAIL=0`（脚本数已增至 69，见文件顶部）
+- **位置**：`index.js` **L3863** `setTimeout(checkWritableRoot, 1500)`、**L8358** `setTimeout(runHealthCheck, 600)`
+- **实测**：两处都是裸调用，返回值没接变量 → 既不能 `unref()`，也没有卸载函数去 `clearTimeout`。同文件 L8475-8476 的 `probeSidebar` 就是**正确样板**。
+- **后果**：卸载/热重载后各仍触发一次（`checkWritableRoot` 会写探针文件、`runHealthCheck` 会用已失效 ctx 盘点）。
+- **修法**：照抄 L8475-8476
+  ```js
+  const writableTimer = setTimeout(checkWritableRoot, 1500)
+  writableTimer.unref?.()
+  ctx.effect(() => () => clearTimeout(writableTimer), 'dsh-memory: writable probe')
+  ```
+- ⚠️ 待办原行号 L3057/L6084 已漂移。
 
-#### 组 B · 静默 fallback 三兄弟 —— **D + G 建议一起做，Z 顺手**
+---
 
-| # | 问题 | 位置 | 耦合 |
+### 🟠 第二批：丢数据类（2 条，同一反模式，建议一起做）
+
+> 共同点：**静默吞错误**。失败时不报错、不留痕，用户以为一切正常。
+> 按 AGENTS.md 硬约束 15 的思路，它们会让人「以为数据还在」。
+
+#### D · `writePointer` 非原子写 + 空 `catch`
+
+- **位置**：`index.js` **L404-414**
+- **现状**：
+  ```js
+  function writePointer(root) {
+    const path = pointerPath()
+    if (path === undefined) return
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+      const payload = JSON.stringify({ root, savedAt: new Date().toISOString() }, null, 2)
+      writeFileSync(path, `${payload}\n`, 'utf8')      // ← 非原子
+    } catch {
+      /* 指针写不了不该影响插件 */                       // ← 空 catch
+    }
+  }
+  ```
+- **链路**：指针写坏 → 上游 `readPointer()`（L398-400）也是 `catch { return undefined }` → `resolveRoot` 当成「没指针」→ 重新选址并**覆盖写入指针** → **记忆根静默漂移**，日志里最多一句「记录的记忆目录已不可用」。
+- **修法**：改用现成的 `atomicWrite`（L1342，已是 async，需给 `writePointer`/`resolveRoot` 一并加 await，或写个同步版 `temp + renameSync`）；空 catch 改成**留痕**。
+- **⚠️ 关键**：`readPointer` 的 catch 也要拆成「ENOENT → 静默」与「存在但解析失败 → 打警告」，否则只修一半。
+
+#### G · `readState` 解析失败静默 `return fallback`
+
+- **位置**：`index.js` **L2871**（fallback 常量）、**L2876**（类型不对）、**L2889-2891**（catch）
+- **现状**：解析失败、类型不是 object、抛异常 —— 三种情况**都只返回空 state**，不记日志、不标记坏文件。调用方区分不出「文件不存在」和「内容坏了」。
+- **危害**：下游 `registerProject` 拿这份空 state 改 `projects` 再 `writeState` 整体覆盖 → **坏文件被一份 `projects: {}` 覆盖掉**，原项目映射和 `policySyncVersion` 全丢。
+- **修法**：
+  - `text === undefined` 时照旧返回 fallback；
+  - 解析失败时**抛错或返回 null**，并优先把坏文件改名成 `state.json.corrupt-<ts>` 留底；
+  - 所有写回点（`registerProject` / `syncPolicyOnce` / scope 改名 / `consolidate`）读到 null 时**跳过写回**，只记日志。
+- **同类**：`readStateSync`（L3499 / L3504 / L3510）也是同一形态，要一起改。
+
+---
+
+### 🟡 第三批：并发与迁移（3 条，有硬顺序：J → H → I）
+
+> **必须按序做。** `J` 是安全网，先修 H/I 会踩进死锁。
+
+#### J · `serialize` 无重入保护
+
+- **位置**：`index.js` **L2620-2624**（函数体全文 5 行）
+- **现状**：
+  ```js
+  let writeQueue = Promise.resolve()
+  function serialize(task) {
+    const run = writeQueue.then(() => task())
+    writeQueue = run.then(() => undefined, () => undefined)
+    return run
+  }
+  ```
+- **子代理实测**（node 直接 import，临时 root，未碰真实库）：嵌套调用后 `3 秒后 innerRan=false outerSettled=false`，**队列永久卡死**，此后所有排队写入一并停摆。**无任何日志**。
+- **现状补充**：当前 3 个加锁点（`registerProject` L2941 / `moveProject` L3412 / `/scope/rename` L8150）**都不调 serialize**，所以**目前无触发路径** —— 属「防未来」（防的正是把 H 搬进锁时踩中）。
+- **修法**：加同步重入标记，入口判断后**直接 reject 并记 diag**，而不是排队等待。
+- **⚠️ 零回归覆盖**：`_dbpreview/selfcheck-serialize.mjs` 现在只测「抛错不卡队列 / 串行顺序」，**没有重入用例**。修完必须补一条**能失败**的断言（「锁内再调必须 reject，且之后队列仍可用」）。
+
+#### H · `ensureLayout` 读-改-写不在锁内，且调用点不 await
+
+- **位置**：`index.js` **L2841**（定义，函数体 L2842-2861 无 `serialize`）、**L2849** 读、**L2852** 写
+- **调用点**：**L3799-3800** `store.ensureLayout().then(...)` —— `apply` 是同步函数（L3559），**这个 Promise 被丢弃**。L3863 那句「避免和 ensureLayout 抢同一个目录创建时机」正是这个未等待的补丁。
+- **危害**：启动窗口内若有会话触发 `registerProject` 抢在 L2849 与 L2852 之间写入，`{ ...st }` 的**过期快照会抹掉新登记的项目** —— 就是 D13「记忆还在但项目不见了」的形态。
+- **修法**：锁只包真正的读-改-写（**重新读一次**，不用过期快照），长文件 IO 留在锁外；调用点先 `await layoutReady` 再允许首次写 state。
+
+#### I · `/memory consolidate` 裸读-改-写
+
+- **位置**：`index.js` **L6795-6797**
+  ```js
+  const state = await store.readState()
+  state.lastConsolidate = localDay()
+  await store.writeState(state)
+  ```
+- **实测**：外层**没有 try、没有 `store.serialize`**。同文件另三处读-改-写都已进锁，**只有这一处漏着**（修那三处时漏掉的第四个调用点）。
+- **修法**：原样搬进 `await store.serialize(async () => { ... })`，与 L8150 **完全同构**。
+- **⚠️** 必须用 `store.serialize`（同一把队列）。自己另起 Promise 链 = 两把锁互不排斥 = 等于没锁（教训写在 L8148-8149 注释里）。
+
+---
+
+### 🟢 第四批：需产品决策或较大改动（4 条）
+
+| # | 问题 | 为什么搁置 | 位置 |
 |---|---|---|---|
-| **D** | `writePointer` 非原子写 + `catch {}` 吞一切 | index.js `writePointer` | 与 B 同链 |
-| **G** | `readState` 解析失败静默返回 fallback → 下次写回空 state | index.js `readState` | 与 D 同反模式 |
-| **Z** | 裸 `ROLLBACK` 未包 try → 原始错误被顶掉 | db-store.mjs **L765 / L999 / L1108 三处仍裸**（L480 已包 try） | 同反模式，修法简单 |
+| **F** | `policy.md.pre-sync` **只写不读**，无恢复路径 | ★★★ 要做 GUI 入口才算真恢复；且文件名固定，下次同步会覆盖上一份 | `index.js` L2603 / L2698；`migrateRoot` 根级清单 L3284 也没搬它 |
+| **E** | `/heartbeat` POST 空 body 删收尾语且**无备份** | ★★ 要区分「没传 text」与「传空串」，还要加备份；**要同改 GUI 并回归「清除」按钮** | 路由 L7612-7642，删除分支 L5102-5117，落盘 L5190 |
+| **K** | 跨进程 `state.json` 完全无保护 | ★★★★★ 架构级。建议「收口」：导出从 `writeState(state)` 换成 `updateState(mutator)`；真正解决要文件锁或迁进 SQLite | 全局 |
+| **B** | 迁移窗口内仍写旧库 | ★★★★ 要动时序（跨 3 个函数）。`serialize` 只串行化「经由它」的写，`appendLog` 不走它，所以**光包 serialize 是空转** | `migrateRoot` L3242；快照 L3309；`/log` L7323 |
 
-**共同反模式**：「出错时假装没事」。
-**D 和 G 一起做的理由**：都在文件读写层，测试可共用同一套「造损坏文件 → 确认不静默」的用例。
-**Z 独立**，照抄 db-store L455 已有的正确写法即可。
+---
 
-#### 组 C · `serialize` 锁 —— **J 必须是第 4 档的前置**
+### ⚪ 第五批：`client.js` 擦除器（1 条，改前必读维护手册 §1）
 
-| # | 问题 | 与谁耦合 |
-|---|---|---|
-| **J** | `serialize` 无重入保护，锁内再调会**永久死锁且无日志** | ⚠️ **H 和 I 都要进锁，改它们前必须先修 J** |
-| **H** | `ensureLayout` 读-改-写不在锁内，且调用点不 `await` | 依赖 J |
-| **I** | `/memory consolidate` 裸读-改-写 | 依赖 J |
-| **K** | 跨进程 `state.json` 完全无保护 | 架构级，与 J 无关（J 只管进程内） |
+#### S · 标记含反引号时吞掉消息后半段
 
-**顺序硬约束**：`J → H → I`。反过来等于在没安全网时走钢丝。
-**J 当前无触发路径**（属于「防未来」），但**只要 H 或 I 的修复写错就会踩到**。
+- **待办原描述说的是 `MEM_COMMENT_LIKE_RE`（L2052）—— 实测判错，那个是「漏擦」不是「吞正文」**
+- **真根因**：`MEM_PARTIAL_RE`（**L2066**）
+  ```js
+  const MEM_PARTIAL_RE = /^[ \t]*<!--mem-(?:l(?:og)?|f(?:act|ix)?|n(?:ote)?)?[\s\S]*$/m
+  ```
+  尾部 `[\s\S]*$` 会**从标记行首一直吞到文本节点末尾**。
+- **触发链**：合法标记正文若含一个反引号（AGENTS 本身就要求写符号加反引号）→ `MEM_STRIP_RE`（L2012 的 `[^`]*?`）一次都命中不了 → 没人擦 → 随后被 `MEM_PARTIAL_RE` 吞掉后半段。
+- **另一层**：`fastStrip` 传 `skipPartial: true`（L2562），所以切会话那条快路径**只擦半边**，同一缺陷在两条路径上症状不同。
+- **修法**（不放宽「独占行首」这条既有安全边界）：
+  - ① L2012 `[^`]*?` → `[^\n]*?`（行内反引号不再是删除条件，误伤风险由「独占行首 + 单行」守住）
+  - ② L2066 尾部 `[\s\S]*$` → `[^\n]*$`
+- **⚠️ 零回归覆盖**：`selfcheck-dom-strip.mjs` 38 条全绿，但**没有一条**用含反引号的 `mem-log` 标记。修完必须补两条能失败的用例（含反引号的完整标记必须擦净 + 其后同节点正文必须保留），外加 `skipPartial:true` 路径对照。
+- **⚠️ 改前必读** [`维护手册.md`](维护手册.md) §1；**改完必须完整重启客户端**（禁/启用插件不刷新浏览器代码）。
 
-#### 组 D · 迁移链路 —— **B 依赖 B 组（D）修好**
+---
 
-| # | 问题 | 耦合 |
-|---|---|---|
-| **D** | （见组 B）`writePointer` 吞错 | ↓ 指针坏了 → 下次启动读不到 |
-| **B** | 迁移窗口内仍往旧库写 → 切根后那几条不在新库 | ↑ 依赖 D |
+### 📌 N · 待重新定义（原描述两处错）
 
-**两者是同一故障的两个阶段**：
-```
-D：迁移末尾 writePointer 失败 → 内存切了但指针没切
-B：迁移期间写入进了旧库 → 新库里没有
-```
-**修 D 不修 B**：指针不会坏，但窗口期数据仍丢。
-**修 B 不修 D**：窗口期不丢，但指针坏了照样切不回去。
-**建议顺序**：先 D（改动小）→ 再 B（碰主流程，风险最高）。
+- **位置纠正**：`removeFts` 在 **`db-schema.mjs` L400-408**，**不在 `db-store.mjs`**
+- **形态纠正**：不是「总是静默」—— 子代理实测，`text` 列整值被换掉时会抛 **`database disk image is malformed`**（`rules_fts` 3/3 稳定复现）。这个错名**指向「库坏了」而非「参数不对」**，比静默更误导。
+- **真实缺陷**：`removeFts(db, table, id, row = null)` 的 `row` 默认 `null` → L407 `ftsValues(table, row ?? {})` 退化成全空值 → **索引项删不掉**（FTS5 的 `'delete'` 要靠原值反查）。常规路径（`purgeByStatus` L758 传了整行）是对的，**默认值才是入口**。
+- **已验证无效的两条修法**（别再试）：
+  - `INSERT INTO ..._fts(...) VALUES('rebuild')` → contentless 表直接抛 `'rebuild' may not be used with a contentless fts5 table`
+  - `COUNT(*)` 前后对比 → 无效（不一致的删除后 `COUNT(*)=0` 但 `MATCH` 仍 =1）
+- **可行修法**（二选一，均已实测）：
+  - ① `purgeByStatus` 里改成 **`delete-all` + 按主表全量重灌**
+  - ② 事务内 **`DROP TABLE ${fts}` + `CREATE VIRTUAL TABLE` 重建 + 重灌**
+- **必做**：让 `removeFts` 在 `row == null` 时**抛错**，别默认传空值。
 
-#### 组 E · `client.js` 三件 —— **改完必须完整重启客户端**
+---
 
-| # | 问题 | 说明 |
-|---|---|---|
-| ~~**R**~~ | ~~日期用 `toISOString()`（UTC）→ +08:00 凌晨 0-8 点筛出昨天~~ | **✅ 2026-11-20 已修** |
-| **S** | 擦除器：标记含反引号时把消息后半段一起擦掉 | ⚠️ **改前必读维护手册 §1** |
-| ~~**T**~~ | ~~勾「显示已停用」无效（后端要 `status=all`，前端从不发）~~ | **✅ 2026-11-21 已修**：前端 `client.js` L828-829 传 `all`，后端 `index.js` L6951 认 `all` |
+### 🆕 本次新发现（不在上一版里）
 
-**三个互相独立**，只是都在 `client.js`。**禁用→启用不刷新浏览器代码**，必须完整重启。
+| # | 问题 | 位置 | 严重度 | 说明 |
+|---|---|---|---|---|
+| **A1** | `selfcheck-serialize.mjs` **无重入用例** | `_dbpreview/` | ★★ | J 修完后**没有防线**。属「测试全绿但没测到东西」——本项目反复出现的形态。修 J 时必须同补 |
+| **A2** | `selfcheck-dom-strip.mjs` **无含反引号标记的用例** | `_dbpreview/` | ★★ | 同上。S 的缺陷零覆盖，38 条绿是假安全 |
+| **A3** | `readStateSync` 与 `readState` **同一静默反模式** | `index.js` L3499 / L3504 / L3510 | ★★ | 修 G 时容易只改 async 那个，漏掉同步版 |
+| **A4** | `removeFts` 的 `row = null` 默认值 | `db-schema.mjs` L400 | ★★★ | 「删除不报错、实际没生效」的入口。改 N 时先改这里 |
+| **A5** | `POINTER_FILE` **已确认为死常量** | `index.js` L380 | ★ | 全文只出现 1 次、零引用；`pointerPath()`（L382-388）实际用的是硬编码 `memory-root.json`。与项目地图 L169 记载一致。**2026-11-24 已复核** |
+| **A6** | `writeState` 仍公开导出 | `index.js` L3475 | ★★ | 调用方可绕过 `serialize` 直接写（K 的一半成因）。K 的「收口」方案就是治它 |
 
-#### 组 F · 无依赖，可随时单做
+---
 
-| # | 问题 | 难度 |
-|---|---|---|
-| **E** | `/heartbeat` POST 空 body 删收尾语且无备份 | ★★ API 语义变更，要同改 GUI |
-| **F** | `policy.md.pre-sync` 只写不读，无恢复路径 | ★★★ 需产品决策 |
-| **U** | ~~`store.recordEmotion` 不存在，分支是死代码~~ **✅ 2026-11-21 核实：本条判断错误，已作废** | — |
-| **V** | ~~`enqueueAmbiguous` 无调用方~~ **✅ 2026-11-18 整条链路已删除** | ★★ 要决策：接回来还是删 |
-| **W** | `dbCopied` 死变量 | ★ |
-| **X** | `rebindDbStore` 的 catch 够不到（`close()` 返回失败不抛错） | ★ |
+### 🚫 已确认「不用做」的历史条目（本次顺手核实）
 
-#### 组 G · 跨平台 —— Windows 上**结构上测不出来**
-
-POSIX 不 chmod / 无 fsync / 大小写未归一 / 指针丢失找不回。
-**不是「还没做」，是「做了也没法在本机验证」**，动手前先确认有真机。
-
-### 推荐顺序（本轮）
-
-```
-第 1 批  M           ← ✅ 已完成
-第 2 批  J           ← 后续 H/I 的前置，必须单独一批
-第 3 批  D + G + Z   ← 静默 fallback 三兄弟
-第 4 批  H + I       ← 依赖第 2 批
-第 5 批  B           ← 依赖第 3 批的 D
-零散    E/F/Q/U/V/W/X/N、client.js 三件、跨平台
-```
-
-### 已确认不用做的（2026-11-19）
-
-| 项 | 原因 |
+| 条目 | 结论 |
 |---|---|
-| P2#1 模板旧句「工作和闲聊都算数」 | 2026-11-19 替换模板时已消掉 |
-| P2#3 「113 处引用 → 108」 | 已改成当时的真值 114；数字随文档增删浮动，别写死 |
-| T1 行号与判据 | 已按实测重算（L5367 / L5393，判据 2 处），并注明「措辞复盘，非待修 bug」 |
-| T3 方案 C | 已撤回（`turn-stopping` payload 无 `step`） |
+| ~~打嗝修复（C1-A / surface replace）~~ | **2026-11-24 从待办移除**。兜底已由**补记（backfill）**这条独立技术方向实现，不再依赖 surface replace。实测：`backfill-done` 每天都有、`backfill-failed = 0`，`c1-hiccup-fixed` 从未出现过 |
+
+> 更早的历史「已修/已证伪」记录保留在下方各节，不再重复。
 
 ---
 

@@ -41,10 +41,11 @@
  *     免得下一个人以为本脚本全查过了。
  */
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -128,13 +129,113 @@ function canRun(bin) {
 
 const GIT = findGit()
 
-function git(args) {
-  if (!GIT) return { ok: false, out: '' }
+/**
+ * 读一条 git 配置。
+ *
+ * ## 返回值三种，**必须能区分**（2026-11-24 实踩）
+ *
+ *   { state: 'value', value: 'lf' }    git 明确说了值
+ *   { state: 'unset' }                 git 说「这个键没设」（退出码 1，无输出）
+ *   { state: 'unknown', why: '...' }   **我没问到** git（EPERM / 起不来 / 超时）
+ *
+ * ⚠️ 旧实现把后两种混成 `ok: false` + `out: ''`，调用处再 `r.ok ? r.out : ''` ——
+ * 于是「沙箱不让开管道、根本没跑起来」被渲染成「当前 = (未设)」。
+ * 那是**把自己的失败栽赃给配置**：人会跑去 `git config core.eol lf` 改配置，
+ * 而真正的问题是读不到 git。2026-11-24 实测：`git config --get core.eol`
+ * 在 pwsh 里明明返回 `lf`，脚本却报未设 —— 就是这个 bug。
+ *
+ * 这就是 AGENTS.md 那条：**`null`（没问到）和 `''`（问到了、是空）必须能区分**。
+ */
+/**
+ * 读一条 git 配置。
+ *
+ * ## 为什么不用 `git config --get`
+ *
+ * 因为它要**开子进程**，而受限沙箱（workspace-write / read-only）**不允许程序
+ * 开命名管道** → `stdio:'pipe'` 拿回 `status = null`（EPERM）。实测：
+ *
+ * | 做法 | 结果 |
+ * |---|---|
+ * | `stdio:'pipe'`（`execFileSync` 默认） | ❌ EPERM，status=null |
+ * | `stdio:'inherit'` | ✅ 能跑、退出码准，但**看不到输出** |
+ * | `cmd /c "git ... > f"` | ❌ 沙箱连 cmd 都拦 |
+ * | `git config --output=f` | ❌ `config` 不认这个参数（只有 diff/log 认） |
+ *
+ * **绕开子进程**才是干净的解法：git 的配置就是**纯文本 INI**，直接读文件即可。
+ * 代价是要自己实现「多来源合并」，但那正好让我们把优先级写清楚。
+ *
+ * ## 优先级（与 git 一致，低 → 高）
+ *
+ *   `<git安装目录>/etc/gitconfig`  → system
+ *   `~/.gitconfig`                 → global
+ *   `<repo>/.git/config`           → local
+ *
+ * 高优先级的**后读**，覆盖前面的。
+ *
+ * ## 返回值三种，**必须能区分**
+ *
+ *   { state: 'value', value: 'lf' }    明确读到了值
+ *   { state: 'unset' }                 三份配置里都没有这个键
+ *   { state: 'unknown', why: '...' }   **我没读到**（文件不可读等）
+ *
+ * ⚠️ 旧实现（走子进程）把「没问到」渲染成「未设」，等于**把自己的失败栽赃给配置**。
+ * 2026-11-24 实测：`git config --get core.eol` 在 pwsh 里明明返回 `lf`，
+ * 脚本却报「当前 = (未设 → 回落到 native = CRLF)」。
+ * 这就是 AGENTS.md 那条：**`null`（没问到）和 `''`（问到了、是空）必须能区分**。
+ */
+function readIniKey(file, key) {
+  let text
   try {
-    return { ok: true, out: execFileSync(GIT, args, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() }
-  } catch (e) {
-    return { ok: false, out: (e.stdout || '').toString().trim(), err: e }
+    text = fs.readFileSync(file, 'utf8')
+  } catch {
+    return { found: false }
   }
+  // [section] 标题 + `key = value` 配对。键名大小写不敏感（git 的规矩）。
+  const [wantSection, wantKey] = key.includes('.')
+    ? [key.slice(0, key.lastIndexOf('.')), key.slice(key.lastIndexOf('.') + 1)]
+    : ['', key]
+  let section = ''
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '' || line.startsWith('#') || line.startsWith(';')) continue
+    const sec = line.match(/^\[([^\]]+)\]$/)
+    if (sec) {
+      section = sec[1].trim().toLowerCase()
+      continue
+    }
+    const kv = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.*)$/)
+    if (!kv) continue
+    const k = kv[1].trim().toLowerCase()
+    if (section === wantSection.toLowerCase() && k === wantKey.toLowerCase()) {
+      return { found: true, value: kv[2].trim().replace(/^"(.*)"$/, '$1') }
+    }
+  }
+  return { found: false }
+}
+
+function gitConfig(key) {
+  // 三份配置，低 → 高优先级
+  const sources = []
+  if (GIT) {
+    // <git>/cmd/git.exe → ../../etc/gitconfig
+    sources.push(path.resolve(path.dirname(GIT), '..', '..', 'etc', 'gitconfig'))
+  }
+  sources.push(path.join(os.homedir(), '.gitconfig'))
+  sources.push(path.join(ROOT, '.git', 'config'))
+
+  let best = null
+  let readAny = false
+  for (const f of sources) {
+    if (!fs.existsSync(f)) continue
+    readAny = true
+    const r = readIniKey(f, key)
+    if (r.found) best = { value: r.value, from: f }
+  }
+
+  if (best) return { state: 'value', value: best.value, from: best.from }
+  // 一份都读不到 → 真的没问到，不能谎称「未设」
+  if (!readAny) return { state: 'unknown', why: '三份 gitconfig 都不存在或都不可读' }
+  return { state: 'unset' }
 }
 
 /** git 是否可用（沙箱里可能起不来 —— 见 AGENTS.md「受限权限下捕获子进程输出会 EPERM」） */
@@ -147,15 +248,21 @@ if (!GIT_OK) {
   // 没有 git 就不产生断言，只说明。**不要**写 check(..., true) —— 那是恒真断言。
   console.log('  ℹ️ 本段不适用：git 不可用（沙箱或 PATH 限制），跳过 autocrlf 检查')
 } else {
-  const r = git(['config', '--get', 'core.autocrlf'])
-  const val = r.ok ? r.out.toLowerCase() : ''
-  check(
-    'core.autocrlf 不是 true（它会静默把 index 的 LF 转成工作区 CRLF）',
-    val !== 'true',
-    val === 'true'
-      ? '当前 = true。修复：git config core.autocrlf false，然后对全仓做一次行尾归一'
-      : `当前 = ${val || '(未设，等效 false)'}`,
-  )
+  const r = gitConfig('core.autocrlf')
+  if (r.state === 'unknown') {
+    // 「我没问到」**不是**「配置没问题」。不产生断言，只说明 —— 别拿它冒充通过。
+    console.log(`  ⚠️ 读不到 core.autocrlf：${r.why}`)
+    console.log('     这不是「配置正确」，是「没查成」—— 本条不产生通过结论')
+  } else {
+    const val = r.state === 'value' ? r.value.toLowerCase() : ''
+    check(
+      'core.autocrlf 不是 true（它会静默把 index 的 LF 转成工作区 CRLF）',
+      val !== 'true',
+      val === 'true'
+        ? '当前 = true。修复：git config core.autocrlf false，然后对全仓做一次行尾归一'
+        : `当前 = ${val || '(未设，等效 false)'}`,
+    )
+  }
 
   // 🔴 2026-11-21 补：**只设 autocrlf=false 是不够的**，实测过。
   //
@@ -167,15 +274,20 @@ if (!GIT_OK) {
   //   autocrlf=false + eol=lf      → 警告消失（实测）
   //
   // 结论：**这两个都要设**。只检查 autocrlf 的守卫会报「通过」，而问题还在。
-  const eolR = git(['config', '--get', 'core.eol'])
-  const eolVal = eolR.ok ? eolR.out.toLowerCase() : ''
-  check(
-    'core.eol 是 lf（text=auto 下 autocrlf=false 会回落到 core.eol，Windows 默认 native=CRLF）',
-    eolVal === 'lf',
-    eolVal === 'lf'
-      ? ''
-      : `当前 = ${eolVal || '(未设 → 回落到 native = CRLF)'}。修复：git config core.eol lf`,
-  )
+  const eolR = gitConfig('core.eol')
+  if (eolR.state === 'unknown') {
+    console.log(`  ⚠️ 读不到 core.eol：${eolR.why}`)
+    console.log('     同上：这是「没查成」，不是「配对了」')
+  } else {
+    const eolVal = eolR.state === 'value' ? eolR.value.toLowerCase() : ''
+    check(
+      'core.eol 是 lf（text=auto 下 autocrlf=false 会回落到 core.eol，Windows 默认 native=CRLF）',
+      eolVal === 'lf',
+      eolVal === 'lf'
+        ? ''
+        : `当前 = ${eolVal || '(未设 → 回落到 native = CRLF)'}。修复：git config core.eol lf`,
+    )
+  }
 
   // 顺带把 .gitattributes 的 text=auto 也打出来：它是「autocrlf 关了也可能有影响」的来源
   const attrPath = path.join(ROOT, '.gitattributes')

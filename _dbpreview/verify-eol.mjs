@@ -29,8 +29,8 @@
  *
  * ## 为什么放在 SCRIPTS 最前面
  *
- * 后面 76 个脚本全部依赖「锚点能匹配上」。这是一个**前置条件检查**，
- * 不是并列的第 78 项 —— 行尾错了，后面的红全是噪音。
+ * 后面所有脚本全部依赖「锚点能匹配上」。这是一个**前置条件检查**，
+ * 不是并列的一项 —— 行尾错了，后面的红全是噪音。
  *
  * ## 覆盖边界（必须写出来，见 AGENTS.md「检测器本身有盲区」）
  *
@@ -315,13 +315,48 @@ for (const abs of files) {
   if (crlf > 0) crlfFiles.push({ abs, rel: path.relative(ROOT, abs).split(path.sep).join('/'), crlf })
 }
 
+/**
+ * 跑一条 git 命令，拿回「成功与否 + 输出」。
+ *
+ * ## 为什么必须有这个函数（2026-11-26 修）
+ *
+ * L324 此前直接调用 `git([...])` —— 而**这个函数从来没定义过**，
+ * 全文件只有 `findGit()` 和它的结果 `GIT`。于是：
+ *
+ *   - 工作区**没有** CRLF 文件时，那段代码根本不执行 → 报「5 通过」，一切正常
+ *   - 一旦**真有** CRLF 文件，走到 L324 就 `ReferenceError: git is not defined` → 崩
+ *
+ * 即：**这条守卫在它唯一该起作用的那一刻是坏的** —— 它不给「哪个文件带 CRLF」
+ * 的诊断，只给一坨栈回溯。这正是本项目记过的「检测器本身有盲区」的又一形态。
+ *
+ * ## 判据
+ *
+ * 用 `GIT`（`findGit()` 的结果），不要用裸 `'git'` —— 本机 git 不在 PATH 里。
+ * 拿不到就返回 `ok:false`，让调用方**保守地**把它当 tracked（进 `remain`），
+ * 这样至少能靠肉眼看到文件名，而不是整条脚本崩掉。
+ */
+function runGit(args) {
+  if (!GIT) return { ok: false, out: '', why: 'git 不可用' }
+  try {
+    // stdio 用 pipe 会 EPERM（见 AGENTS.md「受限权限下捕获子进程输出会 EPERM」），
+    // 但 `--version` 那条探测已经在用 ignore 跑通了；这里要读输出，用 pipe + try 兜。
+    const r = spawnSync(GIT, args, { encoding: 'utf8' })
+    return { ok: r.status === 0, out: r.stdout ?? '', why: r.error ? String(r.error.message) : '' }
+  } catch (e) {
+    return { ok: false, out: '', why: String(e?.message ?? e) }
+  }
+}
+
 // 区分 tracked / ignored / untracked：只有前两者参与「能不能 clone 跑通」的判断。
 // ignored 的不判红（理由见文件头覆盖边界），但打印出来。
 let ignoredCrlf = []
 if (GIT_OK && crlfFiles.length > 0) {
   const remain = []
   for (const f of crlfFiles) {
-    const ig = git(['check-ignore', '-q', f.rel])
+    // 2026-11-26：原来这里调的是不存在的 `git()`，见上面 runGit 的注释。
+    // 拿不到结果时**保守当成 tracked**（留在 remain 里 → 会判红），
+    // 宁可多报一个文件名，也不要把它静默归到 ignored 里躲掉检查。
+    const ig = runGit(['check-ignore', '-q', f.rel])
     if (ig.ok) ignoredCrlf.push(f)
     else remain.push(f)
   }

@@ -50,6 +50,14 @@ function extractRefs(text) {
 function shouldCheck(ref) {
   if (/^(https?:|mailto:|data:|\/|[A-Za-z]:)/.test(ref)) return false
   if (ref.startsWith('#')) return false
+  // ★ 2026-11-26 修盲区：`docs/` 下的文档用 `../_archive/x.md` 指向归档文件时，
+  //   这条引用以 `../` 开头 —— 下面那组前缀**一个都匹配不上**，于是被静默跳过。
+  //   实测：归档 5 份文档后新加的 3 处 `../_archive/...` 链接**完全没被核对**，
+  //   而脚本照样报「69 处，全部存在」。
+  //   这正是本项目反复记的「检测器有盲区，而且它不会告诉你」——
+  //   **一份不覆盖被测物的绿，比红更危险。**
+  //   判据：只要是相对路径且带目录分隔符（`../` 或 `docs/` 这类），就必须核对。
+  if (ref.startsWith('../')) return true
   // 只查带明确目录前缀的引用。
   // 不查裸文件名（`index.js`、`facts.md` 这类）—— 文档正文里常拿它当
   // 「某个文件」的口语指代，真身可能在 dsh-fatfishdream-memory/ 下或根本是已归档的概念，

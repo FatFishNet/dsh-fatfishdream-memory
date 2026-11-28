@@ -396,15 +396,57 @@ export function syncFts(db, table, id, row, oldRow = null) {
   ).run(id, ...ftsValues(table, asRow(row)))
 }
 
-/** 删除时清理 FTS */
-export function removeFts(db, table, id, row = null) {
+/**
+ * 删除时清理 FTS。
+ *
+ * ⚠️ 2026-11-28 修（待办 N / A4）：**`row` 不再是默认 `null`。**
+ *
+ * ## 原来的问题
+ *
+ * 签名是 `removeFts(db, table, id, row = null)`，而 L407 用
+ * `ftsValues(table, row ?? {})` —— 漏传 row 时它退化成**全空值**，
+ * 于是 FTS5 的 `'delete'` 指令拿不到原值反查，**索引项删不掉**。
+ *
+ * 而它是 contentless 表（`content=''`），`'delete'` 必须带**完整原值**
+ * 才能定位要删的条目 —— 传空值不是「删了个空的」，是「什么都没删掉」。
+ *
+ * 实测两种表现（待办 N 的子代理结论）：
+ *   · 有时**静默不生效**：`COUNT(*)=0` 但 `MATCH` 仍命中；
+ *   · 有时抛 `database disk image is malformed`（`rules_fts` 3/3 稳定复现）。
+ *     这个错名指向「库坏了」而非「参数不对」——**比静默更误导**。
+ *
+ * ## 为什么改成抛错而不是「自己查一次」
+ *
+ * 自己补查一次看起来更省事，但它会把「调用方漏传」变成一个**永远查不到的错误**
+ * ——而漏传恰恰说明调用方对「必须给整行」这件事不知情，早晚还会错在别处。
+ * 让它在**开发/测试期立刻炸**，比在生产库里留一堆删不掉的索引项好。
+ *
+ * 判据（硬约束 15 的思路）：这是「删除不报错、实际没生效」的入口。
+ * 调用方现在只有 `purgeByStatus`，它**本来就传了整行**（`removeFts(d, table, row.id, row)`），
+ * 所以这个改动对现有路径零影响 —— 它守的是**将来**谁再调一次。
+ *
+ * @param {object} db
+ * @param {string} table
+ * @param {number} id
+ * @param {object} row 必须是被删的**完整那一行**（不能是 null，不能只给 id）
+ */
+export function removeFts(db, table, id, row) {
   const fts = FTS_TABLE[table]
   if (!fts) return
+  if (row === null || row === undefined || typeof row !== 'object') {
+    // 用明确的错误信息说清「要什么」，而不是让 FTS5 抛一个看不懂的 malformed
+    throw new Error(
+      `removeFts(${table}, ${id}) 缺少完整行数据（收到 ${row === null ? 'null' : typeof row}）。` +
+        `contentless FTS 的 'delete' 必须带原值才能反查，传空值会导致索引项删不掉` +
+        `（静默失效，或抛 database disk image is malformed）。` +
+        `请传 \`SELECT * FROM ${table} WHERE id=?\` 的那一整行。`,
+    )
+  }
   const cols = FTS_COLUMNS[table]
   const ph = new Array(cols.length + 1).fill('?').join(',')
   db.prepare(
     `INSERT INTO ${fts}(${fts}, rowid, ${cols.join(',')}) VALUES('delete', ${ph})`,
-  ).run(id, ...ftsValues(table, row ?? {}))
+  ).run(id, ...ftsValues(table, row))
 }
 
 /**

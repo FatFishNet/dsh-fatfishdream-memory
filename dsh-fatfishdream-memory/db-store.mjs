@@ -996,7 +996,15 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
       }
       d.exec('COMMIT')
     } catch (error) {
-      d.exec('ROLLBACK')
+      // ⚠️ 2026-11-28 修（待办 Z）：ROLLBACK 本身也可能抛（库被占用、事务已结束）。
+      // 不包 try 的话它会**顶掉原始错误** —— 而下面那句 throw new Error(...) 是
+      // 专门为「让用户看懂发生了什么」写的，ROLLBACK 一抛就永远走不到那里。
+      // 照抄同文件 L764-768 与 L480 的现成写法。
+      try {
+        d.exec('ROLLBACK')
+      } catch {
+        /* 回滚失败别掩盖原始错误 */
+      }
       throw new Error(`迁移失败已回滚（数据未变）：${error?.message ?? error}`)
     }
 
@@ -1105,7 +1113,12 @@ export function createDbStore(dbPath, config = {}, log = () => {}) {
       for (const h of hit) d.prepare(`UPDATE rules SET status='deleted' WHERE id=?`).run(h.id)
       d.exec('COMMIT')
     } catch (e) {
-      d.exec('ROLLBACK')
+      // ⚠️ 2026-11-28 修（待办 Z）：同上，裸 ROLLBACK 会顶掉原始错误。
+      try {
+        d.exec('ROLLBACK')
+      } catch {
+        /* 回滚失败别掩盖原始错误 */
+      }
       throw e
     }
     return { removed: hit.length, sample: hit.slice(0, 3).map((h) => h.text) }

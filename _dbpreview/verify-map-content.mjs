@@ -51,7 +51,13 @@ const ANCHORS = [
   ['index', /^\s*function initDbStore\(/, 'function initDbStore', 'initDbStore 定义'],
   ['index', /^\s*initDbStore\(\)$/, 'initDbStore()', 'initDbStore 首次调用'],
   ['index', /^\s*const checkWritableRoot = \(\) =>/, 'checkWritableRoot', 'checkWritableRoot 定义'],
-  ['index', /^\s*setTimeout\(checkWritableRoot/, 'checkWritableRoot', 'checkWritableRoot 延迟'],
+  // ⚠️ 2026-11-28（待办 Y）：这两处 setTimeout 原来写的是裸调用
+  // `setTimeout(checkWritableRoot, 1500)`，现在改成
+  // `const writableTimer = setTimeout(checkWritableRoot, 1500)`（接 disposer）。
+  // 锚点必须跟着放宽 `(?:const \w+ = )?`，否则就是本项目记过的
+  // 「改了代码形态、校验器静默失明」—— 它会报「源码里找不到这个符号」，
+  // 而真相是符号**还在，只是不再是行首那个词**。
+  ['index', /^\s*(?:const \w+ = )?setTimeout\(checkWritableRoot/, 'checkWritableRoot', 'checkWritableRoot 延迟'],
   ['index', /^\s*const dispose = ctx\.systemPrompt\.context\(\{/, 'systemPrompt.context', '注入层'],
   ['index', /^\s*function renderFromDb\(/, 'renderFromDb', 'renderFromDb'],
   ['index', /^\s*function finishInjection\(/, 'finishInjection', 'finishInjection'],
@@ -74,7 +80,15 @@ const ANCHORS = [
   ['index', /^\s*const routes = \[/, 'const routes', 'routes 数组'],
   ['index', /webServer\.register\(route\)/, 'webServer.register', '路由注册'],
   ['index', /const runHealthCheck = \(\) =>/, 'runHealthCheck', 'runHealthCheck 定义'],
-  ['index', /^\s*setTimeout\(runHealthCheck/, 'runHealthCheck', '健康检查调度'],
+  // ⚠️ 2026-11-28（待办 Y）：同上，锚点放宽可选 `const x = ` 前缀。
+  // ⚠️ 2026-11-28（待办 H）：健康检查的定时器回调改成了闭包
+  //   setTimeout(() => { layoutReady.finally(() => runHealthCheck()) }, 600) ——
+  //   锚点原来要求「setTimeout( 后面紧跟 runHealthCheck」，于是报「源码里找不到这个符号」。
+  //   **符号还在，只是不再是紧挨着的那个词。** 这与 2026-11-28 早些时候
+  //   checkWritableRoot 那条踩的是同一个坑（同一类改动，第二次）。
+  //   现在只认「行首是 const <name> = setTimeout(」——锚点定位的是**调度点**，
+  //   回调体是什么由别的断言守。
+  ['index', /^\s*const healthTimer = setTimeout\(/, 'healthTimer', '健康检查调度'],
 ]
 
 let pass = 0

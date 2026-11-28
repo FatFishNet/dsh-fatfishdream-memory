@@ -189,11 +189,27 @@ console.log('\n=== B① pointerPath：路径形状 ===\n')
   // 注入假 homedir，绝不碰真实 home
   const FAKE_HOME = path.sep === '\\' ? 'C:\\Users\\__fake__' : '/home/__fake__'
 
+  // ⚠️ 2026-11-28（待办 A5）：必须把 `POINTER_BASENAME` 一起**注入**。
+  //
+  // 本脚本用 `extractFn` 只抽 `pointerPath` 的**函数体**丢进 `new Function`，
+  // 所以函数体外部的任何标识符都拿不到。删掉死常量、把文件名抽成
+  // `POINTER_BASENAME` 之后，`pointerPath` 引用了它 → 这里就 `undefined` 崩了
+  //（实测：`返回字符串 ← undefined`，然后 `.includes` 抛 TypeError）。
+  //
+  // 这正是「测试的注入方式与代码结构绑定」—— 改结构就得同步改注入。
+  // 从源码里**读出来**注入，而不是在这里再写一遍字面量：
+  // 后者会让测试验证一个和生产代码无关的值。
+  const basenameMatch = SRC.match(/^const POINTER_BASENAME = '([^']+)'/m)
+  if (basenameMatch === null) {
+    check('能从源码读到 POINTER_BASENAME（否则下面几条无意义）', false)
+  }
+  const POINTER_BASENAME = basenameMatch ? basenameMatch[1] : ''
+
   // eslint-disable-next-line no-new-func
   const pointerPath = new Function(
-    'homedir', 'join',
+    'homedir', 'join', 'POINTER_BASENAME',
     `${extractFn('pointerPath')}\nreturn pointerPath`,
-  )(() => FAKE_HOME, path.join)
+  )(() => FAKE_HOME, path.join, POINTER_BASENAME)
 
   const p = pointerPath()
 
@@ -214,11 +230,12 @@ console.log('\n=== B② pointerPath：homedir 抛错时返回 undefined ===\n')
 
 {
   // 这是它唯一的错误分支。忘了它的话，某些环境下整个插件启动就会崩。
+  const basenameMatch2 = SRC.match(/^const POINTER_BASENAME = '([^']+)'/m)
   // eslint-disable-next-line no-new-func
   const pointerPathBroken = new Function(
-    'homedir', 'join',
+    'homedir', 'join', 'POINTER_BASENAME',
     `${extractFn('pointerPath')}\nreturn pointerPath`,
-  )(() => { throw new Error('no home') }, path.join)
+  )(() => { throw new Error('no home') }, path.join, basenameMatch2 ? basenameMatch2[1] : '')
 
   let got
   let threw = false
@@ -234,9 +251,11 @@ console.log('\n=== B③ 一致性：pointerPath 与文档/注释里写的路径�
   // 源码注释与 AGENTS.md 都写 `~/.dsh/memory-root.json`。
   // 这条断言防的是「实现改了、文档没改」—— 那种不一致会让排障时看错文件。
   const FAKE_HOME = path.sep === '\\' ? 'C:\\Users\\__fake__' : '/home/__fake__'
+  const basenameMatch3 = SRC.match(/^const POINTER_BASENAME = '([^']+)'/m)
   // eslint-disable-next-line no-new-func
-  const pointerPath = new Function('homedir', 'join',
-    `${extractFn('pointerPath')}\nreturn pointerPath`)(() => FAKE_HOME, path.join)
+  const pointerPath = new Function('homedir', 'join', 'POINTER_BASENAME',
+    `${extractFn('pointerPath')}\nreturn pointerPath`)(
+    () => FAKE_HOME, path.join, basenameMatch3 ? basenameMatch3[1] : '')
 
   const rel = pointerPath().slice(FAKE_HOME.length).split(path.sep).filter(Boolean)
   check('相对部分正好是 [".dsh", "memory-root.json"]',
@@ -249,34 +268,54 @@ console.log('\n=== B③ 一致性：pointerPath 与文档/注释里写的路径�
     docMentions >= 2, `出现 ${docMentions} 次`)
 }
 
-console.log('\n=== B④ POINTER_FILE 常量是遗留死常量（记录事实，不是断言正确性）===\n')
+console.log('\n=== B④ 指针文件名只在一处定义（2026-11-28 待办 A5 已删死常量）===\n')
 
 {
-  // ⚠️ 本段**不断言它应该存在或应该删** —— 那是人的决定。
-  // 只把事实摆出来：这个常量的值与实际使用的文件名**不一致**，
-  // 且零引用。若哪天有人「顺手用它」，会把指针写到错误的文件名上。
-  const m = SRC.match(/^const POINTER_FILE = '([^']+)'/m)
-  check('POINTER_FILE 常量存在（记录现状）', m !== null, m?.[1] ?? '(未找到)')
+  // 2026-11-28 变更（待办 A5）：
+  //
+  // 这里原本记录一个事实 —— 存在一个死常量 `POINTER_FILE = '_root.json'`，
+  // 而实际用的是 `memory-root.json`，值与用法**不一致**且零引用。
+  // 当时的注释写着「不断言它应该存在或应该删 —— 那是人的决定」。
+  //
+  // 用户 2026-11-28 决定删掉它。所以本段断言**从「记录它存在」翻转为「它必须不在」**。
+  //
+  // 为什么删而不是留：名字正确、值错误的常量**比没有更危险** ——
+  // 它有语义、有注释、看着就该用；将来谁「顺手用它」，指针会写到另一个文件名上，
+  // 表现为「改完记忆根，重启后又变回去」，而目录里默默多出一个文件。
+  const deadConst = SRC.match(/^const POINTER_FILE\b/m)
+  check('死常量 POINTER_FILE 已删除（不能被重新加回来）', deadConst === null,
+    deadConst ? '它又出现了 —— 值会是错的，且没人用' : '')
 
-  if (m) {
-    // 它没有被 pointerPath 使用 —— 这是「值不一致却无人发现」的原因
-    const usesInPointerPath = /function pointerPath\(\)[\s\S]{0,300}?POINTER_FILE/.test(SRC)
-    check('pointerPath 不使用 POINTER_FILE（所以它错着也没人发现）',
-      usesInPointerPath === false)
+  // 反过来：文件名必须有**唯一**出处，且与 pointerPath 实际用的一致。
+  // 这条是删掉死常量后**真正的收益**：值与用法同源，不可能再漂。
+  const baseConst = SRC.match(/^const POINTER_BASENAME = '([^']+)'/m)
+  check('存在 POINTER_BASENAME 常量（文件名唯一出处）', baseConst !== null,
+    baseConst ? baseConst[1] : '(未找到)')
 
-    // 记录它的值与实际文件名不同
-    const actualName = 'memory-root.json'
-    if (m[1] !== actualName) {
-      console.log(`   ⚠️  POINTER_FILE='${m[1]}' 与实际文件名 '${actualName}' 不一致，`)
-      console.log('       且全文件零引用 —— 这是「工具路线遗留」，不是 bug（不影响行为）')
-    }
-    // 断言：它确实是零引用（除定义行）
+  if (baseConst) {
+    // pointerPath 必须真的用它，而不是又写一遍字面量
+    const usesIt = /function pointerPath\(\)[\s\S]{0,300}?POINTER_BASENAME/.test(SRC)
+    check('pointerPath 使用 POINTER_BASENAME（没有重复写死字面量）', usesIt === true,
+      '写死字面量 = 值与用法会再次分家')
+
+    // 字面量只准出现在定义行（定义 + pointerPath 使用，不该有第三处）
     const lines = SRC.split('\n')
-    const defIdx = lines.findIndex((l) => /^const POINTER_FILE/.test(l))
-    const refs = lines.filter((l, i) =>
-      i !== defIdx && /\bPOINTER_FILE\b/.test(l) && !/^\s*(\/\/|\*)/.test(l)).length
-    check('POINTER_FILE 零外部引用（确认是死常量）', refs === 0, `引用 ${refs} 处`)
+    const literalLines = lines
+      .filter((l) => l.includes(`'${baseConst[1]}'`))
+      .filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*'))
+    check(
+      `字符串字面量 '${baseConst[1]}' 只出现在定义行（不许再写第二遍）`,
+      literalLines.length === 1,
+      `实际 ${literalLines.length} 处：${literalLines.map((l) => l.trim()).join(' | ')}`,
+    )
   }
+
+  // 实际文件名必须仍是 memory-root.json（改了会让所有老用户的指针失效）
+  check(
+    '文件名仍是 memory-root.json（改它会让老用户指针失效）',
+    baseConst !== null && baseConst[1] === 'memory-root.json',
+    baseConst?.[1] ?? '(未找到)',
+  )
 }
 
 // ============================================================
@@ -303,16 +342,22 @@ console.log('\n=== C 自证：改坏实现，断言必须变红 ===\n')
   }
 
   // 自证 2：把 pointerPath 的 join 改成写死路径 → 不听 homedir
+  //
+  // ⚠️ 2026-11-28（待办 A5）：锚点原来是 `join(homedir(), '.dsh', 'memory-root.json')`。
+  // 删掉死常量、把文件名抽成 `POINTER_BASENAME` 之后，函数体变成
+  // `join(homedir(), '.dsh', POINTER_BASENAME)` —— 旧锚点**一处都找不到**，
+  // 于是 `n2 === 0`、自证被跳过。**自证被跳过不会报红，只会静默失去意义**
+  // （本项目记过：「变异的 SKIP 必须算失败」）。锚点已同步。
   const pSrc = extractFn('pointerPath')
-  const JOIN_CALL = "    return join(homedir(), '.dsh', 'memory-root.json')"
+  const JOIN_CALL = "    return join(homedir(), '.dsh', POINTER_BASENAME)"
   const n2 = pSrc.split(JOIN_CALL).length - 1
   check('自证锚点唯一（pointerPath 的 return）', n2 === 1, `实际 ${n2} 处`)
 
   if (n2 === 1) {
     // eslint-disable-next-line no-new-func
-    const broken = new Function('homedir', 'join',
-      `${pSrc.replace(JOIN_CALL, "    return join('C:\\\\fixed', '.dsh', 'memory-root.json')")}\nreturn pointerPath`,
-    )(() => '/home/u', path.join)
+    const broken = new Function('homedir', 'join', 'POINTER_BASENAME',
+      `${pSrc.replace(JOIN_CALL, "    return join('C:\\\\fixed', '.dsh', POINTER_BASENAME)")}\nreturn pointerPath`,
+    )(() => '/home/u', path.join, 'memory-root.json')
     check('自证：写死路径后不再依赖 homedir（证明 B① 的断言能红）',
       broken() !== path.join('/home/u', '.dsh', 'memory-root.json'),
       broken())

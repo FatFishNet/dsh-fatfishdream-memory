@@ -8,7 +8,12 @@
  *   4. 普通正文不受影响
  */
 
-const MEM_STRIP_RE = /^[ \t]*<!--mem-(?:log|fact|note|fix)\b[^`]*?-->[ \t]*$/gm
+// ⚠️ 2026-11-28 修（待办 S）：只改了 `MEM_STRIP_RE` —— `[^`]*?` → `[\s\S]*?`
+//   （能跨行，但仍禁止反引号）。
+// ⚠️ `MEM_PARTIAL_RE` **刻意保持原样**：待办原提的「尾巴改 `[^\n]*$`」实测是错的 ——
+//   未闭合标记后面那些行本来就在标记正文里，改了会把它们露到界面上。
+//   现有用例「未闭合标记整段擦除」当场变红。修好上游那条，这条不需要动。
+const MEM_STRIP_RE = /^[ \t]*<!--mem-(?:log|fact|note|fix)\b[\s\S]*?-->[ \t]*$/gm
 const MEM_PARTIAL_RE = /^[ \t]*<!--mem-(?:l(?:og)?|f(?:act|ix)?|n(?:ote)?)?[\s\S]*$/m
 
 /**
@@ -20,13 +25,18 @@ const MEM_PARTIAL_RE = /^[ \t]*<!--mem-(?:l(?:og)?|f(?:act|ix)?|n(?:ote)?)?[\s\S
 const MEM_COMMENT_LIKE_RE = /^[ \t]*<!--[ \t]+[^`\n]{2,}?-->[ \t]*$/gm
 
 /** 复刻 client.js 里的剥离逻辑 */
-function strip(src) {
+function strip(src, opts = {}) {
   let after = src.replace(MEM_STRIP_RE, '')
   // ★ 2026-11-21：与 client.js 同序 —— 完整标记 → 命令式注释 → 未闭合尾巴
   after = after.replace(MEM_COMMENT_LIKE_RE, '')
-  const partial = MEM_PARTIAL_RE.exec(after)
-  if (partial) {
-    after = after.slice(0, partial.index) + after.slice(partial.index + partial[0].length)
+  // ★ 2026-11-28：补 `skipPartial` —— 原来本脚本**根本没有这个分支**，
+  //   于是 client.js 里两条路径（延迟全量擦 / 切会话快擦）只有一条被测，
+  //   另一条走 `skipPartial:true` 的缺陷永远看不见。与 client.js 保持同序同构。
+  if (opts.skipPartial !== true) {
+    const partial = MEM_PARTIAL_RE.exec(after)
+    if (partial) {
+      after = after.slice(0, partial.index) + after.slice(partial.index + partial[0].length)
+    }
   }
   return after
 }
@@ -68,6 +78,72 @@ check(
   '四种 kind 都认',
   strip('<!--mem-log a\n1\n-->\n<!--mem-fact b\n2\n-->\n<!--mem-note c\n3\n-->\n<!--mem-fix d\n4\n-->'),
   '\n\n\n',
+)
+
+console.log('\n=== 1.1 ★ 标记正文含反引号（2026-11-28 补，原 FOR-A2 零覆盖）===\n')
+
+// 🔴 事故形态（待办 S / A2）：
+//
+// 合法标记的**正文里**只要出现一个反引号（而 AGENTS.md 恰恰要求给符号加反引号），
+// `MEM_STRIP_RE` 的 `[^`]*?` 就一次都命中不了 → 没人擦 → 该节点随后被
+// `MEM_PARTIAL_RE` 的尾巴 `[\s\S]*$` 从标记行首**一直吞到文本节点末尾** ——
+// 用户看得见的后半段正文一起没了。
+//
+// ⚠️ 这个用例在修之前**必须是红的**。它红了才说明防线真的对着缺陷。
+//    （本项目反复出现的形态：测试全绿，但绿的 38 条里没有一条碰这个输入。）
+check(
+  '标记正文含反引号 → 标记仍被擦净',
+  strip('结论\n<!--mem-log topic=技术讨论 summary=讲符号\n正文提到 `ensureLayout()` 这个函数\n-->\n结论结尾'),
+  '结论\n\n结论结尾',
+)
+
+check(
+  '★ 标记正文含反引号 → 其后正文必须完整保留（这才是被吞掉的东西）',
+  strip('结论\n<!--mem-log topic=a\n正文带 `符号` 的标记\n-->\n用户想保留的后半段文字'),
+  '结论\n\n用户想保留的后半段文字',
+)
+
+check(
+  '标记正文含反引号且紧贴文末 → 不得吞掉前面正文',
+  strip('这段必须留下\n<!--mem-log topic=a\n正文带 `符号`'),
+  '这段必须留下\n',
+)
+
+// ★ 反向守卫：放宽 `[^`]` 绝不能把「行内代码里讲解格式」那句一起擦了。
+//   那条的安全边界是「独占行首」，不是「不含反引号」。
+check(
+  '放宽后仍不误伤：行内代码讲解标记格式',
+  strip('写法是 `<!--mem-log` 加内容 `-->` 这样'),
+  '写法是 `<!--mem-log` 加内容 `-->` 这样',
+)
+
+// ★★ 两条路径必须**都**测（待办 S 第二层：症状不同）
+//
+//   · 延迟全量擦（`skipPartial` 缺省 false）：先擦完整 → 再擦未闭合尾巴
+//   · 切会话快擦（`skipPartial: true`）：**只擦完整标记**，不碰未闭合
+//
+// 同一缺陷在两条路径上症状不同，所以必须分别断言：
+//   完整标记 + 正文含反引号 + 其后还有正文
+//   → 两条路径都必须擦净标记，且**都必须保留其后正文**。
+// 原来本脚本没有 `skipPartial` 分支，这条路径**一次都没跑过**。
+check(
+  '切会话快擦路径（skipPartial:true）也擦净含反引号的完整标记',
+  strip('结论\n<!--mem-log topic=a\n正文带 `符号`\n-->\n后半段', { skipPartial: true }),
+  '结论\n\n后半段',
+)
+
+check(
+  '切会话快擦路径不得吞掉其后正文',
+  strip('结论\n<!--mem-log topic=a\n正文带 `符号` 的标记\n-->\n用户想保留的后半段文字', { skipPartial: true }),
+  '结论\n\n用户想保留的后半段文字',
+)
+
+// ★ 反向守卫：快擦路径**本来就不该**碰未闭合标记（第五代抖动事故的边界，别改）。
+//   判据见维护手册 §1 关于 `skipPartial` 默认值的那段。
+check(
+  '快擦路径（skipPartial:true）不碰未闭合标记',
+  strip('正文\n<!--mem-log topic=x\n还在写', { skipPartial: true }),
+  '正文\n<!--mem-log topic=x\n还在写',
 )
 
 console.log('\n=== 2. 不该被删的（实测踩过的 bug）===\n')
@@ -300,7 +376,7 @@ check(
 
   check(
     '源码一致性：client.js 里的 MEM_STRIP_RE 与本脚本相同',
-    src.includes('const MEM_STRIP_RE = /^[ \\t]*<!--mem-(?:log|fact|note|fix)\\b[^`]*?-->[ \\t]*$/gm'),
+    src.includes('const MEM_STRIP_RE = /^[ \\t]*<!--mem-(?:log|fact|note|fix)\\b[\\s\\S]*?-->[ \\t]*$/gm'),
     true,
   )
   check(
@@ -342,6 +418,41 @@ check(
       const body = m[1]
       check('COMPLETE_MARKER_HINT 含 mem- 分支', body.includes('mem-'), true)
       check('COMPLETE_MARKER_HINT 含「<!-- 」分支', body.includes('<!-- '), true)
+
+      // ★★ 2026-11-28：闸门必须与 MEM_STRIP_RE 同口径。
+      //
+      // 这是同日修的 S 缺陷的**另一半**，差点漏掉：
+      // 擦除正则放开了反引号，但这条闸门还排除着 —— 于是
+      //   `hasCompleteMarker(node)` → false → **fastStrip 根本不被调用**
+      //   → 切会话（快擦主路径）时整个标记连同其后正文原样露出。
+      // 症状和延迟路径不同，根因同一个：**改了筛选条件，闸门没跟上**。
+      //
+      // 判据：拿「正文含反引号的完整标记」实测闸门必须为真；
+      //   同时「未闭合标记」必须仍为假（否则快擦会去碰还在长的标记 → 第四代抖动）。
+      // ⚠️ 这里用**行为**断言，不是 `body.includes` 这种字面量比对 ——
+      //   后者改成正则的等价写法就会误报。
+      let hintRe = null
+      try {
+        hintRe = new RegExp(body)
+      } catch {
+        hintRe = null
+      }
+      const HINT_PROBE = (text) => (hintRe ? hintRe.test(text) : null)
+      check(
+        '闸门（COMPLETE_MARKER_HINT）认：正文含反引号的完整标记',
+        HINT_PROBE('结论\n<!--mem-log topic=a\n正文带 `符号`\n-->\n后半段'),
+        true,
+      )
+      check(
+        '闸门（COMPLETE_MARKER_HINT）认：「命令式注释」',
+        HINT_PROBE('<!-- 记忆写入命令：x -->'),
+        true,
+      )
+      check(
+        '闸门（COMPLETE_MARKER_HINT）不认：未闭合标记（否则快擦会碰还在长的标记）',
+        HINT_PROBE('正文\n<!--mem-log topic=a\n还在写'),
+        false,
+      )
     }
   }
 }

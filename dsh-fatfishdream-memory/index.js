@@ -32,7 +32,7 @@
  * 用 ctx.inject 可选读取，缺失时对应能力自动退化，不会让整行插件不加载。
  */
 import { mkdir, readFile, readdir, stat, writeFile, rename, unlink, rm } from 'node:fs/promises'
-import { readFileSync, writeFileSync, statSync, statfsSync, appendFileSync, mkdirSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, statSync, statfsSync, appendFileSync, mkdirSync, rmSync, renameSync, unlinkSync } from 'node:fs'
 import { dirname, join, resolve, isAbsolute, basename, relative as relativePath } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
@@ -376,26 +376,118 @@ function syncPathExists(path) {
   }
 }
 
-/** 记忆目录的“指针”文件：放在 userData 侧，用来记住上次用的根目录。 */
-const POINTER_FILE = '_root.json'
+/**
+ * 记忆目录的「指针」文件：放在 userData 侧，用来记住上次用的根目录。
+ *
+ * ⚠️ 2026-11-28 删（待办 A5）：这里原本是一个名为 POINTER_FILE 的常量，
+ *    值是 `_root.json`。**它已经不存在了，别按旧文档去找它。**
+ *
+ * 它是**工具路线遗留的死常量**：值是 `_root.json`，而 `pointerPath()` 实际写死用的是
+ * `memory-root.json`，**两者不一致**；且全文件零引用。
+ *
+ * 为什么必须删而不是留着：一个名字正确、值错误的常量**比没有更危险** ——
+ * 将来谁「顺手用它」（它有语义、有注释、看着就该用），指针就会被写到
+ * 另一个文件名上，表现为「改完记忆根，重启后又变回去」，而实际文件默默多出一个。
+ * 这正是本项目反复记的「写死了值、却没人读的字段 = 恒假分支」的邻居形态。
+ *
+ * 现在文件名只在一处出现（见下面 `POINTER_BASENAME`），值与用法同源，不可能再漂。
+ */
+const POINTER_BASENAME = 'memory-root.json'
 
 function pointerPath() {
   try {
-    return join(homedir(), '.dsh', 'memory-root.json')
+    return join(homedir(), '.dsh', POINTER_BASENAME)
   } catch {
     return undefined
   }
 }
 
-/** 读取上次记录的根目录。指针只作提示，路径不存在时会被忽略。 */
+/**
+ * 指针文件的诊断留痕。
+ *
+ * ⚠️ 2026-11-28（待办 D）：这两个函数在**模块级**，而 `diag` 定义在 `apply` 闭包里，
+ * 拿不到。所以走「注入 sink」：`apply` 里装配一个写 `diag` 的函数进来。
+ * 没装配时退化成空操作 —— 但**至少要有人能接上**，不能像原来那样两个 catch 全空。
+ *
+ * 为什么需要它：指针写坏 / 读坏时，上游 `resolveRoot` 会当成「没有指针」，
+ * 于是**重新选址并覆盖写入指针** → 记忆根**静默漂移**。
+ * 用户看到的是「记忆不见了」，日志里一个字都没有。
+ */
+let pointerLog = () => {}
+/** 装配指针诊断 sink（apply 里调）。 */
+function setPointerLog(fn) {
+  pointerLog = typeof fn === 'function' ? fn : () => {}
+}
+
+/**
+ * 原子写一个 UTF-8 文本文件（同步版）。
+ *
+ * 为什么不用 `writeFileSync` 直接写：**写到一半掉电 / 进程被杀**，
+ * 留下的是**半截 JSON** —— 下次启动 `parseJson` 抛错 → 退回 fallback →
+ * 指针被当成「没有」→ 记忆根漂移。`temp + rename` 保证「要么旧内容、要么新内容」。
+ *
+ * 为什么是同步版：调用方 `resolveRoot` 是同步函数（启动路径，且被 4 处同步调用），
+ * 改成 async 会波及整条启动链。`renameSync` 本来就够用。
+ */
+function atomicWriteFileSync(path, content) {
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
+  writeFileSync(temp, content, 'utf8')
+  try {
+    renameSync(temp, path)
+  } catch (error) {
+    // rename 失败别留下垃圾 temp 文件（它会一直被误认为是「写了一半的新内容」）
+    try {
+      unlinkSync(temp)
+    } catch {
+      /* temp 清不掉也不影响正确性，只是脏 */
+    }
+    throw error
+  }
+}
+
+/**
+ * 读取上次记录的根目录。指针只作提示，路径不存在时会被忽略。
+ *
+ * ⚠️ 2026-11-28（待办 D）：两种失败必须**分开**，原来共用一个空 catch。
+ *
+ * | 情况 | 正确反应 |
+ * |---|---|
+ * | 文件不存在（ENOENT） | 静默返回 undefined —— 这是**首次安装的正常路径**，不该报错 |
+ * | 文件存在但内容坏了 | **留痕** —— 否则它会一路静默到「重新选址 + 覆盖指针」 |
+ */
 function readPointer() {
   const path = pointerPath()
   if (path === undefined) return undefined
+  let text
   try {
-    const parsed = parseJson(readFileSync(path, 'utf8'))
+    text = readFileSync(path, 'utf8')
+  } catch (error) {
+    // 只有 ENOENT 才是「从来没写过指针」，其余（EACCES / EBUSY / EIO）都是异常
+    if (error?.code !== 'ENOENT') {
+      pointerLog('pointer-read-FAILED', {
+        path,
+        code: error?.code ?? null,
+        message: String(error?.message ?? error),
+      })
+    }
+    return undefined
+  }
+  try {
+    const parsed = parseJson(text)
     const root = typeof parsed?.root === 'string' ? parsed.root.trim() : ''
-    return root === '' ? undefined : { root, savedAt: parsed?.savedAt ?? null }
-  } catch {
+    if (root === '') {
+      // 文件在、但结构不对（空对象 / root 不是字符串 / 被手工改坏）
+      pointerLog('pointer-INVALID', { path, bytes: Buffer.byteLength(text, 'utf8') })
+      return undefined
+    }
+    return { root, savedAt: parsed?.savedAt ?? null }
+  } catch (error) {
+    // 文件在但**解析不了** —— 这是最该留痕的一种，它意味着「指针内容没了」
+    pointerLog('pointer-CORRUPT', {
+      path,
+      bytes: Buffer.byteLength(text, 'utf8'),
+      message: String(error?.message ?? error),
+    })
     return undefined
   }
 }
@@ -407,9 +499,20 @@ function writePointer(root) {
   try {
     mkdirSync(dirname(path), { recursive: true })
     const payload = JSON.stringify({ root, savedAt: new Date().toISOString() }, null, 2)
-    writeFileSync(path, `${payload}\n`, 'utf8')
-  } catch {
-    /* 指针写不了不该影响插件 */
+    // ⚠️ 2026-11-28（待办 D）：原来是裸 `writeFileSync` —— 写一半就是坏 JSON，
+    // 而坏指针会被下一次启动当成「没有指针」→ 记忆根漂移。
+    atomicWriteFileSync(path, `${payload}\n`)
+  } catch (error) {
+    // ⚠️ 原来这里是**空 catch**（注释写「指针写不了不该影响插件」）。
+    //    不影响插件是对的，但**不留痕是错的** —— 指针写失败 =
+    //    下次启动找不到记忆目录，而这个失败当时完全不可见。
+    //    仍然不抛（启动路径上抛错会让插件起不来），但必须留痕。
+    pointerLog('pointer-write-FAILED', {
+      path,
+      root,
+      code: error?.code ?? null,
+      message: String(error?.message ?? error),
+    })
   }
 }
 
@@ -2617,8 +2720,65 @@ export function createStore(config) {
   // 剥离后流水只存 logs 表，这两个函数已无任何调用方。
 
   let writeQueue = Promise.resolve()
+
+  /** 当前是否有一个 serialize 任务正在执行（同步标志，**不是** Promise 状态）。 */
+  let inSerialize = false
+
+  /**
+   * 所有 `state.json` 读-改-写的唯一队列（D13）。
+   *
+   * ⚠️ 2026-11-28 修（待办 J / A1）：**重入会永久死锁，且完全静默。**
+   *
+   * 原实现是三行：
+   *
+   *     const run = writeQueue.then(() => task())
+   *     writeQueue = run.then(() => undefined, () => undefined)
+   *     return run
+   *
+   * 在锁内再调一次 `serialize` 会发生什么：
+   *   内层把 `writeQueue` 指向「外层 run 完成之后」才 resolve 的 Promise，
+   *   而外层要等内层返回才完成 —— **互相等对方**，两边永不 settle。
+   *   2026-11-24 子代理实测：`3 秒后 innerRan=false outerSettled=false`，
+   *   此后**所有排队写入一并停摆**，日志里一个字都没有。
+   *
+   * 为什么必须「直接 reject」而不是「排队等待」：
+   *   等待就是等自己，那正是死锁本身。这里要的是**立刻失败并留痕**，
+   *   而不是把调用方挂在那里 —— 挂住的表现是「写记忆没生效，但一切看着正常」，
+   *   属于硬约束 15 那类「该写却没写」的数据丢失形态。
+   *
+   * ⚠️ 加锁/解锁必须放在 `try/finally` 里：`task()` 同步抛错时也要复位，
+   *   否则一次失败就把标志永久留成 true，之后**所有写入全部被误判为重入**。
+   *   那种坏法比原 bug 更隐蔽（原 bug 只卡一次，这个卡到底）。
+   *
+   * @param {() => Promise<any>} task
+   */
   function serialize(task) {
-    const run = writeQueue.then(() => task())
+    // 重入：立刻拒绝，并把「谁撞的」交给调用方留痕。
+    if (inSerialize) {
+      const err = new Error(
+        'serialize() 不允许重入：锁内再调会永久死锁。' +
+          '请把嵌套的那段逻辑并入同一次读-改-写，或拆成两个独立任务。',
+      )
+      err.code = 'SERIALIZE_REENTRY'
+      // 留痕：createStore 的作用域里没有 logger/diag（它们定义在 apply 内），
+      // 所以走注入的回调；没注入就退化成「有 Error 但无日志」——
+      // 至少调用方的 catch 能看见，不会像原来那样静默挂起。
+      try {
+        config.onSerializeReentry?.({ error: err })
+      } catch {
+        /* 留痕回调自己出错也不能影响主流程 */
+      }
+      return Promise.reject(err)
+    }
+
+    const run = writeQueue.then(async () => {
+      inSerialize = true
+      try {
+        return await task()
+      } finally {
+        inSerialize = false
+      }
+    })
     writeQueue = run.then(() => undefined, () => undefined)
     return run
   }
@@ -2839,24 +2999,58 @@ export function createStore(config) {
    * 由调用方决定怎么打。这是既有的分层约定（store 只做纯数据操作）。
    */
   async function ensureLayout() {
+    // ⚠️ 2026-11-28 修（待办 H）：**建目录/建文件的 IO 留在锁外，只有
+    // 「读 state → 改 → 写回」这一段进锁。**
+    //
+    // 为什么不能整段包进锁：`mkdir` 与写 `policy.md` 可能是慢 IO
+    //（网络盘、杀软扫描），把它们塞进全局唯一的写队列会让**所有**
+    // state 写入排在后面 —— 等于给正常流量加了一个无关的长锁。
+    // 判据：锁保护的是**共享可变状态**，不是「这个函数」。
     await mkdir(root, { recursive: true })
     // 唯一需要预建的文件：policy.md（行为规则，不进数据库）
     if (!(await exists(paths.policy))) await atomicWrite(paths.policy, POLICY_TEMPLATE)
-    // ⚠️ 2026-11-16：一次性覆盖（用户明确授权，见 syncPolicyOnce 的注释）。
-    // 只在这里做一次，且由 state.policySyncVersion / 文件内标记双重把关。
+
+    // ⚠️ 原来这段是裸的读-改-写，且**调用点没 await**（见 L4045 附近）：
+    // 启动窗口内若有会话触发 `registerProject` 抢在「读」与「写」之间写入，
+    // `{ ...st }` 的**过期快照会把它抹掉** —— 正是 D13「记忆还在但项目不见了」。
+    //
+    // 修法两件事，缺一不可：
+    //   ① 读-改-写进 `serialize`（同一把队列，不是新造一把）；
+    //   ② **在锁内重新读一次**，不要用函数顶部读到的旧快照。
+    //      （本函数原来就是 `const st = await readState()` 之后 `{ ...st }`
+    //       写回 —— 那份 st 从读出来到写回去之间随时可能过期。）
+    //
+    // ⚠️ 2026-11-16 的一次性覆盖语义不变：仍然只做一次，
+    //    仍由 state.policySyncVersion / 文件内标记双重把关。
     let policySync = null
     try {
-      const st = await readState()
-      const r = await syncPolicyOnce(st)
-      if (r.written) {
-        await writeState({ ...st, policySyncVersion: POLICY_SYNC_VERSION })
-        policySync = r
-      } else if (r.skipped === 'marked') {
-        await writeState({ ...st, policySyncVersion: POLICY_SYNC_VERSION })
-      }
+      // 前半段（判要不要同步、要不要备份文件）在锁外做 —— 它只读文件、不碰 state。
+      // 真正需要锁的是「读 state → 决定 version → 写 state」这一小段。
+      const probe = await serialize(async () => {
+        const st = await readState()
+        const r = await syncPolicyOnce(st)
+        if (r.written) {
+          await writeState({ ...st, policySyncVersion: POLICY_SYNC_VERSION })
+          return { ok: r }
+        }
+        if (r.skipped === 'marked') {
+          await writeState({ ...st, policySyncVersion: POLICY_SYNC_VERSION })
+          return { ok: null }
+        }
+        return { ok: null }
+      })
+      policySync = probe.ok
     } catch (e) {
       // 同步失败不应阻断插件启动：policy.md 只是行为规则，旧版仍可用
-      policySync = { error: String(e?.message ?? e) }
+      //
+      // ⚠️ 这个 catch 也会接住 `serialize` 的**重入拒绝**（SERIALIZE_REENTRY）。
+      //    那种情况下不是「policy 同步失败」，而是「有人在锁内又调了 ensureLayout」
+      //    —— 必须区分，否则又是一次静默误导。下面单独标出来。
+      if (e?.code === 'SERIALIZE_REENTRY') {
+        policySync = { error: 'serialize 重入被拒', code: e.code }
+      } else {
+        policySync = { error: String(e?.message ?? e) }
+      }
     }
     return policySync
   }
@@ -2871,23 +3065,79 @@ export function createStore(config) {
     const fallback = { version: 2, lastConsolidate: null, projects: {} }
     const text = await readIfExists(paths.state)
     if (text === undefined) return fallback
+
+    // ⚠️ 2026-11-28 修（待办 G）：**「文件不存在」与「文件坏了」必须分开。**
+    //
+    // 原实现三种失败都 `return fallback`，不记日志也不标记坏文件。后果：
+    //   下游 `registerProject` 拿这份空 state 改 `projects` 再 `writeState`
+    //   → **坏文件被一份 `projects: {}` 覆盖掉** → 原项目映射和
+    //   `policySyncVersion` 全丢。用户看不到任何错误。
+    //
+    // ## 为什么**不**改成「返回 null 让调用方跳过写回」
+    //
+    // 待办原提议是「解析失败返回 null，所有写回点读到 null 时跳过」。
+    // 实测否决：`readState()` 有 **10 个调用点**，其中多处直接写
+    //   `state.projects[...]` / `state.lastConsolidate = …`
+    // 返回 null 会当场抛出 TypeError，波及面远大于收益 —— 等于用一个
+    // 启动期崩溃换一个罕见场景下的保护。
+    //
+    // ## 采取的做法：**留底 + 留痕，契约不变**
+    //
+    //   ① 解析失败时把坏文件**改名留底**（`state.json.corrupt-<ts>`），
+    //      这样原内容还在，用户/我们都能事后捞回来；
+    //   ② 打一条 diag，**明确指出发生过什么**；
+    //   ③ 仍然返回 fallback —— 但此时磁盘上已经没有 `state.json` 了
+    //      （已被改名），所以哪怕下游立刻 writeState，覆盖的也只是
+    //      **我们自己刚留底之后的新文件**，原内容完好。
+    //
+    // 判据（硬约束 15）：这是「该保留的信息真的会丢」的形态 ——
+    // 区别只在于它**不报错**，日志干净、界面正常，只是项目映射没了。
+    let corruptReason = null
+    let parsed = null
     try {
-      const parsed = parseJson(text)
-      if (!parsed || typeof parsed !== 'object') return fallback
-      return {
-        version: 2,
-        lastConsolidate: parsed.lastConsolidate ?? null,
-        projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
-        // ⚠️ 2026-11-16：policy.md 一次性同步的版本号（见 syncPolicyOnce）。
-        // **必须在这里透传**，否则每次 readState 都把它丢掉 →
-        // 每次启动都以为「没同步过」→ **每次启动都覆盖 policy.md**，
-        // 那就正好违反了用户「仅此一次」的要求。
-        policySyncVersion: Number.isInteger(parsed.policySyncVersion)
-          ? parsed.policySyncVersion
-          : null,
+      parsed = parseJson(text)
+      if (!parsed || typeof parsed !== 'object') corruptReason = 'not-an-object'
+    } catch (error) {
+      corruptReason = `parse-failed: ${error?.message ?? error}`
+    }
+
+    if (corruptReason !== null) {
+      // 留底：改名而不是删除（用户的真实数据，宁可留着脏文件也不丢）
+      const backup = `${paths.state}.corrupt-${Date.now()}`
+      try {
+        await rename(paths.state, backup)
+        pointerLog('state-CORRUPT-quarantined', {
+          reason: corruptReason,
+          bytes: Buffer.byteLength(text, 'utf8'),
+          movedTo: backup,
+        })
+      } catch (error) {
+        // 连改名都失败（文件被占用等）：**尤其不能继续往下走**，
+        // 因为那意味着下游写回会直接覆盖坏文件。这里宁可抛，
+        // 让上层看到明确的失败，也不要静默丢数据。
+        pointerLog('state-CORRUPT-quarantine-FAILED', {
+          reason: corruptReason,
+          message: String(error?.message ?? error),
+        })
+        throw new Error(
+          `state.json 内容损坏（${corruptReason}），且无法改名留底（${error?.code ?? error?.message ?? error}）。` +
+            `为避免覆盖原始数据已中止读取。请关闭占用该文件的程序后重试。`,
+        )
       }
-    } catch {
       return fallback
+    }
+
+    return {
+      version: 2,
+      lastConsolidate: parsed.lastConsolidate ?? null,
+      projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
+      // ⚠️ 2026-11-16：policy.md 一次性同步的版本号（见 syncPolicyOnce）。
+      // **必须在这里透传**，否则每次 readState 都把它丢掉 →
+      // 每次启动都以为「没同步过」→ **每次启动都覆盖 policy.md**，
+      // 那就正好违反了用户「仅此一次」的要求。
+      policySyncVersion: Number.isInteger(parsed.policySyncVersion)
+        ? parsed.policySyncVersion
+        : null,
     }
   }
 
@@ -3238,6 +3488,27 @@ export function createStore(config) {
    *   - 更新指针文件
    *   - 回调 onRootMoved 切换日志落点
    *   - 旧目录保留不删
+   *
+   * ## ⚠️ 源目录：本函数**绝不删除任何东西**（2026-11-28 核实并写死）
+   *
+   * 顺序永远是「读源 → 写目标」，源侧只出现在 `readBytesIfExists` / `readdir`
+   * 这类只读位置。函数体内 `rm` / `unlink` / `rmSync` **一个都没有**
+   *（全仓的递归删除只在 `_dbpreview/` 的临时目录里，生产码零递归删除）。
+   * 所以迁移失败时：**新根可能残缺，源根必定完好**。
+   * 这条要写在这里，是因为它正是路由层失败提示里「源目录没有改动」的依据 ——
+   * 改这里之前先确认它仍然成立。
+   *
+   * ## ⚠️ 反向：本函数**刻意不清理失败后的目标目录**
+   *
+   * 失败时 `nextRoot` 里会留下半份数据（`mkdir` 已执行）。不清理是**取舍**：
+   *   · 要清理就得递归删掉一个用户指定路径的整棵目录 —— 本仓库至今没有这种
+   *     代码，而「路径拼错 / junction 穿透」这类误删无法用哨兵完全堵死；
+   *   · 代价可控：残留目录不在任何被读取的路径上（`resolveRoot` 只看指针与
+   *     `memory.db`；重试时 `backupDbFile` 开头的 `rm(to)` 会先清掉半成品库，
+   *     `atomicWrite` / `copyTree` 又会覆盖同名文件 —— **重试天然幂等**）。
+   * 唯一需要人处理的是下面那道「目录非空」闸，所以它的报错文案必须告诉用户
+   * 「这可能是上次失败留下的、删掉可重试」。
+   *（待办 B2 已记：若要自动化，走哨兵文件 + 幂等重试，**不要走递归删除**。）
    */
   async function migrateRoot(nextRootRaw, onRootMoved, options = {}) {
     const relocateAll = options.relocateAll !== false
@@ -3260,13 +3531,36 @@ export function createStore(config) {
     if (isInside(root, nextRoot)) throw new Error('新位置不能是当前记忆目录的子目录')
     if (await exists(nextRoot)) {
       const entries = await readdir(nextRoot).catch(() => [])
-      if (entries.length > 0) throw new Error(`目标目录非空：${nextRoot}`)
+      if (entries.length > 0) {
+        // ⚠️ 2026-11-28（待办 B2）：**这条提示必须指向「正确的下一步」。**
+        //
+        // 原文案只有一句「目标目录非空：<路径>」，实测会把人引向错误判断 ——
+        // 用户看到后的第一反应是「我路径填错了」，而真实原因常常是
+        // **他自己上一次迁移失败留下的半成品**（本次 `mkdir` 之后中途抛错，
+        // 目录和半份数据就留在那里了）。
+        //
+        // 现在 `migrateRoot` 失败时**不清理目标**（刻意：见下方 docstring），
+        // 所以「删掉该目录再重试」是这条路唯一的出路，必须写出来。
+        // 判据同 `/log` 的 topic 白名单那次教训：错误提示写错方向 =
+        // 用户按提示操作仍然失败，且看不出为什么。
+        throw new Error(
+          `目标目录非空：${nextRoot}\n` +
+            `如果这是你上一次迁移失败留下的目录，里面可能只有半份数据 —— ` +
+            `确认无用了就删掉该目录后重试。\n` +
+            `当前记忆目录（源）没有任何改动，可以继续正常使用。`,
+        )
+      }
     }
     await mkdir(nextRoot, { recursive: true })
 
     const state = await readState()
     let moved = 0
-    let dbCopied = false
+    // ⚠️ 2026-11-28 删（待办 W）：这里原本有个 `let dbCopied = false`，
+    // 全文只在 L3310 附近被赋过一次 true，**从未被读取**，也没进返回值。
+    // 死变量留着最坏的不是浪费一行：它让人以为「调用方能知道库有没有搬过去」，
+    // 于是下游不去查真正的事实（新根有没有 memory.db）。
+    // 要恢复这个信息就把它加进下面的 return **且在调用处真的读一次** ——
+    // 只加返回不加读取，等于没修。
     // 被 copyTree 跳过的条目（junction / 符号链接等）。
     // 收集起来随返回值给上层，由它 diag 一条 —— 绝不静默丢失。
     const skippedEntries = []
@@ -3307,7 +3601,6 @@ export function createStore(config) {
     if (await exists(dbSource)) {
       try {
         await backupDbFile(dbSource, join(nextRoot, 'memory.db'))
-        dbCopied = true
         moved += 1
       } catch (error) {
         // 数据库备份失败必须中断整个迁移 —— 继续下去会让新根变成空库，
@@ -3499,16 +3792,39 @@ function readStateSync(store) {
   const fallback = { version: 2, lastConsolidate: null, projects: {} }
   const text = readCached(store.paths.state)
   if (text === undefined) return fallback
+
+  // ⚠️ 2026-11-28（待办 G / A3）：与 `readState` 同一反模式 —— 解析失败静默 fallback。
+  //
+  // **但这里只留痕、不改名留底**，差异是刻意的：
+  //   · 本函数是**纯读**（注入层取 scope 用），全项目**没有一处**
+  //     拿它的返回值去 writeState —— 所以不存在「坏文件被覆盖」的风险；
+  //   · 它跑在**每次注入**的热路径上（每分钟多次），若在这里改名，
+  //     第一次注入就会把文件挪走，反而制造出「文件突然不见了」的新问题。
+  //   → 所以 `readState`（有写回风险）才改名，这里只记一笔。
+  // 判据：**同一个反模式，能不能动手取决于它后面接不接写回。**
+  let parsed = null
+  let corruptReason = null
   try {
-    const parsed = parseJson(text)
-    if (!parsed || typeof parsed !== 'object') return fallback
-    return {
-      version: 2,
-      lastConsolidate: parsed.lastConsolidate ?? null,
-      projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
-    }
-  } catch {
+    parsed = parseJson(text)
+    if (!parsed || typeof parsed !== 'object') corruptReason = 'not-an-object'
+  } catch (error) {
+    corruptReason = `parse-failed: ${error?.message ?? error}`
+  }
+  if (corruptReason !== null) {
+    // 走 pointerLog 同一个 sink：两者都是「启动/注入路径上的文件坏了」，
+    // 让它们在日志里长得一样，排查时不用记两套措辞。
+    pointerLog('state-sync-CORRUPT', {
+      reason: corruptReason,
+      bytes: Buffer.byteLength(text, 'utf8'),
+      note: '只读不改名：本函数不写回，无覆盖风险',
+    })
     return fallback
+  }
+
+  return {
+    version: 2,
+    lastConsolidate: parsed.lastConsolidate ?? null,
+    projects: parsed.projects && typeof parsed.projects === 'object' ? parsed.projects : {},
   }
 }
 
@@ -3694,9 +4010,26 @@ export function apply(ctx, rawConfig = {}) {
 
   diag('apply-start', { rawRoot: config.root })
 
+  // ⚠️ 2026-11-28（待办 D）：**必须在 `resolveRoot` 之前装配**。
+  // 指针读写就发生在 resolveRoot 里面（读指针选址 / 写回指针），
+  // 装配晚了等于整段启动路径的指针故障都不留痕 —— 那正是我们要修的那个洞。
+  setPointerLog((stage, detail) => diag(stage, detail))
+
   const resolvedRoot = resolveRoot(config.root, (m) => logger.warn?.(m))
   config.root = resolvedRoot.root
   config.rootReason = resolvedRoot.reason
+  // ⚠️ 2026-11-28：`serialize` 的重入留痕回调。
+  // 为什么经 config 注入：`createStore` 是**模块级导出**（测试直接 import），
+  // 拿不到 apply 闭包里的 `diag`。dbStore 当年也是这么解决的
+  //（见 initDbStore 里的 `(level, msg) => diag(...)`）。
+  // 硬约束 15：这类「写不进去」的失败不能静默 —— 没日志就等于没发生。
+  config.onSerializeReentry = ({ error }) => {
+    diag('state-serialize-reentry-BLOCKED', {
+      message: String(error?.message ?? error),
+      // 带上调用栈首帧，能直接定位是谁在锁内又调了一次
+      at: String(error?.stack ?? '').split('\n')[1]?.trim() ?? null,
+    })
+  }
   const store = createStore(config)
 
   // ---- 数据库存储（v2 架构）----
@@ -3774,14 +4107,35 @@ export function apply(ctx, rawConfig = {}) {
    */
   function rebindDbStore(nextRoot) {
     const from = dbPath
+    // ⚠️ 2026-11-28 修（待办 X）：**`close()` 不抛错**，它把失败包成
+    // `{ok:false, error}` **返回**（见 db-store.mjs 的 close()：体内 0 处 throw，
+    // 正常关 / 重复关 / 坏路径三种实测都正常返回，见
+    // `_dbpreview/selfcheck-db-rebind-close.mjs`）。
+    //
+    // 原来这里只调用、不看返回值 —— 于是那个 catch 是**恒假分支**（写得像守着
+    // 失败路径，实际永远不亮），而真正的失败信号就此蒸发：
+    // 旧句柄还开着（Windows 上旧目录删不掉、用户不知道为什么不让他删），
+    // GUI 却照样收到 `dbRebound: true`。这是 2026-11-16 把 close() 改成
+    // 「返回失败」时只改了生产端、没改消费端留下的半条命。
+    let closed
+    let closeThrew = false
     try {
-      dbStore?.close?.()
+      closed = dbStore?.close?.()
     } catch (error) {
+      // 这条 catch 保留：它守的是「契约将来改成抛错」那种情况。
+      // 但现在它还多了一层职责 —— 让 classifyCloseResult 知道是抛的，而不是返回的。
+      closeThrew = true
       diag('db-rebind-close-FAILED', { message: String(error?.message ?? error) })
     }
     config.root = nextRoot
     const ok = initDbStore()
-    diag('db-rebound', { from, to: dbPath, ok })
+    // ⚠️ 顺序不能改：initDbStore() 必须在前。它会把 dbStore 覆盖成新对象，
+    // 而这条日志的全部价值就是「切换之后，新库起没起来 / 旧句柄关没关掉」。
+    // 摆到 initDbStore() 之前，日志里的 `to` 会指向旧路径 —— 那就是假信息。
+    // （`selfcheck-db-rebind-close.mjs` 第 3 段守这个顺序，变异 M3）
+    const cc = classifyCloseResult(closed, closeThrew)
+    if (cc.stage !== undefined) diag(cc.stage, { from, to: dbPath, ...cc.detail })
+    diag('db-rebound', { from, to: dbPath, ok, closed: cc.kind })
     return ok
   }
 
@@ -3796,7 +4150,18 @@ export function apply(ctx, rawConfig = {}) {
   diag('root-resolved', { root: resolvedRoot.root, reason: resolvedRoot.reason, logDir })
 
   // 预建目录与 policy.md（memory.db 由数据库层自己创建）
-  store
+  //
+  // ⚠️ 2026-11-28 修（待办 H 第二半）：**这个 Promise 原来被直接丢弃。**
+  //
+  // `apply` 是同步函数，`store.ensureLayout().then(...)` 的返回值没人接 ——
+  // 也就是说「目录建好了没 / policy.md 同步完了没」**没有任何地方在等**。
+  // 启动窗口里若立刻有会话来写，可能抢在预建完成之前。
+  // 下面 L4113 附近那句「放到下一个 tick，避免和 ensureLayout 抢同一个目录
+  // 创建时机」其实就是这个未等待状态打的补丁。
+  //
+  // 现在把它存成 `layoutReady`：既保住 Promise 不丢，也让需要「等布局就绪」
+  // 的地方有东西可 await（目前是日志与自检，将来若要串行化首写也能直接接上）。
+  const layoutReady = store
     .ensureLayout()
     .then((policySync) => {
       // ⚠️ 2026-11-16：policy.md 的一次性覆盖结果在这里记日志。
@@ -3814,10 +4179,12 @@ export function apply(ctx, rawConfig = {}) {
         diag('policy-sync-failed', { message: policySync.error })
         logger.warn?.(`[dsh-memory] policy.md 同步失败（不影响启动）：${policySync.error}`)
       }
+      return policySync
     })
     .catch((error) => {
       logger.warn?.(`[dsh-memory] 初始化失败：${error?.message ?? error}`)
       diag('layout-FAILED', { message: String(error?.message ?? error) })
+      return null
     })
 
   // ---- 启动自检：记忆目录是否真的可写 ----
@@ -3860,7 +4227,14 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
   // 放到下一个 tick，避免和 ensureLayout 抢同一个目录创建时机
-  setTimeout(checkWritableRoot, 1500)
+  //
+  // ⚠️ 2026-11-28 修（待办 Y）：原来是裸调用 `setTimeout(checkWritableRoot, 1500)`。
+  // 后果：返回值没接 → 既不能 `unref()`，也没有卸载函数去 `clearTimeout`；
+  // 插件卸载 / 热重载后它**仍会触发一次**，而且 `checkWritableRoot` 会**写探针文件**。
+  // 照抄同文件 `probeSidebar` 的现成三件套（定时器三件套的样板）。
+  const writableTimer = setTimeout(checkWritableRoot, 1500)
+  writableTimer.unref?.()
+  ctx.effect(() => () => clearTimeout(writableTimer), 'dsh-memory: writable probe')
 
   // ---- L0 注入层：记忆内容 + 使用协议 ----
   //
@@ -5029,6 +5403,68 @@ export function apply(ctx, rawConfig = {}) {
    */
   const HEARTBEAT_MAX_BYTES = 80
 
+  /**
+   * 删除收尾语前，把整份 `policy.md` 备份一份（2026-11-28，待办 E）。
+   *
+   * ## 为什么必须有
+   *
+   * 「清除收尾语」是 **GUI 上一个按钮就能触发的破坏性操作**，而修改前是
+   * 直接覆盖、零备份。用户手写的那句话一旦删掉，这个项目**没有任何**地方
+   * 存着它（`memory.db` 里没有 policy.md 的内容，`back/` 也不含运行时文件）。
+   *
+   * 而且删除走 `replace`，正则历史上出过两次事故（吞标题、留孤儿续行）——
+   * 存「那一行」不够，必须存**整份**，才能看出这次操作到底把文件改成了什么样。
+   *
+   * ## 为什么不复用 `policy.md.pre-sync`
+   *
+   * 那个是**一次性同步**的备份（`syncPolicyOnce` 专用，有哨兵把关、只写一次）。
+   * 混用会让「哪次覆盖对应哪个备份」彻底说不清。
+   *
+   * ## 清理策略
+   *
+   * 只留最近 {@link POLICY_BACKUP_KEEP} 个。用户可能反复「删了再写」，
+   * 不清理的话目录里会堆一堆 —— 而备份的价值集中在**最近几次**。
+   * ⚠️ 清理失败**不能**影响删除本身（备份是安全网，不是前置条件）。
+   */
+  const POLICY_BACKUP_KEEP = 5
+  async function backupPolicyBeforeDelete(content) {
+    if (typeof content !== 'string' || content === '') return
+    const dir = dirname(store.paths.policy)
+    // 用「日期-时分秒-毫秒」：同一秒内反复操作也不会撞名
+    const d = new Date()
+    const p = (n, w = 2) => String(n).padStart(w, '0')
+    const stamp =
+      `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-` +
+      `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${p(d.getMilliseconds(), 3)}`
+    const target = join(dir, `policy.md.bak-${stamp}`)
+    try {
+      await atomicWrite(target, content)
+      diag('policy-backup-before-delete', { file: target, bytes: Buffer.byteLength(content, 'utf8') })
+    } catch (error) {
+      // 备份失败**不该**阻止删除（否则用户永远删不掉），但必须留痕 ——
+      // 否则「删了以后找不到备份」这件事事后无法解释。
+      diag('policy-backup-FAILED', {
+        message: String(error?.message ?? error),
+        note: '删除继续执行，但这份 policy.md 没有留底',
+      })
+      return
+    }
+
+    // 只留最近 N 个（按文件名里的时间戳排，不依赖 mtime）
+    try {
+      const all = (await readdir(dir)).filter((f) => /^policy\.md\.bak-\d{8}-\d{9,}$/.test(f)).sort()
+      const extra = all.length - POLICY_BACKUP_KEEP
+      if (extra > 0) {
+        for (const f of all.slice(0, extra)) {
+          await unlink(join(dir, f)).catch(() => {})
+        }
+        diag('policy-backup-pruned', { removed: extra, keep: POLICY_BACKUP_KEEP })
+      }
+    } catch {
+      /* 清理失败无所谓，不影响正确性 */
+    }
+  }
+
   async function writeHeartbeat(next) {
     // 归一化：换行/连续空白统一成一个空格。
     // 为什么必须归一化：收尾语要求「放在最后一行」，本身就不能是多行文本。
@@ -5114,6 +5550,21 @@ export function apply(ctx, rawConfig = {}) {
       //
       // 两条正则都保持「只吃行 + 缩进续行」的形态，对不命中的正则 `replace` 无副作用，
       // 所以不会破坏「不吞标题 / 不留孤儿续行」那两条防线。
+
+      // ⚠️ 2026-11-28 加（待办 E）：**删除前先备份整份 policy.md。**
+      //
+      // 原来删除是**直接覆盖、零备份**：用户点一下「清除」，那句话就从磁盘上没了，
+      // 想找回来只能靠 `backrestore` 之类的外部手段（而本项目**没有** memory 目录的
+      // 历史副本，见 AGENTS.md 的目录说明）。
+      //
+      // 为什么备份**整份文件**而不是只存那一行：
+      //   删除走的是 `replace`，正则一旦有漏网（历史上有过两次：
+      //   吞标题、留孤儿续行），被改动的就**不止那一行**。
+      //   存整份才能把「删除操作把文件改成了什么样」完整留证。
+      //
+      // 文件名带时间戳，且**不覆盖**旧备份 —— 用户可能反复删/写。
+      // 只留最近若干个，避免目录里堆成垃圾（见下面的清理）。
+      await backupPolicyBeforeDelete(current)
       updated = current.replace(heartbeatBlockReNew(), '').replace(heartbeatBlockRe(), '')
     } else {
       // 用户在 GUI 里只输入那句话本身；执行说明由这里补全。
@@ -6792,10 +7243,24 @@ export function apply(ctx, rawConfig = {}) {
                 return { kind: 'success', text: `#${id}（${table}）已标记「撤回过」——不再注入，但仍可查` }
               }
               if (action === 'consolidate') {
-                const state = await store.readState()
-                state.lastConsolidate = localDay()
-                await store.writeState(state)
-                return { kind: 'success', text: '已记录整理时间。' }
+                // ⚠️ 2026-11-28 修（待办 I）：**必须走同一把锁**。
+                //
+                // 原来是裸的三行读-改-写：
+                //     const state = await store.readState()
+                //     state.lastConsolidate = localDay()
+                //     await store.writeState(state)
+                // 「读」与「写」之间没有任何保护，同文件另三处读-改-写
+                //（registerProject / moveProject / /scope/rename）都进了锁，
+                // **只有这一处漏着** —— 修那三处时漏掉的第四个调用点。
+                //
+                // ⚠️ 必须用 `store.serialize`，不能自己另起 Promise 链：
+                //    两把锁互不排斥 = 等于没锁（教训写在 L8401 的注释里）。
+                return await store.serialize(async () => {
+                  const state = await store.readState()
+                  state.lastConsolidate = localDay()
+                  await store.writeState(state)
+                  return { kind: 'success', text: '已记录整理时间。' }
+                })
               }
               return { kind: 'error', text: `未知动作：${action}` }
             },
@@ -7631,7 +8096,28 @@ export function apply(ctx, rawConfig = {}) {
               return json(res, 405, { ok: false, error: '只接受 GET / POST' })
             }
             const body = await readBody(req)
-            const text = typeof body.text === 'string' ? body.text.trim() : ''
+            // ⚠️ 2026-11-28 修（待办 E）：**必须区分「没传 text」与「传了空串」。**
+            //
+            // 原来是一句：
+            //     const text = typeof body.text === 'string' ? body.text.trim() : ''
+            // 于是 `{"text":""}`（用户点「清除」）与 `{}`（没传 / body 解析成空对象）
+            // **走同一条路** —— 都变成空串 → 删掉收尾语。
+            //
+            // 方法白名单（上面那条）挡住了 HEAD/GET 这类**探活**触发，
+            // 但挡不住「POST 了一个空 body」：代理重放、GUI 某处漏传、
+            // 第三方脚本误调，全会静默删掉用户手写的收尾语。
+            //
+            // 判据：**「删除」这个动作必须由调用方显式表达**（传空串），
+            // 而不是「没给别的值」的副作用 —— 前者是意图，后者是缺失。
+            if (typeof body?.text !== 'string') {
+              return json(res, 400, {
+                ok: false,
+                error:
+                  '缺少 text 字段。要清除收尾语请显式传 {"text":""}；' +
+                  '空 body / 不带该字段不会删除任何内容。',
+              })
+            }
+            const text = body.text.trim()
             const saved = await writeHeartbeat(text)
             diag('heartbeat-saved', { empty: text === '' })
             json(res, 200, { ok: true, text: saved })
@@ -7914,6 +8400,14 @@ export function apply(ctx, rawConfig = {}) {
         kind: 'exact',
         path: '/api/dsh-memory/root/move',
         handler: async (req, res) => {
+          // ⚠️ 2026-11-28：**这两个值必须在 `try` 之前取。**
+          //
+          // 理由不是风格：失败可能发生在 `setRoot()` **之后**
+          //（例如 writePointer 抛错），那时 `store.root` 已经是新根了 ——
+          // 在 catch 里现读会得到错误的「源目录」，把用户指向一个半成品。
+          // 取一次快照，此后整条路径都用它。
+          const sourceRoot = store.root
+          let rawTarget = ''
           try {
             // ⚠️ 最危险的写路由：误触发会真的搬走整个记忆目录。
             // 空 body 会让 target 变成空串 → 走 expandRoot 的默认值分支，
@@ -7934,7 +8428,7 @@ export function apply(ctx, rawConfig = {}) {
             //
             // 注意 `~` 开头是合法的简写（expandRoot 会展开成 homedir），
             // 所以这里单独放行，不能一刀切要求原始值 isAbsolute。
-            const rawTarget = target.trim()
+            rawTarget = target.trim()
             const looksAbsolute = isAbsolute(rawTarget) || rawTarget === '~' ||
               rawTarget.startsWith('~/') || rawTarget.startsWith('~\\')
             if (rawTarget === '' || !looksAbsolute) {
@@ -7999,7 +8493,38 @@ export function apply(ctx, rawConfig = {}) {
                 : '文件已迁移，但新位置的数据库打不开，已回退文件模式。请重启 DSH 或检查目录权限。',
             })
           } catch (error) {
-            json(res, 400, { ok: false, error: String(error?.message ?? error) })
+            // ⚠️ 2026-11-28（待办 C）：**失败提示必须回答「我的记忆还在吗」。**
+            //
+            // 原实现只有一句 `String(error.message)`。用户在「整体迁移」失败后
+            // 最怕的就是记忆没了 —— 而事实是**源目录一个字节都没动**
+            // （判据写死在 migrateRoot 的 docstring 里：它不删任何东西）。
+            // 这句话不给出来，用户就会去翻目录、复制文件、甚至重装。
+            //
+            // 三条信息缺一不可：
+            //   ① 源目录路径（用户要能直接打开确认，不能只说「完好」）
+            //   ② 源目录完好（这是结论，不是安慰）
+            //   ③ 半成品在哪（否则用户不知道那个「目标目录非空」是哪来的）
+            //
+            // ⚠️ sourceRoot 取的是**进入 try 之前**的快照：失败可能发生在
+            //    `setRoot()` 之后，那时 store.root 已经是新根，现读会指错地方。
+            const message = String(error?.message ?? error)
+            const partial =
+              rawTarget !== '' && rawTarget !== sourceRoot
+                ? `\n如果目标位置已有残留文件，那是本次迁移留下的半成品；` +
+                  `确认无用了可以删掉后重试。`
+                : ''
+            json(res, 400, {
+              ok: false,
+              error:
+                `迁移失败：${message}\n\n` +
+                `⚠️ 你的记忆没有动：源目录仍完好，可以照常使用。\n` +
+                `  源目录：${sourceRoot}` +
+                partial,
+              // 单独给字段而不是只塞进 error 文本：GUI 想分开显示时用得上，
+              // 也不必再解析字符串。
+              sourceRoot,
+              sourceIntact: true,
+            })
           }
         },
       },
@@ -8355,7 +8880,24 @@ export function apply(ctx, rawConfig = {}) {
 
   // 等所有同步注册跑完再清点（events/commands/routes 都是同步注册的，
   // 放在下一个 tick 是为了让注入层等异步装配也完成）
-  setTimeout(runHealthCheck, 600)
+  //
+  // ⚠️ 2026-11-28 修（待办 Y）：裸 `setTimeout(runHealthCheck, 600)` →
+  // 卸载/热重载后仍会用**已失效的 ctx** 再盘点一次。
+  // 与上面 writableTimer 同一修法（照抄 probeSidebar 的三件套）。
+  //
+  // ⚠️ 2026-11-28 修（待办 H）：**顺便让自检等布局就绪**。
+  //
+  // 这是 `layoutReady` 的唯一消费点 —— 它必须是「被读一次」的，
+  // 否则就退化成一个只写不读的死变量（我刚删掉 `dbCopied`，不能转身再建一个）。
+  // 语义上这样接也是对的：自检要盘 `policy.md` 是否存在、目录是否可写，
+  // 这些都由 `ensureLayout` 决定；600ms 是个**猜测**，而 `layoutReady` 是**事实**。
+  // 两者取「先到 600ms 且布局已完成」—— 既保留原来的延迟习惯，又不再赌时序。
+  const healthTimer = setTimeout(() => {
+    // 布局还没好就再让一步（不阻塞，只是把这次清点推后）
+    layoutReady.finally(() => runHealthCheck())
+  }, 600)
+  healthTimer.unref?.()
+  ctx.effect(() => () => clearTimeout(healthTimer), 'dsh-memory: health check')
 
   // ---- 周期心跳（2026-11-16 22:35）----
   //
@@ -9130,4 +9672,72 @@ export function apply(ctx, rawConfig = {}) {
       logger.warn?.(`[dsh-memory] 补记判定失败：${error?.message ?? error}`)
     }
   })
+}
+
+/**
+ * 把 `dbStore.close()` 的返回值翻译成「要不要留痕、留哪一条」。
+ *
+ * ## 为什么需要一个纯函数（2026-11-28，待办 X）
+ *
+ * `rebindDbStore` 在 `apply` 的闭包里，要测它就得注入 `config` / `dbPath` /
+ * `initDbStore` / `diag` / `dbStore` 一整套 —— `_dbpreview/` 里没有任何脚本
+ * 这么干过，守卫成本会远高于修法本身。抽成纯函数后，从源码抽出去直接喂
+ * `close()` 的各种返回值就能测（见 `_dbpreview/selfcheck-db-rebind-close.mjs`）。
+ *
+ * ## 为什么不用一个 `ok: boolean` 收口
+ *
+ * 因为 `close()` 的失败**分两种，处置不同**：
+ *   - 库关了、但 WAL 没落盘 → 数据还在，下次打开会重放，**只算警告**
+ *   - 库压根没关掉 → 旧句柄泄漏，Windows 上旧目录删不掉，**要查**
+ * 挤成一个布尔，日志里就只剩「失败了」三个字，而这两件事的下一步动作完全不同。
+ *
+ * ## 返回值契约（定义在 db-store.mjs 的 close()）
+ *
+ * | 情况 | 返回 |
+ * |---|---|
+ * | 关闭成功 | `{ok:true, checkpointError:null}` |
+ * | 关闭成功但 checkpoint 失败 | `{ok:true, checkpointError:'…'}` |
+ * | 关闭失败（句柄仍开着） | `{ok:false, error:'…'}` |
+ * | 本来就没开 | `{ok:true, alreadyClosed:true}` |
+ * | store 没有 close 方法 | `undefined` |
+ *
+ * ⚠️ **`readyKnown:false` 不是错误，是「无从判断」** —— 首次迁移前 `dbStore`
+ * 可能是 `undefined`（initDbStore 早早失败过），这时 close 根本没发生。
+ * 这种情况**绝不能**报成关闭失败，否则日志会把「本来就没有库」说成「库关不掉」。
+ *
+ * @param {object|undefined} closed - `close()` 的返回值（抛错时传 undefined）
+ * @param {boolean} [closeThrew] - `close()` 是否抛了错（抛错已由调用方留痕）
+ * @returns {{kind: string, stage: string|undefined, detail: object}}
+ *   `kind` 进 `db-rebound` 日志的 `closed` 字段；`stage` 为 undefined 表示不用额外留痕
+ */
+function classifyCloseResult(closed, closeThrew = false) {
+  // 抛错：调用方已经在 catch 里记过 db-rebind-close-FAILED，
+  // 这里只负责让 db-rebound 日志能看出「那次切换是抛错收场的」。
+  if (closeThrew === true) {
+    return { kind: 'threw', stage: undefined, detail: {} }
+  }
+  // 没有 close 方法 / 本来就没有 store：不是失败，是「没轮到它」。
+  if (closed === undefined || closed === null || typeof closed !== 'object') {
+    return { kind: 'no-store', stage: undefined, detail: {} }
+  }
+  if (closed.ok === false) {
+    return {
+      kind: 'close-failed',
+      stage: 'db-rebind-close-refused',
+      // 原样保留 close() 给的错误文本 —— 它常常是 OS 级的
+      //（Windows「另一个程序正在使用此文件」一类），改写会丢掉线索。
+      detail: { message: closed.error === undefined ? null : String(closed.error) },
+    }
+  }
+  if (closed.checkpointError !== undefined && closed.checkpointError !== null) {
+    return {
+      kind: 'checkpoint-failed',
+      stage: 'db-rebind-checkpoint-failed',
+      detail: { message: String(closed.checkpointError) },
+    }
+  }
+  if (closed.alreadyClosed === true) {
+    return { kind: 'already-closed', stage: undefined, detail: {} }
+  }
+  return { kind: 'clean', stage: undefined, detail: {} }
 }

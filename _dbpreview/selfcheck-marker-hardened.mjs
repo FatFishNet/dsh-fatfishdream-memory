@@ -134,7 +134,7 @@ const lineStartRe = /^[ \t]*<!--mem-/m
 const CASES = [
   // [说明, 文本, 期望 atLineStart]
   ['引用正则片段（真实失败案例）',
-    '对应到 `MEM_STRIP_RE`：\n\n```js\n/^[ \\t]*<!--mem-(?:log|fact|note|fix)\\b[^`]*?-->[ \\t]*$/gm\n```', false],
+    '对应到 `MEM_STRIP_RE`：\n\n```js\n/^[ \\t]*<!--mem-(?:log|fact|note|fix)\\b[\\s\\S]*?-->[ \\t]*$/gm\n```', false],
   ['引用示例标记（行中间）',
     "  head: \"<!--mem-log ...-->'\\n4: tag: CODE", false],
   ['真写了但缺收尾符（行首）',

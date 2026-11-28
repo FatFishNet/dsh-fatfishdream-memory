@@ -66,8 +66,17 @@ for (let i = startIdx + 1; i < mapLines.length; i++) {
 //   | 372–395 | `a`(372) / `b`(376) | …    区间 + 行内括号行号
 //   | 243 / 253–283 | `a`(243) / … | …     混合
 //
-// 对「行内括号行号」逐个核对；行首的区间数字只核对下界是否存在声明，
+// 对「行内括号行号」逐个核对；行首的区间数字**只核对下界是否存在声明**，
 // 避免与行内括号行号重复计数。
+//
+// ⚠️ 2026-11-28：上面那句「只核对下界」曾经意味着**上界完全没人管** ——
+//    实测 §3.1 里有 7 行范围是错的（4 行「倒序」，如 `659–588`；
+//    3 行上界盖不住最后一个符号，如 `289–296` 而 `listCandidateDrives` 在 340）。
+//    这些错从**原始版本**就有（`git diff` 对着 HEAD 核过），历次整改都没发现，
+//    因为 `verify-map` 只看带 `L` 的引用、`verify-map-content` 只看
+//    `` `符号`（L####） ``，两个都不看这张裸数字表的范围列。
+//    → 现在补上（见下面的「范围列」段）。**这是第二次栽在同一个盲区上**
+//      （第一次是整张表无人校验，2026-11-16），所以这次把判据写死在这里。
 const rows = []
 for (let i = startIdx; i < endIdx; i++) {
   const line = mapLines[i]
@@ -106,6 +115,84 @@ for (const r of rows) {
 }
 
 check('至少核对了 10 个符号（防止表格被改坏后静默零覆盖）', checked >= 10, `实际 ${checked}`)
+
+// ---- 范围列（2026-11-28 新增）-----------------------------------------
+//
+// 形态：`| 1199–1548 | \`readIfExists\`(1199) / … / \`backupDbFile\`(1548) | … |`
+//
+// 两条判据，缺一不可：
+//   ① **不许倒序**（下界 ≤ 上界）—— 倒序是最明确的写错，一眼可判；
+//   ② **必须盖住本行列出的全部符号** —— 上界要 ≥ 最后一个符号的位置，
+//      下界要 ≤ 第一个。只判 ① 不够：`289–296` 顺序是对的，但
+//      `listCandidateDrives` 在 340，范围根本没盖住它。
+//
+// ⚠️ 为什么不能简单「拿行首那个符号的位置当上界」：行首符号是**第一个**，
+//    上界要由**最后一个**决定。这个区别正是当年写错的根源
+//    （把区间上界理解成「第一段的结尾」而不是「整行的结尾」）。
+console.log('\n=== 范围列（下界–上界）核对 ===\n')
+{
+  let rangeRows = 0
+  for (let i = startIdx; i < endIdx; i++) {
+    const line = mapLines[i]
+    // ⚠️ 2026-11-28：必须连**混合写法**一起认。
+    //   形态 `| 370 / 380–481 | \`syncPathExists\`(370) / \`POINTER_FILE\`(380) … |`
+    //   表示「单号 370，另有区间 380–481」。第一版只匹配 `^\|\s*数字[–-]数字`，
+    //   于是这种行**整行被跳过** —— 实测漏掉了 `263–296` 这个错（应为 380–481），
+    //   是我自己再查一遍才发现的。
+    //   **教训：解析器写窄了，比不写更危险 —— 它会让覆盖数看起来还行。**
+    const ranges = []
+    const headM = line.match(/^\|\s*(\d{2,4})(?:[–-](\d{2,4}))?/)
+    if (headM) {
+      if (headM[2] !== undefined) ranges.push({ lo: Number(headM[1]), hi: Number(headM[2]) })
+    }
+    // `/` 分隔的后续区间（混合写法）
+    for (const rm of line.matchAll(/\d{2,4}\s*\/\s*(\d{2,4})[–-](\d{2,4})/g)) {
+      ranges.push({ lo: Number(rm[1]), hi: Number(rm[2]) })
+    }
+    if (ranges.length === 0) continue   // 纯单行号行，没有范围要判
+
+    // 本行列出的全部「`符号`(行号)」
+    const listed = [...line.matchAll(/`([A-Za-z_$][\w$]*)`\s*[（(]\s*(\d{2,4})\s*[）)]/g)]
+      .map((x) => ({ sym: x[1], no: Number(x[2]) }))
+    if (listed.length === 0) continue   // 没有括号符号，范围无从判断
+
+    const realPositions = listed.map((x) => locate(x.sym)).filter((n) => n > 0)
+    if (realPositions.length === 0) continue
+    const realLo = Math.min(...realPositions)
+    const realHi = Math.max(...realPositions)
+
+    for (const { lo, hi } of ranges) {
+      rangeRows++
+      // ① 倒序
+      check(
+        `map#${i + 1} 范围 ${lo}–${hi} 不得倒序`,
+        lo <= hi,
+        lo > hi ? `下界 ${lo} 大于上界 ${hi}` : '',
+      )
+      // ② 端点必须是本行某个符号的**真实位置**
+      //
+      //   ⚠️ 这里试过两种「看起来对」的判据，都比这个弱，记下来防回退：
+      //     · 「区间必须盖住本行全部符号」（lo ≤ 最早、hi ≥ 最晚）
+      //       → 混合写法 `370 / 380–481` 会被误判（380 不是最早）。
+      //     · 「区间必须落在本行符号范围内」（lo ≥ 最早、hi ≤ 最晚）
+      //       → `289–296` 会被**放过**（296 确实 ≤ 340）。
+      //   正确判据：**端点必须是本行某个符号的真实行号**。
+      //   它对两类错法都成立：`289–296` 的 296 没有符号在那儿 →
+      //   红；`263–296` 两端都没有符号 → 红；`1199–1460` 的 1460 不是
+      //   `backupDbFile`(1548) → 红。
+      const endpointOk = realPositions.includes(lo) && realPositions.includes(hi)
+      check(
+        `map#${i + 1} 范围 ${lo}–${hi} 的两个端点都必须是本行符号的真实位置（实际：${realPositions.join('/')}）`,
+        endpointOk,
+        endpointOk
+          ? ''
+          : `${realPositions.includes(lo) ? '' : `下界 ${lo} 没有符号在那儿 `}${realPositions.includes(hi) ? '' : `上界 ${hi} 没有符号在那儿`}`.trim(),
+      )
+    }
+  }
+  // 防空转：这张表正常应有若干多符号行，若一条都没解析出来说明解析坏了
+  check('范围列至少解析出 5 行（防止解析失效后静默零覆盖）', rangeRows >= 5, `实际 ${rangeRows} 行`)
+}
 
 console.log(`\n结果：PASS=${pass} FAIL=${fail}（共核对 ${checked} 个符号行号）`)
 if (fail > 0) {

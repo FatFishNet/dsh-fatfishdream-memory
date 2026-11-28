@@ -62,7 +62,7 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | 少数几个 `FAIL`，附带了脚本自己的输出 | 真的失败 |
 
 **现在已修**：`run-all.mjs` 走 `_dbpreview/lib-spawn-capture.mjs` —— 先试管道，
-被拒就退回**临时文件捕获**。受限模式下会自动降级，正常输出 `TOTAL=80 FAIL=0`
+被拒就退回**临时文件捕获**。受限模式下会自动降级，正常输出 `TOTAL=84 FAIL=0`（脚本数会随新增而变化，**以 `SCRIPTS` 为准**）
 （⚠️ 脚本数会变，`TOTAL` 后面的数字**以当场输出为准**）。
 输出里若出现 `（输出经临时文件捕获：… 属正常降级）`，说明走的正是这条降级路径。
 
@@ -123,7 +123,7 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | `selfcheck-isolation` | 18 | 检索按项目隔离（**自建 3 个项目种子**）；含 4 项「emotion 不在检索池」断言 |
 | `selfcheck-paging` | 15 | 流水页分页（**需 `DSH_BASE`**；流水 <130 条时整脚本跳过）。**2026-11-15 修**：原来断言「最多的项目 total === 100」，等于要求库里必有项目超过 100 条 —— 数据掉下来就红。现在先查真实条数再断言 `total === min(真实, 100)`，与数据量解耦 |
 | `selfcheck-marker-hardened` | 37（正则 + 源码级 + 按轮计数） | 标记正则行首锚点；**D 段断言解析失败必须记账**（`markerMatched`/`markerWritten`/`marker-unmatched`/`marker-dropped`/`empty-body`）；**E 段**区分「写错标记」与「只是提到标记」；**F 段**写入失败提醒；**G 段** `writeFailStreak` 按轮计数（不是按条） |
-| `selfcheck-dom-strip` | 22 | 界面擦除正则（含「别吃掉说明文字」） |
+| `selfcheck-dom-strip` | 48 | 界面擦除正则（含「别吃掉说明文字」）。**2026-11-28 补 10 条**：标记正文含反引号时必须擦净、其后正文必须保留、`skipPartial:true` 快擦路径对照、`COMPLETE_MARKER_HINT` 闸门三条 —— 旧代码下其中 4 条变红（原来这两个数字 22/17 也早就和实测不符） |
 | `selfcheck-scrubber-loop` | **20** | **擦除器调度（第五代：静止窗口 + 第六代：完整标记同步快擦）**：连续变化只在安静后扫一次、一直不安静时有兜底上限、无变化不扫；**段 5 守第六代**（`hasCompleteMarker` 判据、`fastStrip` 只擦完整标记、接线在 `addedNodes`、未闭合仍走延迟、`characterData` 不抢跑、异常退回 `schedule`），共 10 条 |
 | `selfcheck-ts-sort` | 10（+真实库段） | 流水排序（锁定「三种按时间排的写法全错」；真实库段在空库时跳过） |
 | `selfcheck-migrate-order` | 9 | 迁移时全局按时间排序 |
@@ -136,6 +136,13 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | `selfcheck-emotion-lexicon` | 27 | **情绪词典复合词闸门**：麻烦≠烦 / 积累≠累 / 无语义≠无语，且不误伤「好烦」「累死了」 |
 | **`selfcheck-emotion-limiter`** | **10** | **后置限定词降权**（「成功了一半」不得判 strong）。不复刻逻辑 —— 从源码抽出 `analyzeEmotion` 函数体 + 注入闭包依赖，用 `new Function` **直接执行真实代码** |
 | `selfcheck-entry-by-id` | 13 | **按 id 取单条全文**（`/entry?id=&table=`）：正文一致、缺参数 400、未知表 400、不存在 404；旧 `/entry/<id>` 仍 401 |
+| `selfcheck-heartbeat-delete` | **27** | **收尾语删除的安全网 + FTS 删除参数纪律**（待办 E/N，2026-11-28）。E：①「没传 `text`」不再被当成「清除」（空 body / 漏传会让整句收尾语消失，方法白名单挡不住 POST 空 body）②删除前**备份整份** policy.md（原先零备份，而这项目没有任何地方存它的内容）。N：`removeFts` 的 `row = null` 默认值已移除（contentless FTS 传空值 = 删不掉，且会抛 `database disk image is malformed` 这种误导性错名） |
+| **`selfcheck-migrate-root`** | **28** | **唯一真正执行 `migrateRoot` 的脚本**（待办 C / B2，2026-11-28 新增）。现有 4 个迁移脚本全是源码文本断言或把 `backupDbFile` / `copyTree` 抄一份单测，**这个最危险的写函数此前零行为覆盖**。①成功路径：库/policy/state/logs 都到新根、新库能独立打开、指针已指向新根；②**源目录逐字节校验**：原有文件 sha256 全等且一个不少（只允许新增 sqlite 旁路 `-wal`/`-shm` —— 第一次跑就抓到这一点，是 SQLite 只读打开时自己生成的）；③失败路径（用非 SQLite 文件冒充库 → VACUUM 必抛）：源完好、**目标留残骸**；④`sourceRoot` 必须是 `try` 之前的快照（失败可能发生在 `setRoot()` 之后，catch 里现读会指向新根）；⑤源码级：`migrateRoot` 体内不许有 `rm`/`unlink`（源侧只读，全仓生产码零递归删除）。<br>⚠️ 两条**反向断言别改成绿**：目标失败后不被清理是**刻意取舍**（见 `migrateRoot` docstring）；若将来实现改成「失败清理」，回来先读 docstring 与 B2。 |
+| **`selfcheck-db-rebind-close`** | **26** | **`close()` 的返回值到底有没有人读**（待办 X，2026-11-28 新增）。`dbStore.close()` **不抛错**、把失败包成 `{ok:false, error}` 返回（体内 0 处 `throw`），所以 `rebindDbStore` 里原来那个 `catch` 是**恒假分支**：日志里永远不会有 `db-rebind-close-FAILED`，而真正的失败信号（旧句柄没关掉 → 旧目录删不掉）彻底消失，GUI 照样收到 `dbRebound: true`。**两层缺一不可**：①纯函数级 —— `classifyCloseResult` 六种分类（`close-failed` / `checkpoint-failed` / `already-closed` / `clean` / `no-store` / `threw`）+ 三条反向（`no-store` 不得走失败分支、抛错不得与 `close-failed` 重复报、**close 状态不许污染 `dbOk`**）；②接线级 —— 真的接住返回值、真的调 `classifyCloseResult`、`stage` 真的被 `diag` 出去、`initDbStore()` 必须在分类之前、`catch` 保留。⚠️ **只测纯函数的话，把调用删掉本脚本照样绿** —— 第 ③ 段专守接线。变异 6 个全 KILLED（含 M1 完整退回旧实现）。 | **唯一真正执行 `migrateRoot` 的脚本**（待办 C / B2，2026-11-28 新增）。现有 4 个迁移脚本全是源码文本断言或把 `backupDbFile` / `copyTree` 抄一份单测，**这个最危险的写函数此前零行为覆盖**。①成功路径：库/policy/state/logs 都到新根、新库能独立打开、指针已指向新根；②**源目录逐字节校验**：原有文件 sha256 全等且一个不少（只允许新增 sqlite 旁路 `-wal`/`-shm` —— 第一次跑就抓到这一点，是 SQLite 只读打开时自己生成的）；③失败路径（用非 SQLite 文件冒充库 → VACUUM 必抛）：源完好、**目标留残骸**；④`sourceRoot` 必须是 `try` 之前的快照（失败可能发生在 `setRoot()` 之后，catch 里现读会指向新根）；⑤源码级：`migrateRoot` 体内不许有 `rm`/`unlink`（源侧只读，全仓生产码零递归删除）。<br>⚠️ 两条**反向断言别改成绿**：目标失败后不被清理是**刻意取舍**（见 `migrateRoot` docstring）；若将来实现改成「失败清理」，回来先读 docstring 与 B2。 |
+| `verify-l-ranges` | **按文档现算**（不写死；2026-11-28 实测：扫到 33 处区间 → 73 通过 / 0 失败，判定了 6 处、跳过 27 处） | **`L####–####` 区间写法**（维护手册 §4.9 盲区表第 ⑤ 类，2026-11-21 记下、2026-11-28 才补）。三层判据：①倒序 ②越界 ③**紧邻**符号必须落在区间内。⚠️ **归属率按文档现算，别写死**（2026-11-28 实测：33 处里 **15 处能确定归属文件** = 显式标注 8 + 项目地图章节推断 7，其余 18 处是教学示例/历史快照，只能做宽松判据）。判据：①倒序 ②**按归属文件**判越界（比「不超最大文件」严得多）③紧邻符号须落在区间内。归属统计每次打印 |
+| `selfcheck-pointer-corrupt` | **29** | **指针文件与 state.json 的损坏处理**（待办 D/G/A3，2026-11-28 新增）：① 指针用 `temp+rename` 原子写（半截 JSON 不能落成正式文件）② ENOENT 静默 / 内容损坏**留痕**，两者必须分开 ③ 坏 state.json **改名留底**而不是被 fallback 覆盖 ④ `readStateSync` 只留痕不改名（纯读、且在注入热路径）。**含端到端段**（真的 `createStore` 跑一遍）—— 写这个脚本时正是端到端抓到 `diag is not defined`：源码级断言全绿，真跑起来第一行就崩 |
+| `selfcheck-timer-disposer` | **16** | **延迟调度的资源纪律**（待办 Z/W/Y，2026-11-28 新增）：① 每处 `ROLLBACK` 必须包 `try`（否则顶掉原始错误）② 不许留「只写不读」的变量 ③ `setTimeout` 必须接住句柄 + `unref` + `clearTimeout`。**自带反证段**，验证判据真的会红。⚠️ 已有明示边界：判据只认「独占一行的 `try {`」，同行写法不判 |
+| `selfcheck-serialize` | **29** | **`state.json` 那把锁（D13）**：并发注册 12 个项目一个不丢、抛错不卡队列、严格串行、返回值语义。**2026-11-28 补 5 条重入用例**（待办 J/A1）：锁内再调必须立刻 reject 而**不得永久卡死**、拒绝后队列仍可用、必须留痕 —— 原实现下 3 条变红且**进程挂死（exit=13）**。**又补 11 条**（待办 H/I）：`consolidate` 的读-改-写必须进锁且 readState 也在锁内、`ensureLayout` 进锁但 mkdir 留锁外、锁内重新读 state、`layoutReady` 必须被读过。⚠️ 本行是 2026-11-28 补登记的：**它一直在 `SCRIPTS` 里跑，却从没进过这张表** |
 | **`selfcheck-log-alive`** | **31** | **流水通道存活检查**（需 `DSH_BASE`）。**判据在 2026-11-16 22:40 第三次也是最后一次改写，读之前先看下面这段**。<br>① **进程存活度**：诊断日志最新一行的时戳距今 < 15 分钟（心跳 5 分钟一行）+ 日志里必须能看到 `[heartbeat]`（防止「日志有行但不是心跳」蒙混）；② 源码级断言**标记通道**整条链路（`MEM_MARKER_RE` → `appendLog` → `mem-写流水` diag）；③ **段 5 守 HTTP 写入通道**（路由注册、复用三套 `sanitize*`、置位 `wroteLog`、拒绝非 POST、`cwd` 不存在时拒绝）。`KNOWN_BAD_IDS` 精确豁免历史空 topic 条目。<br>**⚠️「上一轮写没写流水」这条判据已被彻底删除，不要加回来。** 它前后写过三版（距今 N 分钟 / 最近一条 user 之后有无流水 / 已封口区间有无流水），每版都在测「模型有没有在场」，而**回归测试不该测模型行为**——结果与代码无关，用户歇几小时回来它必然红。用户 2026-11-16 22:26 原话：「我中间歇了几个小时，真的需要让你更改断言吗」。<br>**现在的分工是三个维度各读一处，互不顶替**：进程活着 → 本段；记忆在写入 → `writeFailStreak`（运行时 turn-stopping，**连续 2 轮没写就提醒**——2026-11-17 从 4 降到 2，因为实测漏记规模常是 3 轮，阈值 4 在最常见的规模上失效）；代码没坏 → 本段之外的源码/行为断言。 |
 | **`selfcheck-archive`** | **49（存储 36 + HTTP 13）** | **v4 原文归档**：存储层（写入/过滤/FTS 中文/分页/统计口径/不污染 `/search`）+ HTTP（`/archive` 200 形状、`role=x` 400、limit）。加 `--no-http` 可只跑存储层 |
 | **`selfcheck-breakdown`** | **24（存储 18 + HTTP 6）** | **v5 库体积分层**：`dbstat` 不列空闲页所以 `core+archive+system+free` 必须**精确等于** `page_count×page_size`；索引归属（`idx_archive_*`→archive、`idx_logs_*`→core）；缓存与失效；**反向断言 `stats()` 里没有 dbstat**。加 `--no-http` 只跑存储层 |
@@ -144,13 +151,13 @@ $env:DSH_BASE = 'http://127.0.0.1:<当前端口>'   # 端口每重启都变，�
 | **`selfcheck-search-tier`** | **12** | **检索按表分层**（自建种子）：段序固定 profile→rules→logs、小 limit 时三表各露一条、组内仍按 bm25、`lastLogTs()` 按 id 取最新；另 3 条源码级断言守着「整理提醒不再只看 `lastConsolidate`」 |
 | `verify-no-self-trigger` | — | 注入文本不会被自己匹配 |
 | `verify-final` | 9 | 数据总览 |
-| `verify-doc-links` | 73 处 | 文档路径引用无断链（防开源后失效）。⚠️ 2026-11-26 修了盲区：以 `../` 开头的相对路径（指向上级目录里的归档文件）**此前整类被跳过**，归档后新加的链接根本不在核对范围里 |
+| `verify-doc-links` | 82 处 | 文档路径引用无断链（防开源后失效）。⚠️ 2026-11-26 修了盲区：以 `../` 开头的相对路径（指向上级目录里的归档文件）**此前整类被跳过**，归档后新加的链接根本不在核对范围里。**2026-11-28 又补一处盲区：`docs/踩坑清单.md` 根本不在 `DOCS` 清单里**（39 KB、全仓引用最多的一份，却从来没被查过）—— 收录后 75 → 82 |
 | **`verify-policy-template-sync`** | **18** | `POLICY_TEMPLATE` 与 `policy.md` 的口径一致（模板不含私人内容 / policy 多出的行可解释）。**2026-11-24 就写好了，但直到 2026-11-26 才补进 `SCRIPTS`** —— 一条活着却没人跑的防线 |
 | `verify-v3-schema` | 55 | **三层记忆 v3 + 原文归档 v4 + v5 收尾**：现有库迁移 / 空库全建 / 存储层读写检索 / `archive` 写入与回溯（用 `_dbbackup` 副本，不碰真实库） |
 | `test-marker-forms` | 30 | 标记七种写法自检（**改标记正则必须跑**：须保持 5 个捕获组，kind 组丢失会让所有带标记回复静默丢弃） |
 | **`selfcheck-policy-sync`** | **82** | **policy.md 一次性覆盖的真实行为回归**（2026-11-16 新增）。**唯一真正 import 并执行 `createStore.ensureLayout` 的脚本** —— 之前所有测试只查「源码里有没有那几行字」，从不执行覆盖逻辑，于是漏掉了「升级时收尾语随覆盖丢失」这个真 bug。覆盖 10 个场景：①老用户升级 ②二次启动不覆盖 ③state.json 丢失 ④无收尾语不写空行 ⑤全新安装不产生冗余备份 ⑥覆盖后格式合法 ⑦**替换不吞后续标题** ⑧**折行时不留孤儿续行** ⑨**删除分支**（含「必须复用 blockRe、不得内联正则」的源码级断言）⑩**异常输入**（state 损坏 / 空文件 / 重复收尾语均不崩）。场景 7/8/9 都从源码提取真实 `blockRe` 执行，不是抄一份逻辑 |
 | **`selfcheck-message-key`** | **26** | **消息去重键的真实行为回归**（2026-11-16 新增）。守的是「**不同会话的同一 `turn:step` 不能撞键**」—— 撞了那条既不进 `archive`（原文永久丢失）也不解析标记，且无任何日志。修复原先**内联在监听器里，无法黑盒验证**（需要伪造两个会话消费相同 turn:step；单会话测试里 `sid` 恒定，加不加前缀行为一样 → 那种测试会绿却证明不了任何事）。现在逻辑抽成顶层纯函数 `makeMessageKey(session, payload)`，本脚本从源码抽取函数体执行，用两个不同 session 调两次断言键不等。另覆盖：`id`/`turn`/`step` 为 `0` 时**不得**被当成缺失（`??` vs `\|\|`）、缺失字段降级为 `?` 不抛错、返回值恒为 string |
-| **`verify-symbol-lines`** | **72**（核对 69 个符号行号） | **§3.1 裸数字行号表的核对**（2026-11-16 新增）。`verify-map` 只认带 `L` 前缀的引用（`L1234`），而 §3.1 那张表写的是**裸数字**（`\| 45 \| \`name\` \|`）→ 它**完全不受任何校验**。实测：表里 15 行**全部指向错位置**（`name` 表说 45、实际 83；`POLICY_TEMPLATE` 说 610、实际 790），而 `verify-map` 一直报「111 处引用，0 处落空」。本脚本按符号名**现算**真实行号（不写死期望值），逐条断言一致，并额外断言「至少核对 10 个符号」防止表格被改坏后静默零覆盖 |
+| **`verify-symbol-lines`** | **89**（核对 69 个符号行号 + 17 条范围断言） | **§3.1 裸数字行号表的核对**（2026-11-16 新增）。`verify-map` 只认带 `L` 前缀的引用（`L1234`），而 §3.1 那张表写的是**裸数字**（`\| 45 \| \`name\` \|`）→ 它**完全不受任何校验**。实测：表里 15 行**全部指向错位置**（`name` 表说 45、实际 83；`POLICY_TEMPLATE` 说 610、实际 790），而 `verify-map` 一直报「111 处引用，0 处落空」。本脚本按符号名**现算**真实行号（不写死期望值），逐条断言一致，并额外断言「至少核对 10 个符号」防止表格被改坏后静默零覆盖 |
 | **`selfcheck-posix-paths`** | **24** | **macOS / POSIX 路径行为**（2026-11-17 新增）。守硬约束 14 —— 记忆目录必须留在工作区之外。原逻辑全假设 Windows 盘符：POSIX 下 `expandRoot('')` 产出 `D:\<名称>`，被 `resolve()` 当**相对路径** → 记忆**建进当前工作区**（那里 LLM 可以随意操作）。本脚本用假 `platform` + `path.posix` 在 Windows 上精确复现 POSIX 语义，**不需要真 Mac**。含「Windows 分支必须完全不变」的对照断言，防改坏现有用户。⚠️ 它证明的是平台分支逻辑对，**不证明** macOS 端到端跑通（权限 / APFS / TCC 不在内） |
 | **`faultinject-posix-paths`** | **7** | 配套故障注入（2026-11-17）：逐条把平台分支改坏（去掉 POSIX 分支 / 去掉早退 / 改落 Documents / 破坏 Windows 默认根 / 去掉盘符路径防护），确认 `selfcheck-posix-paths` 每条都真的会红。**它会临时改写 `index.js`，跑完按 sha256 逐字节还原** —— 同 `meta-mutation-test`，跑时不要并行改代码 |
 | **`selfcheck-archive-collision`** | **14** | **双会话撞键的逻辑链端到端验证**（2026-11-17 新增）。补 TODO 里「真实双会话同 `(turn,step)` 撞车时原文不丢」那一层。当初以为验不了（宿主 `session/event` 驱动不了），**对了一半** —— 事件源确实驱动不了，但去重的四步（取键 → Set 判重 → `appendArchive` → `listArchive` 读回）全在插件自己代码里，所以用两个**真实 store 实例**喂完全相同的 `(turn, step)` 就能复现撞车。断言：两条都在、`session_id` 不同、正文各自完整、同会话重复投递仍去重。⚠️ **不含宿主真实并发时序**，别据此宣称全验完 |
@@ -859,7 +866,7 @@ case "html": return r.omitHtml ? null : e.value;   // omitHtml 默认 false
 ```powershell
 # 本机 node 不在 PATH，用 DSH 自带运行时（路径按你的安装位置替换）
 $node = "<DSH 安装目录>\dsh\node_modules\@deepseek-ai\dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
-& $node _dbpreview\selfcheck-dom-strip.mjs        # 17 项
+& $node _dbpreview\selfcheck-dom-strip.mjs        # 48 项
 & $node _dbpreview\selfcheck-scrubber-loop.mjs    # 23 项
 ```
 

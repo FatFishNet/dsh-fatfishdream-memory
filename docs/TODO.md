@@ -24,205 +24,369 @@
 > ⚠️ **行号会再次漂移**。下次动手前若发现对不上，以 `Select-String` 实测为准，
 > 别把这张表当事实来源 —— 这是本项目反复踩过的坑。
 
-### 核实结论总览（15 条：全部仍存在，0 条已修复，3 条描述失准）
+### 核实结论总览（15 条：**1 条仍存在（B）/ 12 条已修复（S、J、Z、W、Y、D、G、H、I、E、N、X）/ 2 条结案不修（F、K）**）
+> 另有**本次新修**：**C**（迁移失败提示）✅ 已修 + **B2**（失败残骸卡重试）⏳ 已列入，见第五节。
 
 | # | 一句话 | 实测位置 | 判定 |
 |---|---|---|---|
-| **Z** | 裸 `ROLLBACK` 未包 try | `db-store.mjs` **L999 / L1108** | ⚠️ **描述失准**（L765 已修，只剩这两处） |
-| **W** | `dbCopied` 死变量 | `index.js` **L3269 / L3310** | ✅ 仍存在（行号漂移） |
-| **Y** | 两处 `setTimeout` 未接 disposer | `index.js` **L3863 / L8358** | ✅ 仍存在（行号漂移） |
-| **X** | `rebindDbStore` 的 catch 够不到 | `index.js` **L3778** | ✅ 仍存在（行号漂移） |
-| **D** | `writePointer` 裸写 + 空 catch | `index.js` **L404-414** | ✅ 仍存在（位置未变） |
-| **G** | `readState` 解析失败静默 fallback | `index.js` **L2871 / L2876 / L2889-2891** | ✅ 仍存在（行号漂移） |
-| **F** | `policy.md.pre-sync` 只写不读 | `index.js` **L2603 / L2698** | ✅ 仍存在（行号漂移） |
-| **E** | `/heartbeat` 空 body 删收尾语且无备份 | `index.js` **L7634** / 写盘 **L5190** | ✅ 仍存在（方法白名单已修，主症未动） |
-| **J** | `serialize` 无重入保护 | `index.js` **L2620-2624** | ✅ 仍存在（无触发路径，属防未来） |
-| **H** | `ensureLayout` 读-改-写不在锁内 + 不 await | `index.js` **L2841**（定义）/ **L3799-3800**（调用） | ✅ 仍存在 |
-| **I** | `/memory consolidate` 裸读-改-写 | `index.js` **L6795-6797** | ✅ 仍存在 |
-| **K** | 跨进程 `state.json` 无保护 + `writeState` 公开导出 | 全局 | ✅ 仍存在（进程内已有锁，跨进程零保护） |
-| **N** | `purgeByStatus` 的 FTS 删除不可靠 | `db-schema.mjs` **L400-408** `removeFts` | ⚠️ **描述失准**（位置错，且不总是静默） |
-| **S** | 擦除器吞掉消息后半段 | `client.js` **L2066** `MEM_PARTIAL_RE` | ⚠️ **描述失准**（根因不是待办说的那个正则） |
-| **B** | 迁移窗口内写进旧库 | `index.js` **L3242 / L3306-3311 / L7323** | ✅ 仍存在（行号漂移） |
+| **Z** | 裸 `ROLLBACK` 未包 try | `db-store.mjs` | ✅ **2026-11-28 已修复**（三处全部包 try，实测旧写法会顶掉原始错误） |
+| **W** | `dbCopied` 死变量 | `index.js` | ✅ **2026-11-28 已删除**（只写不读，去掉赋值与声明） |
+| **Y** | 两处 `setTimeout` 未接 disposer | `index.js` | ✅ **2026-11-28 已修复**（接句柄 + unref + ctx.effect 清理） |
+| **X** | `rebindDbStore` 的 catch 够不到 | `index.js` **L4108**（`rebindDbStore` 定义）/ **L9713**（`classifyCloseResult` 定义） | ✅ **2026-11-28 已修复**（接住 `close()` 返回值；判断抽成顶层纯函数，见第五节） |
+| **D** | `writePointer` 裸写 + 空 catch | `index.js` | ✅ **2026-11-28 已修复**（temp+rename 原子写；三个 catch 全部留痕） |
+| **G** | `readState` 解析失败静默 fallback | `index.js` | ✅ **2026-11-28 已修复**（损坏改名留底 + 留痕；契约不变，见第二节） |
+| **F** | `policy.md.pre-sync` 只写不读 | `index.js` **L2856-L2858**（写入点） | ⚪ **2026-11-28 结案不修**（用户定：不做恢复入口；备份内容全部可再生，见第四节） |
+| **E** | `/heartbeat` 空 body 删收尾语且无备份 | `index.js` | ✅ **2026-11-28 已修复**（缺 text 返回 400；删除前备份整份 policy.md） |
+| **J** | `serialize` 无重入保护 | `index.js` **L2620-L2624** | ✅ **2026-11-28 已修复**（同步标志 + reject + 留痕回调，18 条用例守着） |
+| **H** | `ensureLayout` 读-改-写不在锁内 + 不 await | `index.js` | ✅ **2026-11-28 已修复**（读-改-写进锁、IO 留锁外、调用点接住 Promise） |
+| **I** | `/memory consolidate` 裸读-改-写 | `index.js` | ✅ **2026-11-28 已修复**（包进 store.serialize，与另三处同一把锁） |
+| **K** | 跨进程 `state.json` 无保护 + `writeState` 公开导出 | 全局 | ⚪ **2026-11-28 结案不修**（用户定：本机默认单开，不为多实例单独优化） |
+| **N** | `purgeByStatus` 的 FTS 删除不可靠 | `db-schema.mjs` `removeFts` | ✅ **2026-11-28 已修复**（移除 `row = null` 默认值，缺行立刻抛错） |
+| **S** | 擦除器吞掉消息后半段 | `client.js` `MEM_STRIP_RE` + `COMPLETE_MARKER_HINT` | ✅ **2026-11-28 已修复**（真根因是上游 `MEM_STRIP_RE` 的 `[^`]*?`；闸门须同步，见第五节） |
+| **B** | 迁移窗口内写进旧库 | `index.js` **L3492**（`migrateRoot` 定义）/ **L3564**（快照那一刻）/ **L8375**（`rebindDbStore` 调用） | ✅ 仍存在（行号 2026-11-28 重算） |
 
 ---
 
-### 🔴 第一批：可立刻做（共 3 条，约 12 行，全是「照抄已有正确写法」）
+### 🔴 第一批：可立刻做 —— **✅ 2026-11-28 三条全部修完**
 
-> 这三条**零架构改动、零新依赖**，且每处都已有同文件内的正确样板可参照。
-> 建议一次做完，跑全量回归即可。
+> ~~Z / W / Y~~ 已完成。守它们的是新脚本 `_dbpreview/selfcheck-timer-disposer.mjs`（16 条，含反证段）。
+>
+> | 条目 | 改了什么 | 实测证据 |
+> |---|---|---|
+> | **Z** | 三处 `ROLLBACK` 全部包 `try`（`db-store.mjs`） | 行为级自证：旧写法下 ROLLBACK 抛错时用户看到「ROLLBACK 失败」，原始错误「磁盘满了」被顶掉；修后保住 |
+> | **W** | 删掉 `dbCopied` 的声明与赋值（只写不读） | 全代码已无该符号（注释里那句说明不算代码） |
+> | **Y** | 两处 `setTimeout` 改接句柄 + `unref()` + `ctx.effect` 清理 | 与 `probeSidebar` 样板一致；断言锁住「行首不许出现裸 `setTimeout`」 |
+>
+> ⚠️ 补这条时踩到一个**校验器与代码形态绑定**的坑：`verify-map-content.mjs` 用
+> `/^\s*setTimeout\(checkWritableRoot/` 定位锚点，改成 `const x = setTimeout(...)` 后
+> 它报「源码里找不到这个符号」——**符号还在，只是不再是行首那个词**。
+> 锚点已放宽成 `(?:const \w+ = )?`。同类改动以后都要跟着看锚点正则。
 
-#### Z · 两处裸 `ROLLBACK` 未包 try
+### 🟠 第二批：丢数据类（2 条）—— **✅ 2026-11-28 两条都修完**
 
-- **位置**：`db-store.mjs` **L999**（`renameScope`）、**L1108**（`removeGlobalByRegex`）
-- **现状**（实测原文）：
-  ```js
-  // L998-1000
-  } catch (error) {
-    d.exec('ROLLBACK')
-    throw new Error(`迁移失败已回滚（数据未变）：${error?.message ?? error}`)
-  }
+> 共同点：**静默吞错误**。失败时不报错、不留痕，用户以为一切正常（硬约束 15 的形态）。
+> 守它们的是新脚本 `_dbpreview/selfcheck-pointer-corrupt.mjs`（29 条，**含端到端段**）。
+>
+> | 条目 | 改了什么 |
+> |---|---|
+> | **D** | 指针改用 `temp + renameSync` 原子写；`readPointer` 的 catch 拆成「ENOENT 静默 / 存在但坏了 → 留痕」；`writePointer` 的**空 catch 改留痕** |
+> | **G** | 坏 `state.json` **改名留底**（`state.json.corrupt-<ts>`）+ 留痕，**契约不变**（仍返回 fallback） |
 
-  // L1107-1109
-  } catch (e) {
-    d.exec('ROLLBACK')
-    throw e
-  }
-  ```
-- **危害**：回滚本身再抛错时，**原始错误被顶掉**。L999 那句 `throw new Error(...)` 排在裸 ROLLBACK **之后**，ROLLBACK 一抛就永远走不到 —— 包装形同虚设。
-- **修法**：照抄同文件 **L765** 的现成写法
-  ```js
-  try { d.exec('ROLLBACK') } catch { /* 回滚失败别掩盖原始错误 */ }
-  ```
-- **⚠️ 校对**：待办原文说「L765 / L999 / L1108 三处仍裸」—— **L765 已经修好了**，只剩两处。
-
-#### W · `dbCopied` 死变量
-
-- **位置**：`index.js` **L3269**（`let dbCopied = false`）、**L3310**（`dbCopied = true`）
-- **实测**：全文件 **2 次命中、读取 0 次**；`migrateRoot` 的 `return`（L3387-3400）里没有它。
-- **修法**（二选一）：
-  - ① 删掉这 2 行（最简单）；
-  - ② 加进 `return` 并在调用处读一次 —— **只加返回不加读取等于没修**。
-- ⚠️ 待办原行号 L2499/L2540 已漂移。
-
-#### Y · 两处 `setTimeout` 未清理、未 `unref`
-
-- **位置**：`index.js` **L3863** `setTimeout(checkWritableRoot, 1500)`、**L8358** `setTimeout(runHealthCheck, 600)`
-- **实测**：两处都是裸调用，返回值没接变量 → 既不能 `unref()`，也没有卸载函数去 `clearTimeout`。同文件 L8475-8476 的 `probeSidebar` 就是**正确样板**。
-- **后果**：卸载/热重载后各仍触发一次（`checkWritableRoot` 会写探针文件、`runHealthCheck` 会用已失效 ctx 盘点）。
-- **修法**：照抄 L8475-8476
-  ```js
-  const writableTimer = setTimeout(checkWritableRoot, 1500)
-  writableTimer.unref?.()
-  ctx.effect(() => () => clearTimeout(writableTimer), 'dsh-memory: writable probe')
-  ```
-- ⚠️ 待办原行号 L3057/L6084 已漂移。
+> ⚠️ **待办里 G 的修法被我否决了，记在这里防重试：**
+>
+> 原建议是「解析失败返回 `null`，所有写回点读到 null 时跳过写回」。实测否决 ——
+> `readState()` 有 **10 个调用点**，其中多处直接写 `state.projects[...]` /
+> `state.lastConsolidate = …`，返回 `null` 会**当场抛 TypeError**。
+> 等于用一个启动期崩溃，换一个罕见场景下的保护。
+>
+> 实际做法：**留底 + 留痕，契约不变**。改名之后磁盘上已经没有 `state.json`，
+> 所以下游哪怕立刻 `writeState`，覆盖的也只是新文件，原内容完好。
+>
+> ⚠️ **A3（`readStateSync`）刻意与 G 不同**：它只留痕、**不改名**。
+> 因为它是纯读（注入层取 scope），没有任何写回点，且跑在**每次注入的热路径**上 ——
+> 在那里改名会导致「第一次注入就把文件挪走」。
+> 判据：**同一个反模式，能不能动手取决于它后面接不接写回。**
+>
+> ⚠️ 本轮端到端抓到一个真 bug：`readState` 在 `createStore` 作用域里，
+> 而 `diag` 定义在 `apply` 闭包 —— **`ReferenceError: diag is not defined`**。
+> 源码级断言 27 条全绿，真跑起来第一行就崩。
+> 教训：**「源码里有没有这个字符串」和「这行执行时那个名字在不在作用域里」是两件事**，
+> 而报告里长得一样。已补一条断言：createStore 体内不许出现裸 `diag(`。
 
 ---
 
-### 🟠 第二批：丢数据类（2 条，同一反模式，建议一起做）
+### 🟡 第三批：并发与迁移（3 条，硬顺序 J → H → I）—— **✅ 2026-11-28 三条全部修完**
 
-> 共同点：**静默吞错误**。失败时不报错、不留痕，用户以为一切正常。
-> 按 AGENTS.md 硬约束 15 的思路，它们会让人「以为数据还在」。
+> 守它们的是 `selfcheck-serialize.mjs`（29 条，含重入 + 读-改-写进锁两组断言）。
+>
+> | 条目 | 改了什么 |
+> |---|---|
+> | **J** | `serialize` 加同步重入标志，锁内再调**直接 reject**（排队=等自己=死锁）并留痕 |
+> | **H** | `ensureLayout` 的读-改-写进锁、**锁内重新读 state**（不用旧快照）、`mkdir`/写 policy 留在锁外、调用点接住 Promise |
+> | **I** | `/memory consolidate` 包进 `store.serialize`，与另三处**同一把锁** |
+>
+> **H 两个关键取舍**（都是「看起来该做、实测不该做」的）：
+>
+> 1. **不能整段包进锁**：`mkdir` 与写 `policy.md` 可能是慢 IO（网络盘、杀软扫描），
+>    塞进全局唯一写队列会让**所有** state 写入排队 —— 等于给正常流量加了个无关的长锁。
+>    判据：**锁保护的是共享可变状态，不是「这个函数」**。
+> 2. **锁内必须重新读一次**：原来的 `const st = await readState()` 之后 `{ ...st }`
+>    写回，那份 st 从读出来到写回去之间随时可能过期 —— 只把写包进锁是没用的。
+>
+> ⚠️ **顺手抓到自己的一个错**：修 H 时把 `ensureLayout()` 的返回值存成 `layoutReady`，
+>    但它当时**没有任何读取点** —— 这就是我刚在待办 W 里删掉的 `dbCopied` 那种死变量。
+>    后来接到健康自检上（`layoutReady.finally(() => runHealthCheck())`）：
+>    `setTimeout(600)` 是**猜**布局好了，`layoutReady` 是**知道**它好了。
+>    断言里也加了一条「layoutReady 真的被读过」，防止它退化回去。
 
-#### D · `writePointer` 非原子写 + 空 `catch`
+### 🟢 第四批：需产品决策或较大改动（**2 条结案不修，只剩 B**）
 
-- **位置**：`index.js` **L404-414**
-- **现状**：
-  ```js
-  function writePointer(root) {
-    const path = pointerPath()
-    if (path === undefined) return
-    try {
-      mkdirSync(dirname(path), { recursive: true })
-      const payload = JSON.stringify({ root, savedAt: new Date().toISOString() }, null, 2)
-      writeFileSync(path, `${payload}\n`, 'utf8')      // ← 非原子
-    } catch {
-      /* 指针写不了不该影响插件 */                       // ← 空 catch
-    }
-  }
-  ```
-- **链路**：指针写坏 → 上游 `readPointer()`（L398-400）也是 `catch { return undefined }` → `resolveRoot` 当成「没指针」→ 重新选址并**覆盖写入指针** → **记忆根静默漂移**，日志里最多一句「记录的记忆目录已不可用」。
-- **修法**：改用现成的 `atomicWrite`（L1342，已是 async，需给 `writePointer`/`resolveRoot` 一并加 await，或写个同步版 `temp + renameSync`）；空 catch 改成**留痕**。
-- **⚠️ 关键**：`readPointer` 的 catch 也要拆成「ENOENT → 静默」与「存在但解析失败 → 打警告」，否则只修一半。
-
-#### G · `readState` 解析失败静默 `return fallback`
-
-- **位置**：`index.js` **L2871**（fallback 常量）、**L2876**（类型不对）、**L2889-2891**（catch）
-- **现状**：解析失败、类型不是 object、抛异常 —— 三种情况**都只返回空 state**，不记日志、不标记坏文件。调用方区分不出「文件不存在」和「内容坏了」。
-- **危害**：下游 `registerProject` 拿这份空 state 改 `projects` 再 `writeState` 整体覆盖 → **坏文件被一份 `projects: {}` 覆盖掉**，原项目映射和 `policySyncVersion` 全丢。
-- **修法**：
-  - `text === undefined` 时照旧返回 fallback；
-  - 解析失败时**抛错或返回 null**，并优先把坏文件改名成 `state.json.corrupt-<ts>` 留底；
-  - 所有写回点（`registerProject` / `syncPolicyOnce` / scope 改名 / `consolidate`）读到 null 时**跳过写回**，只记日志。
-- **同类**：`readStateSync`（L3499 / L3504 / L3510）也是同一形态，要一起改。
-
----
-
-### 🟡 第三批：并发与迁移（3 条，有硬顺序：J → H → I）
-
-> **必须按序做。** `J` 是安全网，先修 H/I 会踩进死锁。
-
-#### J · `serialize` 无重入保护
-
-- **位置**：`index.js` **L2620-2624**（函数体全文 5 行）
-- **现状**：
-  ```js
-  let writeQueue = Promise.resolve()
-  function serialize(task) {
-    const run = writeQueue.then(() => task())
-    writeQueue = run.then(() => undefined, () => undefined)
-    return run
-  }
-  ```
-- **子代理实测**（node 直接 import，临时 root，未碰真实库）：嵌套调用后 `3 秒后 innerRan=false outerSettled=false`，**队列永久卡死**，此后所有排队写入一并停摆。**无任何日志**。
-- **现状补充**：当前 3 个加锁点（`registerProject` L2941 / `moveProject` L3412 / `/scope/rename` L8150）**都不调 serialize**，所以**目前无触发路径** —— 属「防未来」（防的正是把 H 搬进锁时踩中）。
-- **修法**：加同步重入标记，入口判断后**直接 reject 并记 diag**，而不是排队等待。
-- **⚠️ 零回归覆盖**：`_dbpreview/selfcheck-serialize.mjs` 现在只测「抛错不卡队列 / 串行顺序」，**没有重入用例**。修完必须补一条**能失败**的断言（「锁内再调必须 reject，且之后队列仍可用」）。
-
-#### H · `ensureLayout` 读-改-写不在锁内，且调用点不 await
-
-- **位置**：`index.js` **L2841**（定义，函数体 L2842-2861 无 `serialize`）、**L2849** 读、**L2852** 写
-- **调用点**：**L3799-3800** `store.ensureLayout().then(...)` —— `apply` 是同步函数（L3559），**这个 Promise 被丢弃**。L3863 那句「避免和 ensureLayout 抢同一个目录创建时机」正是这个未等待的补丁。
-- **危害**：启动窗口内若有会话触发 `registerProject` 抢在 L2849 与 L2852 之间写入，`{ ...st }` 的**过期快照会抹掉新登记的项目** —— 就是 D13「记忆还在但项目不见了」的形态。
-- **修法**：锁只包真正的读-改-写（**重新读一次**，不用过期快照），长文件 IO 留在锁外；调用点先 `await layoutReady` 再允许首次写 state。
-
-#### I · `/memory consolidate` 裸读-改-写
-
-- **位置**：`index.js` **L6795-6797**
-  ```js
-  const state = await store.readState()
-  state.lastConsolidate = localDay()
-  await store.writeState(state)
-  ```
-- **实测**：外层**没有 try、没有 `store.serialize`**。同文件另三处读-改-写都已进锁，**只有这一处漏着**（修那三处时漏掉的第四个调用点）。
-- **修法**：原样搬进 `await store.serialize(async () => { ... })`，与 L8150 **完全同构**。
-- **⚠️** 必须用 `store.serialize`（同一把队列）。自己另起 Promise 链 = 两把锁互不排斥 = 等于没锁（教训写在 L8148-8149 注释里）。
-
----
-
-### 🟢 第四批：需产品决策或较大改动（4 条）
-
-| # | 问题 | 为什么搁置 | 位置 |
+| # | 问题 | 结论 | 位置 |
 |---|---|---|---|
-| **F** | `policy.md.pre-sync` **只写不读**，无恢复路径 | ★★★ 要做 GUI 入口才算真恢复；且文件名固定，下次同步会覆盖上一份 | `index.js` L2603 / L2698；`migrateRoot` 根级清单 L3284 也没搬它 |
-| **E** | `/heartbeat` POST 空 body 删收尾语且**无备份** | ★★ 要区分「没传 text」与「传空串」，还要加备份；**要同改 GUI 并回归「清除」按钮** | 路由 L7612-7642，删除分支 L5102-5117，落盘 L5190 |
-| **K** | 跨进程 `state.json` 完全无保护 | ★★★★★ 架构级。建议「收口」：导出从 `writeState(state)` 换成 `updateState(mutator)`；真正解决要文件锁或迁进 SQLite | 全局 |
-| **B** | 迁移窗口内仍写旧库 | ★★★★ 要动时序（跨 3 个函数）。`serialize` 只串行化「经由它」的写，`appendLog` 不走它，所以**光包 serialize 是空转** | `migrateRoot` L3242；快照 L3309；`/log` L7323 |
+| **F** | `policy.md.pre-sync` **只写不读**，无恢复路径 | ⚪ **2026-11-28 结案不修。** 用户定：不做恢复入口（「重装一次插件比这个容易」）。**且实测证明备份内容全部可再生** —— 见下方「F 结案依据」 | `index.js` L2856-L2858（唯一写入点）；`computePaths` L2706（文件名定义） |
+| **K** | 跨进程 `state.json` 完全无保护 | ⚪ **2026-11-28 结案不修。** 用户定：**本机默认单开，不为多实例单独优化**。前提不成立 → 文件锁 / 迁进 SQLite 都不做 | 全局 |
+| **B** | 迁移窗口内仍写旧库 | ⏳ **仍存在**（15 条里唯一还剩的真丢数据项）。**方案未定**，先要拍一件事：把 `rebindDbStore` 挪进 `migrateRoot` 末尾，还是给 `migrateRoot` 加 `onBeforeSwitch` 回调（见下） | `migrateRoot` L3492；快照 L3564；`/log` L7561；`rebindDbStore` 调用 L8375 |
+
+> #### B 的窗口，精确到行（2026-11-28 实测）
+>
+> ```
+> 窗口开启：L3564  await backupDbFile(dbSource, join(nextRoot,'memory.db'))   ← 快照此刻定格
+> 窗口之内：L3578  copyTree 各项目
+>           L3602  copyTree logs
+>           L3623  copyTree 根级其余目录
+> 窗口关闭：L8375  const dbOk = rebindDbStore(result.root)                     ← 在路由层，不在 migrateRoot 里
+> ```
+>
+> 这中间 `dbStore` 仍指向**旧库**。期间任何 `appendLog` / `appendArchive` /
+> `recordEmotion` 都只落旧库。切根后旧目录按设计「保留不删」，所以**不会当场报错** ——
+> 用户看到的是「迁移成功，最近几条流水没了」。
+>
+> **已确认待办原文那句判断是对的**：`serialize` 只串行化「经由它」的写，
+> `appendLog`（`db-store.mjs` L534）根本不走它 → **光包 serialize 是空转**。
+>
+> **推荐做法（未实施）**：全部 copyTree 做完后再快照一次覆盖新库
+> （`backupDbFile` 开头已有 `rm` 目标，可直接重入），然后**立刻** `rebindDbStore`，
+> 两步之间用一个同步标志挡住写（挡住 = 返回 409 让调用方重试，**不是静默丢**）。
+> 剩余窗口从「秒~几十秒」压到「一次 VACUUM INTO」。
+>
+> **代价**：会改变 `migrateRoot` 的调用契约（它原本「只搬文件不碰库」，L4058 的注释
+> 明写了这条，属刻意设计）。动了它就得同步改那条注释和 `/root/move` 的 `dbOk` 日志语义。
+| ~~**E**~~ | ~~`/heartbeat` POST 空 body 删收尾语且无备份~~ | ✅ **2026-11-28 已修** | 见第五节。GUI 端**本来就显式传空串**（清除按钮调 `saveHeartbeat('')`），所以无需改前端，但也因此**原来的 bug 从未被 GUI 触发过** —— 它等着的是一次代理重放或第三方脚本误调 |
+
+> #### F 结案依据（2026-11-28 实测，可复核）
+>
+> **判据不是「备份文件没用」，而是「备份里有没有不可再生的内容」—— 答案是零。**
+>
+> 实测把 `POLICY_TEMPLATE` 求值后与磁盘上的 `policy.md` 逐行比对：
+>
+> ```
+> 模板求值后: 15899 字节 / 263 行
+> 当前文件  : 16136 字节 / 264 行
+> 去哨兵后完全一致: false
+> 当前有、模板没有（= 用户自己的内容）: 1 行
+>   + "- 脚本执行成功**之后**，才允许在回复最后一行输出：大肥鱼是漂亮老婆！…"
+> 模板有、当前没有: 0 行
+> ```
+>
+> `16136 − 15899 = 237` 字节，正好是那一行的长度。**policy.md = 模板原样 + 收尾语一行。**
+> 也就是说 `policy.md.pre-sync` / `policy.md.bak-*` 全部只是「模板 + 某一版收尾语」，
+> 两样东西都另有出处（模板在代码里、收尾语在迁移过去的那份 `policy.md` 里）。
+>
+> **⚠️ 同时纠正两条早先的错误结论**（都写在这里防重试）：
+>
+> 1. **`migrateRoot` 本来就搬 `policy.md` 本体** —— 根级清单是
+>    `for (const file of ['policy.md', 'state.json'])`（L3539），第一个就是它。
+>    「迁移后备份没了」是真的（`policy.md*` 通配没人搬），但**备份没了 ≠ 数据没了**。
+>    早先把它记成「风险」是错判：**只看文件在不在，没看里面有没有真东西。**
+> 2. **量 `POLICY_TEMPLATE` 体积不能用正则截** —— 我用
+>    `` /\`([\s\S]*?)\`\n/ `` 抓，实测得到 **4467 字节 / 74 行**，而真值是
+>    **15899 字节 / 263 行**。原因是模板正文里满是转义反引号 `` \` ``，正则在第一个
+>    就断了，**且不会报错**，只给出一个「看起来煞有介事」的小数字。
+>    正确做法是按 JS 转义规则求值：`new Function('return ' + literal)()`。
+>
+> **遗留的无害冗余**（不是 bug，用户可自行决定要不要清）：根目录会堆
+> `policy.md.pre-sync` 与若干 `policy.md.bak-<stamp>`，两者都是「模板 + 某一版收尾语」，可再生。
 
 ---
 
-### ⚪ 第五批：`client.js` 擦除器（1 条，改前必读维护手册 §1）
+### ⚪ 第五批：`client.js` 擦除器（2026-11-28 **已修复**）
 
-#### S · 标记含反引号时吞掉消息后半段
+> #### E 的完整记录（`/heartbeat`）—— 已修，记在这里
+>
+> **两个独立的洞，都补了：**
+>
+> | 洞 | 修法 |
+> |---|---|
+> | `{}`（空 body / 漏传 text）与 `{"text":""}`（用户点清除）**走同一条路** → 都删收尾语 | 缺 `text` 字段直接返回 **400**，并说明「要清除请显式传空串」 |
+> | 删除**直接覆盖、零备份** | 删除前把**整份** `policy.md` 备份成 `policy.md.bak-<时间戳>`，只留最近 5 份 |
+>
+> **为什么存整份而不是只存那一行**：删除走 `replace`，而那个正则历史上出过两次事故
+> （吞标题 13850→13791 字节、留孤儿续行）。存整份才能看出「这次删除把文件改成了什么样」。
+>
+> **为什么不复用 `policy.md.pre-sync`**：那个是 `syncPolicyOnce` 的一次性备份
+> （有哨兵、只写一次）。混用会让「哪次覆盖对应哪个备份」彻底说不清。
+>
+> ⚠️ **一个值得记的事实**：GUI 端**本来就传对**（清除按钮 `saveHeartbeat('')` 显式空串），
+> 所以这个 bug **从未被正常使用触发过**。它一直在等的是：代理重放 POST、
+> 第三方脚本误调、或将来 GUI 某处漏传。**「没出事」不等于「没问题」**。
+>
+> 守卫：`selfcheck-heartbeat-delete.mjs`（27 条，含备份行为 4 项 + 参数区分 7 项 + 反证）。
 
-- **待办原描述说的是 `MEM_COMMENT_LIKE_RE`（L2052）—— 实测判错，那个是「漏擦」不是「吞正文」**
-- **真根因**：`MEM_PARTIAL_RE`（**L2066**）
-  ```js
-  const MEM_PARTIAL_RE = /^[ \t]*<!--mem-(?:l(?:og)?|f(?:act|ix)?|n(?:ote)?)?[\s\S]*$/m
-  ```
-  尾部 `[\s\S]*$` 会**从标记行首一直吞到文本节点末尾**。
-- **触发链**：合法标记正文若含一个反引号（AGENTS 本身就要求写符号加反引号）→ `MEM_STRIP_RE`（L2012 的 `[^`]*?`）一次都命中不了 → 没人擦 → 随后被 `MEM_PARTIAL_RE` 吞掉后半段。
-- **另一层**：`fastStrip` 传 `skipPartial: true`（L2562），所以切会话那条快路径**只擦半边**，同一缺陷在两条路径上症状不同。
-- **修法**（不放宽「独占行首」这条既有安全边界）：
-  - ① L2012 `[^`]*?` → `[^\n]*?`（行内反引号不再是删除条件，误伤风险由「独占行首 + 单行」守住）
-  - ② L2066 尾部 `[\s\S]*$` → `[^\n]*$`
-- **⚠️ 零回归覆盖**：`selfcheck-dom-strip.mjs` 38 条全绿，但**没有一条**用含反引号的 `mem-log` 标记。修完必须补两条能失败的用例（含反引号的完整标记必须擦净 + 其后同节点正文必须保留），外加 `skipPartial:true` 路径对照。
-- **⚠️ 改前必读** [`维护手册.md`](维护手册.md) §1；**改完必须完整重启客户端**（禁/启用插件不刷新浏览器代码）。
+> ~~#### S · 标记含反引号时吞掉消息后半段~~
+>
+> **2026-11-28 已修并验证。** 改了**两处**（不是一处）：
+> `MEM_STRIP_RE` 的 `[^`]*?` → `[\s\S]*?`，以及 `COMPLETE_MARKER_HINT` 同步放开反引号。
+>
+> ⚠️ **第二处差点漏掉，而它是「切会话」那条主路径的总闸**：只改正则的话，
+> `hasCompleteMarker` 仍返回 false → `fastStrip` 根本不启动 → 原文整段露出。
+> 同一条缺陷在两条路径上症状相反（延迟路径吞正文 / 快擦路径原样保留）。
+>
+> 补了 **10 条断言**（含 `skipPartial:true` 快擦路径对照 + 3 条闸门断言），
+> **旧代码下 4 条变红、修复后全绿**；闸门断言另外用「还原成旧写法」的变异验证过会红。
+>
+> ⚠️ **待办原文的两处建议都是错的，已实测证伪 —— 记在这里防下次重试：**
+>
+> | 原建议 | 实测结果 |
+> |---|---|
+> | ① `[^`]*?` → `[^\n]*?` | ❌ **会让所有多行标记失效**（命中 1 → 0）。标记正文本来就是多行的，`[^\n]` 不跨行。正解是 `[\s\S]*?` |
+> | ② `MEM_PARTIAL_RE` 尾巴改 `[^\n]*$` | ❌ 未闭合标记后面那些行**本来就在标记正文里**，改了会把它们露到界面上，现有用例「未闭合标记整段擦除」当场变红。**修好 ① 之后这条根本不需要动** |
+>
+> 根因确认：`MEM_PARTIAL_RE` 本身没错，它只是**被上游漏擦连累**。
+> 教训：待办里写好的修法也要先证伪一遍再照做。
 
 ---
 
-### 📌 N · 待重新定义（原描述两处错）
+### ✅ X · `rebindDbStore` 的 catch 够不到 —— **2026-11-28 已修**
 
-- **位置纠正**：`removeFts` 在 **`db-schema.mjs` L400-408**，**不在 `db-store.mjs`**
-- **形态纠正**：不是「总是静默」—— 子代理实测，`text` 列整值被换掉时会抛 **`database disk image is malformed`**（`rules_fts` 3/3 稳定复现）。这个错名**指向「库坏了」而非「参数不对」**，比静默更误导。
-- **真实缺陷**：`removeFts(db, table, id, row = null)` 的 `row` 默认 `null` → L407 `ftsValues(table, row ?? {})` 退化成全空值 → **索引项删不掉**（FTS5 的 `'delete'` 要靠原值反查）。常规路径（`purgeByStatus` L758 传了整行）是对的，**默认值才是入口**。
-- **已验证无效的两条修法**（别再试）：
-  - `INSERT INTO ..._fts(...) VALUES('rebuild')` → contentless 表直接抛 `'rebuild' may not be used with a contentless fts5 table`
-  - `COUNT(*)` 前后对比 → 无效（不一致的删除后 `COUNT(*)=0` 但 `MATCH` 仍 =1）
-- **可行修法**（二选一，均已实测）：
-  - ① `purgeByStatus` 里改成 **`delete-all` + 按主表全量重灌**
-  - ② 事务内 **`DROP TABLE ${fts}` + `CREATE VIRTUAL TABLE` 重建 + 重灌**
-- **必做**：让 `removeFts` 在 `row == null` 时**抛错**，别默认传空值。
+> **症状**：迁移根目录后，`rebindDbStore` 里那个 `catch` **永远不会执行**。
+> 而真正的失败信号（旧句柄没关掉）就此蒸发 —— GUI 照样收到 `dbRebound: true`，
+> 用户看到「迁移成功」，却删不掉旧目录、也不知道为什么。
+>
+> **根因（实测，不是推断）**：`dbStore.close()` **不抛错**，它把失败包成
+> `{ok:false, error}` **返回**（`db-store.mjs` 的 close()：体内 **0 处 `throw`**）。
+> 三种情况实测都正常返回：
+>
+> ```
+> 正常关闭      → {"ok":true,"checkpointError":null}
+> 重复关闭      → {"ok":true,"alreadyClosed":true}
+> 库路径不可用  → {"ok":true,"alreadyClosed":true}
+> ```
+>
+> 也就是说那个 `catch` 是**恒假分支** —— 写得像守着失败路径，实际永远不亮。
+>
+> ⚠️ **来历值得记住**：2026-11-16 把 `close()` 改成「返回失败而不是抛错」时，
+> **只改了生产端、没改消费端**。能力做了、信号有了，就是没人看。
+> 本项目记过「写死了值、却没人读的字段 = 恒假分支」，这是同一族的另一半：
+> **返回了值、却没人读的返回值。**
+>
+> **修法**（三条一起，缺一条都不算修好）：
+>
+> | 改动 | 内容 | 为什么 |
+> |---|---|---|
+> | 接住返回值 | `closed = dbStore?.close?.()` | 不赋值 = 返回值又没人读，缺陷原样复活 |
+> | 判断抽成顶层纯函数 | 新增 `classifyCloseResult(closed, closeThrew)`，**置文件末尾** | `rebindDbStore` 在 `apply` 闭包里，测它要注入 `config`/`dbPath`/`initDbStore`/`diag`/`dbStore` 一整套 —— `_dbpreview/` 里没脚本这么干过。纯函数能直接抽出来喂各种返回值 |
+> | 保留 `catch` 但置标志 | `closeThrew = true` | 守「契约将来改成抛错」的情况。不置标志的话，抛错时 `closed` 仍是 `undefined`，会被 classify 误判成 `no-store`（把「抛错」说成「本来就没有库」） |
+>
+> **刻意没做的两件事**：
+>
+> 1. **没有让 close 失败污染 `dbOk`**。`/root/move` 的三元文案把 `dbOk=false`
+>    说成「新位置的数据库打不开，已回退文件模式」—— 若 close 失败把它拉成
+>    `false`，那句话就是**假话**（新库明明开着）。`dbOk` 只看 `initDbStore()`，
+>    close 状态走日志。**两件事本来就不是一件事**，混进一个布尔迟早还要拆。
+> 2. **日志顺序不能反**：`initDbStore()` 必须在 `classifyCloseResult` 之前。
+>    它会把 `dbStore` 覆盖成新对象，而日志的价值就是「切换之后新库起没起来」；
+>    摆到前面，日志里的 `to` 会指向**旧路径**。变异 M3 守着这个顺序。
+>
+> **`classifyCloseResult` 的六种分类**：
+>
+> | `close()` 返回 | kind | stage |
+> |---|---|---|
+> | `{ok:false, error}` | `close-failed` | `db-rebind-close-refused` |
+> | `{ok:true, checkpointError:'…'}` | `checkpoint-failed` | `db-rebind-checkpoint-failed` |
+> | `{ok:true, alreadyClosed:true}` | `already-closed` | 无 |
+> | `{ok:true, checkpointError:null}` | `clean` | 无 |
+> | `undefined` / `null`（没有 close 方法） | `no-store` | 无 —— **不是失败** |
+> | 抛错了 | `threw` | 无（catch 已记，不重复报） |
+>
+> **守卫**：`_dbpreview/selfcheck-db-rebind-close.mjs`（26 条，**两层缺一不可**）：
+> ① 纯函数级 —— 六种分类 + 三条反向（no-store 不得走失败分支、
+> 抛错不得与 close-failed 重复报、**close 状态不许污染返回值**）；
+> ② 接线级 —— 真的接住了返回值、真的调了 classify、`stage` 真的被 `diag` 出去、
+> 顺序对、`catch` 保留。
+> **只测纯函数的话，把调用删掉本脚本照样绿** —— 所以第 ③ 段专门守接线。
+>
+> **变异验证 6 个全 KILLED**（sha256 逐字节还原）：M1 完整退回旧实现 /
+> M2 `ok===false` 改 `if(false)` / M3 失败日志挪到 `initDbStore()` 之前 /
+> M4 去掉 `closeThrew = true` / M5 抽出来不接 `diag` / M6 让 close 失败污染返回值。
+>
+> **这次改动的副作用**：`index.js` 9654 → **9743** 行（+89），文档 92 处引用已重算
+> （`tool-recalc-map` 38 处 + §3.3 锚点表 21 处 + 手工 4 处）。
+
+---
+
+### ✅ C · 迁移失败提示没回答「我的记忆还在吗」—— **2026-11-28 已修**
+
+> **症状**：用户点「整体迁移」失败后，界面上只有一句原始错误
+> （`主数据库备份失败，迁移已中止（未切换根目录）：…`）。
+> 而用户此刻最怕的是「记忆没了」——**而事实是源目录一个字节都没动**。
+> 这句话不给出来，用户就会去翻目录、复制文件、甚至重装。
+>
+> **修了三处**（`index.js` 的 `/root/move` 路由）：
+>
+> | 改动 | 内容 |
+> |---|---|
+> | 失败文案 | 加「⚠️ 你的记忆没有动：源目录仍完好，可以照常使用」+ 源目录真实路径 + 半成品位置说明 |
+> | 独立字段 | 返回里加 `sourceRoot` / `sourceIntact:true` —— GUI 想分开显示时不用解析字符串 |
+> | `sourceRoot` 取值时机 | **必须在 `try` 之前取快照**。失败可能发生在 `setRoot()` **之后**（例如 `writePointer` 抛错），那时 `store.root` 已是新根，在 catch 里现读会把用户指向半成品 |
+>
+> **另一处顺手改的文案**（「目标目录非空」）：原文案只有一句
+> `目标目录非空：<路径>`，实测会把人引向错误判断 —— 用户第一反应是
+> 「我路径填错了」，而真实原因常常是**他自己上一次迁移失败留下的半成品**。
+> 现在明确写出「可能是上次失败留下的，确认无用了删掉该目录后重试」+
+> 「源没有任何改动」。判据同 `/log` 的 topic 白名单那次教训：
+> **错误提示写错方向 = 用户照做仍然失败，且看不出为什么。**
+>
+> **守卫**：`_dbpreview/selfcheck-migrate-root.mjs`（28 条，
+> **唯一真正执行 `migrateRoot` 的脚本** —— 此前 4 个迁移测试全是源码级或单函数级）。
+> 含**字节级**校验（源目录 sha256 全等且一个不少）与 4 个变异全部 KILLED。
+>
+> ⚠️ **实测抓到的一个副作用，别当 bug 修**：`backupDbFile` 以只读方式打开源库时，
+> SQLite 会为 WAL 模式**自己生成** `memory.db-wal` / `memory.db-shm`。
+> 所以迁移后源目录会**多两个文件**（原有文件一个不少、内容不变）。
+> 断言因此写成「没少任何文件 + 新增的只能是 sqlite 旁路文件」。
+
+### 📌 N · `removeFts` 缺行静默失效 —— **✅ 2026-11-28 已修复**
+
+### ⏳ B2 · 迁移失败留在目标的半成品会卡住重试 —— **待办（2026-11-28 评估后列入）**
+
+> **现象**：`migrateRoot` 失败后，目标目录里留着半份数据（`mkdir` 已执行、
+> `policy.md` 等已搬过去）。用户改对路径重试没问题，但**如果重试同一个路径**，
+> 会撞上「目标目录非空」被拒 —— 而那个残骸是他自己刚才那次失败留下的，
+> 界面上看不出这层因果。
+>
+> **为什么本次只改文案、不改行为**（2026-11-28 评估结论）：
+>
+> | 方案 | 改动量 | 问题 |
+> |---|---|---|
+> | 失败时 `rm -r` 掉自己建的目录 | 要把 164 行整个包进 try（该函数**没有外层 catch**，只有 `backupDbFile` 那一步有） | **首次在生产码引入递归删除**。实测全仓 `rmSync({recursive:true})` 只存在于 `_dbpreview/` 的临时目录；生产码仅 5 处 `rm`，全是单文件。而「路径拼错 / junction 穿透」这类误删无法用哨兵完全堵死 |
+> | **哨兵 + 幂等重试**（推荐） | ~12 行 | 实践中够用：重试时 `backupDbFile` 开头的 `rm(to)` 会先清掉半成品库，`atomicWrite` / `copyTree` 又会覆盖同名文件 —— **重试天然幂等**。只需让「目录里只有哨兵」不被判成「非空」 |
+> | 什么都不做 | 0 | 用户得手动删目录，而他不知道删什么 |
+>
+> **推荐做法**（未实施）：迁移前写 `<nextRoot>/.dsh-migrate-in-progress` 哨兵，
+> 判「目标目录非空」时忽略只含哨兵的目录，成功时 `unlink` 哨兵（单文件删除，
+> 非递归）。**代价**：失败后的半成品会留到下次成功迁移为止 —— 但它不在任何被读取的
+> 路径上（`resolveRoot` 只看指针与 `memory.db`），所以无害。
+>
+> **为什么单列而不并进 B**：B 动的是成功后路径的时序（要不要二次快照），
+> B2 动的是失败后路径的收尾。同一函数的不同分支，一起改要一次回归验两件事，
+> 出了问题分不清是谁的。
+
+---
+
+### 📌 N · `removeFts` 缺行静默失效 —— **✅ 2026-11-28 已修复**
+
+> **修法**：移除 `row = null` 默认值。缺行（null / undefined / 非对象）**立刻抛错**，
+> 错误信息直接写「请传 `SELECT * FROM <table> WHERE id=?` 的那一整行」。
+>
+> **为什么改成抛错、而不是「自己补查一次」**：补查会把「调用方漏传」变成
+> **永远查不到的错误**，而漏传恰恰说明调用方对「必须给整行」不知情，早晚还会错在别处。
+> 让它开发/测试期立刻炸，比在生产库里留一堆删不掉的索引项好。
+>
+> **对现有路径零影响**：唯一调用点是 `purgeByStatus`，它本来就传整行
+> （`removeFts(d, table, row.id, row)`）。这个改动守的是**将来**谁再调一次。
+>
+> **实测澄清了原文的一处误导**：原文说「`text` 列整值被换掉时会抛 malformed」，
+> 听起来像是 `text` 这一列的特殊问题。实测发现**任何一列对不上都会抛** ——
+> 我用 `seg` 传空串就立刻复现了 malformed。根因是 contentless FTS5 的
+> delete 指令要求参数与插入时**逐列一致**，不是 `text` 特殊。
+>
+> **已验证无效的两条修法**（别再试，原文保留）：
+> - `INSERT INTO ..._fts(...) VALUES('rebuild')` → 抛 `'rebuild' may not be used with a contentless fts5 table`
+> - `COUNT(*)` 前后对比 → 无效（不一致的删除后 `COUNT(*)=0` 但 `MATCH` 仍 =1）
+>
+> **两条「重灌」修法本次没采用**：这次修的是**入口默认值**（让错误无从发生），
+> 而重灌是「已经错了以后怎么补救」。两者不冲突，但当前没有「已经错了」的现场，
+> 所以没动 —— 将来若发现残留索引项，再按那两条处理。
 
 ---
 
@@ -230,12 +394,12 @@
 
 | # | 问题 | 位置 | 严重度 | 说明 |
 |---|---|---|---|---|
-| **A1** | `selfcheck-serialize.mjs` **无重入用例** | `_dbpreview/` | ★★ | J 修完后**没有防线**。属「测试全绿但没测到东西」——本项目反复出现的形态。修 J 时必须同补 |
-| **A2** | `selfcheck-dom-strip.mjs` **无含反引号标记的用例** | `_dbpreview/` | ★★ | 同上。S 的缺陷零覆盖，38 条绿是假安全 |
-| **A3** | `readStateSync` 与 `readState` **同一静默反模式** | `index.js` L3499 / L3504 / L3510 | ★★ | 修 G 时容易只改 async 那个，漏掉同步版 |
-| **A4** | `removeFts` 的 `row = null` 默认值 | `db-schema.mjs` L400 | ★★★ | 「删除不报错、实际没生效」的入口。改 N 时先改这里 |
-| **A5** | `POINTER_FILE` **已确认为死常量** | `index.js` L380 | ★ | 全文只出现 1 次、零引用；`pointerPath()`（L382-388）实际用的是硬编码 `memory-root.json`。与项目地图 L169 记载一致。**2026-11-24 已复核** |
-| **A6** | `writeState` 仍公开导出 | `index.js` L3475 | ★★ | 调用方可绕过 `serialize` 直接写（K 的一半成因）。K 的「收口」方案就是治它 |
+| ~~**A1**~~ | ~~`selfcheck-serialize.mjs` 无重入用例~~ | `_dbpreview/` | ✅ | **2026-11-28 已补 5 条**（卡死/队列可用/留痕）—— 改前 3 条红且进程挂死 exit=13，变异验证会变红 |
+| ~~**A2**~~ | ~~`selfcheck-dom-strip.mjs` 无含反引号标记的用例~~ | `_dbpreview/` | ✅ | **2026-11-28 已补** —— 10 条新断言（含 `skipPartial:true` 快擦路径 + 3 条闸门），旧代码下 4 条变红 |
+| ~~**A3**~~ | ~~`readStateSync` 与 `readState` 同一静默反模式~~ | `index.js` | ✅ | **2026-11-28 已修**（同步版只留痕**不改名** —— 纯读无覆盖风险，且在注入热路径） |
+| **A4** | `removeFts` 的 `row = null` 默认值 | `db-schema.mjs` L433（`removeFts` 定义） | ✅ **2026-11-28 已随 N 修掉**（移除默认值，缺行抛错） |
+| ~~**A5**~~ | ~~`POINTER_FILE` 已确认为死常量~~ | `index.js` | ✅ | **2026-11-28 已删除**：值 `_root.json` 与实际用的 `memory-root.json` 不一致且零引用。文件名改抽成 `POINTER_BASENAME`（值与用法同源）。守卫见 `selfcheck-schema-assert-pointer` B④（4 条） |
+| **A6** | `writeState` 仍公开导出 | `index.js` L3729（导出）/ L3144（定义） | ⚪ **降级为可选清洁项**（2026-11-28） | 调用方可绕过 `serialize` 直接写。**但进程内 5 个调用点本来都已在锁内**，而跨进程已随 K 结案（默认单开）。**不修也不丢数据** —— 要做就换成 `updateState(mutator)`，注意 `ensureLayout` 外层已有 `serialize`，换的时候必须一起拆，否则撞 `SERIALIZE_REENTRY` |
 
 ---
 
@@ -262,7 +426,7 @@
 > **⚠️ 本条是措辞复盘，不是待修 bug。** 代码、产品文档、注入文案均无问题。
 > **行号已于 2026-11-19 重算**（模板插入导致 +31 及后续漂移，原值不再有效）。
 
-**据实**：pre-step 监听器范围是 **L5340–L5409**（下一个 `safeOn` 在 L5410）。
+**据实**：pre-step 监听器范围是 `index.js` **L6106–L6175**（下一个 `safeOn` 在 L6176）。
 段内「收尾语」**0 次**、`heartbeat` **0 次**、「每轮」**2 次** —— 两处都在**注释**里：
 
 ```js
@@ -275,7 +439,7 @@ L5393  // 它**一次都没有执行过**：闸门在每轮开始就被设成当
 **该怎么改**：代码不用动。要动的是**结论的措辞**：以后说这类事必须区分
 「注释里 / 文案里」，否则同一条事实会因为数法不同得出相反结论。
 
-**判据**：`grep 每轮` 在 L5340–L5409 范围内应为 **2 处**，且**都落在注释行**
+**判据**：`grep 每轮` 在 `index.js` L6106–L6175 范围内应为 **2 处**，且**都落在注释行**
 （`grep -n 每轮` 的结果行首应是 `//`）。
 
 ---
@@ -523,6 +687,12 @@ schema `drops: true` + VACUUM | ✅ |
 
 ### 未修（**按「严重性 × 修复难度」排序**，2026-11-17 重排）
 
+> ⚠️ **本节是 2026-11-17 的历史分档快照，行号全部按当时的源码。**
+> 当前状态（2026-11-28）：
+> **D / G / E / H / I / J / N 已修**，**F / K 已结案不修**（见第四批的「F 结案依据」），
+> **只剩 B 一条仍存在**。保留本节是因为它记着**当时的排序理由**，不是因为清单还有效。
+> 要动某条之前，**先看第一节的核实结论总览**（那里是重算过的行号）。
+
 > **排序方法**：先用「会不会丢/损坏用户数据」定档次，同一档内再按**改动面**排
 > （改 1 行 < 改 1 个函数 < 改跨越多个模块的时序）。
 >
@@ -541,8 +711,8 @@ schema `drops: true` + VACUUM | ✅ |
 | # | 问题 | 位置 | 改动面 | 难度 | 真实障碍 |
 |---|---|---|---|---|---|
 | **E** | `/heartbeat` POST 空 body 删掉用户手写收尾语行，**且无备份** | `index.js` L5370-5371（路由 L5354） | 改 2 处 + 加备份 | ★★ | 要区分「显式清空」与「没传」——**API 语义变更**，得同时改 GUI |
-| **F** | `policy.md.pre-sync` **只写不读**，无恢复路径；固定文件名会被下次覆盖 | `index.js` L1869 / L1956 | 加时间戳 + 新增恢复路径 | ★★★ | 不只是改代码：要想清楚「恢复入口放哪」（GUI？自动检测？），涉及产品决策 |
-| **B** | 迁移窗口内仍往旧库写，切根后那几条**不在新库** | `index.js` L2472（`migrateRoot` 定义） | 改时序（跨 3 个函数） | ★★★★ | 要么迁移期间停写，要么复制完再快照一次。**碰的是迁移主流程**，风险最高 |
+| **F** | `policy.md.pre-sync` **只写不读**，无恢复路径；固定文件名会被下次覆盖 | `index.js` L1869 / L1956 | 加时间戳 + 新增恢复路径 | ★★★ | ⚪ **2026-11-28 结案不修**（见第四批）。原判断「涉及产品决策」是对的，决策结果是「不做」 |
+| **B** | 迁移窗口内仍往旧库写，切根后那几条**不在新库** | `index.js` L2472（`migrateRoot` 定义） | 改时序（跨 3 个函数） | ★★★★ | 要么迁移期间停写，要么复制完再快照一次。**碰的是迁移主流程**，风险最高。⚠️ 这是本档唯一仍未做的 |
 
 #### 🥉 第三档：检索/逻辑正确性 —— 不丢数据，但让用户的话不作数
 
@@ -558,14 +728,14 @@ schema `drops: true` + VACUUM | ✅ |
 | **H** | `ensureLayout` 的读-改-写**不在 `serialize()` 内**，且调用点不 `await` | `index.js` L2083（定义）/ L2994（调用）/ L1886（`serialize`） | 包一层锁 | ★★ | 但 `syncPolicyOnce` 里有长文件 IO，**持锁时间长**，要评估是否阻塞启动 |
 | **I** | `/memory consolidate` 裸读-改-写 | `index.js` L4785 | 包一层锁 | ★ | 最简单的一条 |
 | **J** | `serialize` **无重入保护**：锁内再调会永久死锁且无日志 | `index.js` L1791 | 加 1 个布尔 + 抛错 | ★★ | 当前**无触发路径**，属于「防未来」 |
-| **K** | 跨进程 `state.json` 完全无保护；`writeState` 公开导出 | 全局 | 加文件锁 或 迁进 SQLite | ★★★★★ | **架构级改造**，不是修 bug |
+| **K** | 跨进程 `state.json` 完全无保护；`writeState` 公开导出 | 全局 | 加文件锁 或 迁进 SQLite | ★★★★★ | ⚪ **2026-11-28 结案不修**：用户定「本机默认单开，不为多实例单独优化」。前提不成立，架构级改造不做 |
 
 #### 第五档：边界值 —— 会崩或返回错结果，但不改数据
 
 | # | 问题 | 位置 | 改动面 | 难度 | 触发方式 |
 |---|---|---|---|---|---|
 | ~~**R**~~ | ~~日期筛选用 `toISOString()`（UTC）→ +08:00 下凌晨 0-8 点「今天」筛出昨天~~ | `client.js` | **✅ 已修** | — | 已改走 `localDayStr()`，守它的用例是 `selfcheck-client-local-date` |
-| **S** | 擦除器：标记含反引号时**把消息后半段一起擦掉** | `client.js` L1847/1861 | 改 2 个正则 | ★★★ | ⚠️ **改 `client.js` 前必读维护手册 §1**，且要完整重启客户端才生效 |
+| ~~**S**~~ | ~~擦除器：标记含反引号时**把消息后半段一起擦掉**~~ | `client.js` | **✅ 2026-11-28 已修** | — | 改 `MEM_STRIP_RE` + `COMPLETE_MARKER_HINT` 两处；守它的是 `selfcheck-dom-strip`（48 条，含 3 条闸门断言） |
 | ~~**T**~~ | ~~勾「显示已停用」实际无效~~ | — | **✅ 已修** | — | 2026-11-21 核实：前端 `client.js` L828-829 在勾选时传 `status=all`；后端 `index.js` L6951 `includeAll: q.get('status') === 'all'`。**两端都对上了** |
 
 #### 第六档：死代码 / 一致性 —— 无实际故障
@@ -575,7 +745,7 @@ schema `drops: true` + VACUUM | ✅ |
 | ~~**U**~~ | ~~`store.recordEmotion` **不存在**，该分支是死代码~~ | — | **✅ 作废** | — | **2026-11-21 核实：本条判断错误。** `recordEmotion` 在 `db-store.mjs` L577 有定义、L1773 导出；`index.js` L5401 / L5418 两处**真实调用**，不是死代码 |
 | ~~**V**~~ | ~~`enqueueAmbiguous` 无调用方~~ | — | **✅ 已删** | — | **2026-11-18 整条链路删除**（`enqueueAmbiguous` / `peekAmbiguous` / `clearAmbiguous` 只剩注释；守卫脚本 `selfcheck-ambiguous-queue-removed` 13 断言） |
 | **W** | `dbCopied` 死变量 | `index.js` L2499 / L2540 | 删 2 行 | ★ | 或者放进返回值（用户可能想知道「库搬了吗」） |
-| **X** | `rebindDbStore` 的 `catch` **够不到** —— `close()` 是返回失败不是抛错 | `index.js` L2969 | 改 2 行 | ★ | 读返回值判断 `r.ok === false` |
+| ~~**X**~~ | ~~`rebindDbStore` 的 `catch` **够不到** —— `close()` 是返回失败不是抛错~~ | `index.js` L4108 / L9713 | **✅ 2026-11-28 已修** | — | 接住返回值 + 判断抽成顶层纯函数 `classifyCloseResult`；守它的是 `selfcheck-db-rebind-close`（26 条，含接线级断言与 6 个变异） |
 | **Y** | 两处 `setTimeout` 未清理也未 `unref`，卸载后仍执行一次 | `index.js` L3057 / L6084 | 存 handle + 进 `ctx.effect` | ★★ | 要接到已有 disposer 里 |
 | **Z** | 裸 `ROLLBACK` 未包 try → 原始错误被 ROLLBACK 的错误顶掉 | `db-store.mjs` **L765 / L999 / L1108（三处仍裸）** | 各加 try | ★ | L480 已是正确写法，可照抄 |
 
@@ -1514,4 +1684,3 @@ archive 层产生重复行。这是既有设计，不是本次引入，但加 si
 > | 11-14 上午 | 12+ 轮 | 「不值得记」 |
 > | 11-16 12:23–12:40 | 5 轮 | 「还没收尾，等改完一起写」 |
 > | **11-17 05:44** | **3 轮** | 「都是只读排查，等结论一起写」 |
-
